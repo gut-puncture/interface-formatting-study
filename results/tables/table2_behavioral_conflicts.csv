@@ -1,0 +1,3 @@
+group,run_type,calibrated_accuracy,raw_accuracy,mean_calibrated_margin,conflict_item_rate,all_correct_rate,all_wrong_rate,mean_correct_wrappers_per_item,n_items,n_prompts
+category:pure_interface,final,0.4964741346826721,0.4816170533455348,0.3618654788178931,,,,,2672,18577
+all_items,final,0.4964741346826721,0.4816170533455348,0.3618654788178931,0.5557634730538922,0.21519461077844312,0.22904191616766467,3.4517215568862274,2672,18577

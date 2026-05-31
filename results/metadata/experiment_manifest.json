@@ -1,0 +1,406 @@
+{
+  "artifact_hashes": {
+    "paper/main.tex": "2d80ec1490dec16a1fec3810e4c723e0ed1990d9296e9b9fb541779f0952d596",
+    "paper/references.bib": "22e2e0adf052eed7c6e679e25457abdca125e60f16812df078f8fe49defce72b",
+    "results/figures/format_conflict_distribution.png": "e2565835f2c522ff6b0a335e777bf907d4b9fbe023fab1a30e81b72df97ef037",
+    "results/figures/wrapper_accuracy_heatmap.png": "e489a2f53e22834ac6c7740aa6b86361144a5c139e01217b992f0414e8195415",
+    "results/metadata/dataset_audit.json": "4986f991ecf67fe03aa365106270901c0dc648e84a88b94dc5648914a6f92b1a",
+    "results/metadata/split_manifest.json": "b52545c7507a84747ea6811fefa8b4323f1b6d761f5fb82bf93fe29ce8ee5d82",
+    "results/metadata/wrapper_audit.csv": "aa635e45edd92e30fea240ed7c577751eb45576ab8ec2139ad32585dada62812",
+    "results/processed/attention_diagnostics.parquet": "b0ea6000c0c7c5a5d9eb54fe42ec8eab7dcfe30f93ed10fb8bb5ea6230edcf93",
+    "results/processed/conflict_pairs.parquet": "0d42e9ad2f280842032457c2a2f91817c09f772109542d72a554572049d18ab2",
+    "results/processed/focused_patching_controls.parquet": "fdee0a69a8b9d969fb9c1645196532e1bd601ba639f426de9f553ecbb3328460",
+    "results/processed/vanilla_convergence.parquet": "aa57792101aec650206ab2fb4b451a4e09e48b7feab41494f550eb3f7a959af6",
+    "results/raw/behavioral_scores.parquet": "e5523ca859d8508becf753d51c568a29553c61fec91855e303aa05860a8216d8",
+    "results/tables/table1_dataset_wrapper_audit.csv": "61fbe345c59eaf73551aac90bdfe32044c2192da320a219a9462c63a398ed108",
+    "results/tables/table2_behavioral_conflicts.csv": "7e8de91f3299b1bded700d9cb4856d9d06e60d7450ce7b50a04084d995b8cb3b",
+    "results/tables/table_attention_diagnostics.csv": "9a67c9c1e4a62eed903d1a1c7dcabb93f96ae45c75838ad730c5299ac78afae3",
+    "results/tables/table_focused_controls.csv": "131cca0834778cf2af5b503fc30954c294d2f1d71ebf8dc6697c6dc2816bbd17",
+    "results/tables/table_vanilla_convergence.csv": "1252a6d4db73567b36584ef30c3263efe7c41e12618dfa8dfd8ba48820a376ff"
+  },
+  "config": {
+    "activation": {
+      "alpha_grid": [
+        -5,
+        -3,
+        -2,
+        -1,
+        -0.5,
+        0.5,
+        1,
+        2,
+        3,
+        5
+      ],
+      "anchors": [
+        "question_end",
+        "option_A_end",
+        "option_B_end",
+        "option_C_end",
+        "option_D_end",
+        "options_end",
+        "question_end+options_end",
+        "all_option_ends",
+        "content_end"
+      ],
+      "layers": [
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20
+      ],
+      "validation_conflict_cap": 300
+    },
+    "bootstrap": {
+      "debug_samples": 200,
+      "final_samples": 1000
+    },
+    "dataset_path": "mmlu_20_wrapper_robustness_60000.jsonl",
+    "experiment": {
+      "active_wrappers": [
+        "csv_inline",
+        "graphql_query",
+        "html_form",
+        "ini_file",
+        "key_equals",
+        "protobuf_msg",
+        "shell_heredoc",
+        "toml_config"
+      ],
+      "wrapper_categories": [
+        "pure_interface"
+      ],
+      "wrapper_policy": "verified_pure_interface_only"
+    },
+    "fallback_model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+    "focused_mechanistic": {
+      "anchors": [
+        "options_end",
+        "all_option_ends"
+      ],
+      "conditions": [
+        "same_item_clean_to_corrupt",
+        "vanilla_to_corrupt",
+        "cross_item_clean_to_corrupt",
+        "same_label_cross_item_clean_to_corrupt",
+        "different_label_cross_item_clean_to_corrupt"
+      ],
+      "diagnostic_cap": 300,
+      "layers": [
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16
+      ],
+      "patching_cap": 300
+    },
+    "labels": [
+      "A",
+      "B",
+      "C",
+      "D"
+    ],
+    "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "outputs": {
+      "figures_dir": "results/figures",
+      "metadata_dir": "results/metadata",
+      "processed_dir": "results/processed",
+      "raw_dir": "results/raw",
+      "tables_dir": "results/tables"
+    },
+    "scoring": {
+      "answer_variant_policy": "canonical_letter_only",
+      "batch_size": 4,
+      "checkpoint_size": 256,
+      "epsilon": 1e-06,
+      "max_batch_tokens": 40000,
+      "sequence_batch_size": 4,
+      "use_calibrated_primary": true
+    },
+    "seed": 1729,
+    "splits": {
+      "test": 0.2,
+      "train": 0.6,
+      "validation": 0.2
+    }
+  },
+  "dataset": {
+    "audit": {
+      "canonical_fields_missing_counts": {},
+      "correct_label_distribution": {
+        "A": 5616,
+        "B": 6000,
+        "C": 6288,
+        "D": 6096
+      },
+      "dataset_path": "mmlu_20_wrapper_robustness_60000.jsonl",
+      "example_prompts_by_wrapper": {
+        "csv_inline": [
+          "Question,Option,Value\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.,A,0\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.,B,4\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.,C,2\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.,D,6\nSelect the correct option letter.\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+        ],
+        "graphql_query": [
+          "query {\n  question: \"Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\"\n  answer(options: [\n    { letter: \"A\", value: \"0\" },\n    { letter: \"B\", value: \"4\" },\n    { letter: \"C\", value: \"2\" },\n    { letter: \"D\", value: \"6\" }\n  ])\n}\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+        ],
+        "html_form": [
+          "<form>\n<p>Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.</p>\n<label for=\"answer\">Select your answer:</label>\n<select id=\"answer\" name=\"answer\">\n<option value=\"\">--Choose--</option>\n<option value=\"A\">A) 0</option>\n<option value=\"B\">B) 4</option>\n<option value=\"C\">C) 2</option>\n<option value=\"D\">D) 6</option>\n</select>\n</form>\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+        ],
+        "ini_file": [
+          "[question]\ntext=Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\n\n[options]\nA=0\nB=4\nC=2\nD=6\n\n[instruction]\nSelect the correct option by responding with a single letter (A, B, C, or D).\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+        ],
+        "key_equals": [
+          "QUESTION=Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q. OPTION_A=0 OPTION_B=4 OPTION_C=2 OPTION_D=6\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+        ],
+        "protobuf_msg": [
+          "message MCQ {\n  required string question = 1 [default = \"Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\"];\n  repeated string options = 2 [\n    (option) = \"A) 0\",\n    (option) = \"B) 4\",\n    (option) = \"C) 2\",\n    (option) = \"D) 6\"\n  ];\n  required string answer_field = 3 [default = \"Select the correct option letter (A, B, C, or D):\"];\n}\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+        ],
+        "shell_heredoc": [
+          "#!/bin/bash\ncat << 'EOF'\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\nSelect the correct answer by entering the corresponding letter.\n\nA) 0\nB) 4\nC) 2\nD) 6\n\nEOF\nread -p \"Enter your choice (A/B/C/D): \" answer\necho \"You selected: $answer\"\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+        ],
+        "toml_config": [
+          "[question]\ntext = \"Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\"\n\n[options]\nA = \"0\"\nB = \"4\"\nC = \"2\"\nD = \"6\"\n\n[instruction]\nselect = \"Answer with the letter (A, B, C, or D) corresponding to the correct option.\"\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+        ]
+      },
+      "num_items": 3000,
+      "num_rows": 24000,
+      "num_wrappers": 8,
+      "prompt_length_chars": {
+        "max": 5210,
+        "mean": 561.8137083333334,
+        "median": 458.0,
+        "min": 88
+      },
+      "schema_fields": [
+        "coarse_domain",
+        "correct_key",
+        "dataset",
+        "example_id",
+        "manifest_sha256",
+        "module",
+        "options",
+        "prompt_id",
+        "prompt_text",
+        "prompt_uid",
+        "question",
+        "split",
+        "subject",
+        "wrapper_description",
+        "wrapper_id"
+      ],
+      "source_num_rows": 60000,
+      "subject_counts": {
+        "abstract_algebra": 128,
+        "anatomy": 184,
+        "college_chemistry": 432,
+        "college_computer_science": 760,
+        "college_mathematics": 768,
+        "college_medicine": 320,
+        "college_physics": 776,
+        "computer_security": 792,
+        "conceptual_physics": 1224,
+        "elementary_mathematics": 1104,
+        "formal_logic": 432,
+        "high_school_biology": 680,
+        "high_school_chemistry": 1568,
+        "high_school_computer_science": 448,
+        "miscellaneous": 2000,
+        "philosophy": 200,
+        "prehistory": 2000,
+        "professional_accounting": 2000,
+        "professional_law": 2000,
+        "professional_medicine": 1496,
+        "professional_psychology": 2000,
+        "virology": 1320,
+        "world_religions": 1368
+      },
+      "wrapper_category_counts": {
+        "pure_interface": 24000
+      },
+      "wrapper_counts": {
+        "csv_inline": 3000,
+        "graphql_query": 3000,
+        "html_form": 3000,
+        "ini_file": 3000,
+        "key_equals": 3000,
+        "protobuf_msg": 3000,
+        "shell_heredoc": 3000,
+        "toml_config": 3000
+      },
+      "wrapper_policy": "verified_pure_interface_only"
+    },
+    "path": "mmlu_20_wrapper_robustness_60000.jsonl",
+    "sha256": "57c676b3ead7627b5d720c0aacdba1284925cc84fee83bff063d724c87ce085d"
+  },
+  "dependency_versions": {
+    "PyYAML": "6.0.3",
+    "numpy": "2.4.2",
+    "pandas": "3.0.0",
+    "pyarrow": "23.0.0",
+    "python": "3.14.3",
+    "torch": "2.10.0",
+    "transformers": "5.1.0"
+  },
+  "description": "Diagnostics for interface-formatting effects in multiple-choice language-model evaluation.",
+  "manifest_schema_version": 1,
+  "model": {
+    "name": "Qwen/Qwen2.5-1.5B-Instruct"
+  },
+  "pipeline": [
+    "audit-dataset",
+    "wrapper-audit",
+    "behavioral",
+    "conflicts",
+    "attention-diagnostics",
+    "vanilla-convergence",
+    "focused-patching-controls",
+    "figures",
+    "tables",
+    "write-manifest",
+    "deliverables"
+  ],
+  "project": "Interface Formatting Study",
+  "scientific_invariants": [
+    "score answer labels by conditional likelihood, never primary generation parsing",
+    "calibrate with content-free wrapper priors only when same-wrapper redaction succeeds",
+    "split by item_id into internal partitions and never tune on the internal test partition",
+    "primary mechanistic claims use verified pure-interface conflicts with same-wrapper calibration",
+    "attention is diagnostic and not treated as causal evidence by itself",
+    "focused causal controls distinguish same-item answer-state transfer from task-representation restoration",
+    "primary focused patching uses options_end and all_option_ends content anchors rather than final answer-token states",
+    "final tables and figures require full behavioral row coverage"
+  ],
+  "source_hashes": {
+    "configs/default.yaml": "56f9afa9098ee534b2a10b80ff31ae20022fec4e6f874218bb3aab0e12ca8618",
+    "pyproject.toml": "99a447e1f51276e5f5de19b11049a5a5c3c9eaf032326da97c2d3fc20cb5161f",
+    "src/interface_formatting_study/__init__.py": "5668e4d037e8652e91636e7ed8c9f0dc743cfd23dc188d33ba46851a1ce285c1",
+    "src/interface_formatting_study/access_vector.py": "409b8619d6ebf68bed96aa76e6f3ea110dd9ade4ca15f2b2ea10a474a2804017",
+    "src/interface_formatting_study/anchors.py": "648ed9caec83d9b522876af383ce722adbd9c78963c40db71fe05234a71258e5",
+    "src/interface_formatting_study/behavioral_eval.py": "89c5f54add521e12f6a04ff5d84b441ea69611a13f7ee66a177b9481669f7622",
+    "src/interface_formatting_study/calibration.py": "6adc01122b6ec15192c45c7dd795dfff59cd9c705e27a03ccd5b8d65cf276608",
+    "src/interface_formatting_study/cli.py": "6f3b0cefe05e1378a8359ae3f35976c773a2618e9de8b384b8a17498d6292d01",
+    "src/interface_formatting_study/component_patching.py": "35dc8ac10dab4822c87320480a58219def635e7a4dc2bbf34cbf7a041b784937",
+    "src/interface_formatting_study/conflicts.py": "c9c0fc14bcc772e38031c29c3d57c6c5f426a7c755177c1d956043e63d0f1f68",
+    "src/interface_formatting_study/controls.py": "f49d2b550cba7204a4846602f27e20623652b91bb91183a767b493ec6ea64597",
+    "src/interface_formatting_study/data_loading.py": "a2349f0a6600086c1f77d5850d5937b50bf8b3b27bf34593e124a5b73a8be588",
+    "src/interface_formatting_study/deliverables.py": "29aa0126482f96bad965ab8dfe760e158d711c88300ab20a7066b6fd179b77b1",
+    "src/interface_formatting_study/diagnostics.py": "afc7ec46c434fc293b9104bd6c9b7d28da402d2342d6491d2cbaf56fef82ee7a",
+    "src/interface_formatting_study/experiment.py": "1553be535a95498b3fb7b01a0761f5dbceac34ecefe08f0a0e15225498a2d7f3",
+    "src/interface_formatting_study/generation_parser.py": "00bd5e643e7a932c2f9061efb7a6f592c8cb0041a55b18faeae2f643e3a8e09f",
+    "src/interface_formatting_study/hooks.py": "2d799016fdeb1d32160bf221bea0c20b8be87652ec1005ffadc562e16d22f23b",
+    "src/interface_formatting_study/interventions.py": "1fb0a9d625e5a72c3a98b9a99d28e9b897f509a6701d8c452714cd8d305a9e39",
+    "src/interface_formatting_study/model_loader.py": "cf52b2bddd78b818edc5282a70d935e3eeb00459e98f42063f719b27ef0f3e24",
+    "src/interface_formatting_study/patching.py": "273e9c5994d7a4f0e190f1ef78428697f0a05e6bcd443d52b2358adc2ff86e8f",
+    "src/interface_formatting_study/plots.py": "2c0fa0787c24eb40330897d60d04b94d2fc1faf12cd40bdac8873d9345ac841c",
+    "src/interface_formatting_study/scoring.py": "4eadcea279db49055101925b9c0826fdc73f414931c3dd4ecb61204e96045b65",
+    "src/interface_formatting_study/splits.py": "c847576afd6ddd3dbaafa3599b7b0b38722f4dafb65a4fe442ce68a17e6bf59f",
+    "src/interface_formatting_study/statistics.py": "b6b5074fb175015430fb1f9efce40fb06fc394d4b8649ccc8db92cd7ac353174",
+    "src/interface_formatting_study/tables.py": "e19b5ad281b26fd0f6b7073918f0b2ad378429fad087ef8096a429f143b422bb",
+    "src/interface_formatting_study/token_roles.py": "b130cd43e6ab0dfdf827e24f841830c814b5513e26637a823320315e8f098b5d",
+    "src/interface_formatting_study/utils.py": "d2e96132bb5e063f7fe7037360045d2328708c84be52d5c3a7292cbd07f20e91",
+    "src/interface_formatting_study/vanilla.py": "7a2d7763ee1d36804f61b1d7fd7feaf4438cbe5defd77ae5faeeec12ccc5b6bd",
+    "src/interface_formatting_study/wrapper_audit.py": "87b38507f740161c7a42caba1fd5c626a52350e39f76edba996a9e8ba0803c64"
+  },
+  "split_manifest": {
+    "num_items": 3000,
+    "num_prompts": 24000,
+    "source_split_counts": {
+      "test": 24000
+    },
+    "split_item_counts": {
+      "test": 599,
+      "train": 1801,
+      "validation": 600
+    },
+    "split_prompt_counts": {
+      "test": 4792,
+      "train": 14408,
+      "validation": 4800
+    },
+    "subject_by_split": {
+      "test": {
+        "abstract_algebra": 3,
+        "anatomy": 4,
+        "college_chemistry": 11,
+        "college_computer_science": 19,
+        "college_mathematics": 19,
+        "college_medicine": 8,
+        "college_physics": 20,
+        "computer_security": 20,
+        "conceptual_physics": 30,
+        "elementary_mathematics": 27,
+        "formal_logic": 11,
+        "high_school_biology": 17,
+        "high_school_chemistry": 39,
+        "high_school_computer_science": 11,
+        "miscellaneous": 50,
+        "philosophy": 5,
+        "prehistory": 50,
+        "professional_accounting": 50,
+        "professional_law": 50,
+        "professional_medicine": 38,
+        "professional_psychology": 50,
+        "virology": 33,
+        "world_religions": 34
+      },
+      "train": {
+        "abstract_algebra": 10,
+        "anatomy": 14,
+        "college_chemistry": 32,
+        "college_computer_science": 57,
+        "college_mathematics": 58,
+        "college_medicine": 24,
+        "college_physics": 58,
+        "computer_security": 59,
+        "conceptual_physics": 92,
+        "elementary_mathematics": 83,
+        "formal_logic": 32,
+        "high_school_biology": 51,
+        "high_school_chemistry": 118,
+        "high_school_computer_science": 34,
+        "miscellaneous": 150,
+        "philosophy": 15,
+        "prehistory": 150,
+        "professional_accounting": 150,
+        "professional_law": 150,
+        "professional_medicine": 112,
+        "professional_psychology": 150,
+        "virology": 99,
+        "world_religions": 103
+      },
+      "validation": {
+        "abstract_algebra": 3,
+        "anatomy": 5,
+        "college_chemistry": 11,
+        "college_computer_science": 19,
+        "college_mathematics": 19,
+        "college_medicine": 8,
+        "college_physics": 19,
+        "computer_security": 20,
+        "conceptual_physics": 31,
+        "elementary_mathematics": 28,
+        "formal_logic": 11,
+        "high_school_biology": 17,
+        "high_school_chemistry": 39,
+        "high_school_computer_science": 11,
+        "miscellaneous": 50,
+        "philosophy": 5,
+        "prehistory": 50,
+        "professional_accounting": 50,
+        "professional_law": 50,
+        "professional_medicine": 37,
+        "professional_psychology": 50,
+        "virology": 33,
+        "world_religions": 34
+      }
+    }
+  }
+}

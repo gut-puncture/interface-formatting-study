@@ -1,0 +1,65 @@
+dataset_path: mmlu_20_wrapper_robustness_60000.jsonl
+model_name: Qwen/Qwen2.5-1.5B-Instruct
+fallback_model_name: Qwen/Qwen2.5-0.5B-Instruct
+seed: 1729
+splits:
+  train: 0.60
+  validation: 0.20
+  test: 0.20
+labels: ["A", "B", "C", "D"]
+experiment:
+  active_wrappers:
+    - csv_inline
+    - graphql_query
+    - html_form
+    - ini_file
+    - key_equals
+    - protobuf_msg
+    - shell_heredoc
+    - toml_config
+  wrapper_categories: ["pure_interface"]
+  wrapper_policy: "verified_pure_interface_only"
+scoring:
+  answer_variant_policy: "canonical_letter_only"
+  batch_size: 4
+  sequence_batch_size: 4
+  checkpoint_size: 256
+  max_batch_tokens: 40000
+  epsilon: 1.0e-6
+  use_calibrated_primary: true
+activation:
+  layers: [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+  anchors:
+    - question_end
+    - option_A_end
+    - option_B_end
+    - option_C_end
+    - option_D_end
+    - options_end
+    - question_end+options_end
+    - all_option_ends
+    - content_end
+  validation_conflict_cap: 300
+  alpha_grid: [-5, -3, -2, -1, -0.5, 0.5, 1, 2, 3, 5]
+focused_mechanistic:
+  layers: [2, 4, 6, 8, 10, 12, 14, 16]
+  anchors:
+    - options_end
+    - all_option_ends
+  diagnostic_cap: 300
+  patching_cap: 300
+  conditions:
+    - same_item_clean_to_corrupt
+    - vanilla_to_corrupt
+    - cross_item_clean_to_corrupt
+    - same_label_cross_item_clean_to_corrupt
+    - different_label_cross_item_clean_to_corrupt
+bootstrap:
+  debug_samples: 200
+  final_samples: 1000
+outputs:
+  metadata_dir: results/metadata
+  raw_dir: results/raw
+  processed_dir: results/processed
+  figures_dir: results/figures
+  tables_dir: results/tables

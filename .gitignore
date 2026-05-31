@@ -1,0 +1,30 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local and historical run material. The public repo keeps compact final
+# results under results/ and paper/, not raw GPU logs or retired archives.
+gpu_artifacts/
+tmp/
+reference/
+docs/
+run_logs/
+artifacts/
+
+# Generated paper build outputs and bundled submission zips.
+paper/build/
+paper/submission/*.zip
+paper/submission/SHA256SUMS.txt
+results/metadata/plot_cache/
+analysis/semantic_anchor_patching/
+
+# Large model/cache artifacts should be downloaded by tools, not committed.
+.cache/
+*.safetensors
+*.bin
+*.pt
+*.pth

@@ -1,0 +1,102 @@
+{
+  "canonical_fields_missing_counts": {},
+  "correct_label_distribution": {
+    "A": 5616,
+    "B": 6000,
+    "C": 6288,
+    "D": 6096
+  },
+  "dataset_path": "mmlu_20_wrapper_robustness_60000.jsonl",
+  "example_prompts_by_wrapper": {
+    "csv_inline": [
+      "Question,Option,Value\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.,A,0\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.,B,4\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.,C,2\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.,D,6\nSelect the correct option letter.\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+    ],
+    "graphql_query": [
+      "query {\n  question: \"Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\"\n  answer(options: [\n    { letter: \"A\", value: \"0\" },\n    { letter: \"B\", value: \"4\" },\n    { letter: \"C\", value: \"2\" },\n    { letter: \"D\", value: \"6\" }\n  ])\n}\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+    ],
+    "html_form": [
+      "<form>\n<p>Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.</p>\n<label for=\"answer\">Select your answer:</label>\n<select id=\"answer\" name=\"answer\">\n<option value=\"\">--Choose--</option>\n<option value=\"A\">A) 0</option>\n<option value=\"B\">B) 4</option>\n<option value=\"C\">C) 2</option>\n<option value=\"D\">D) 6</option>\n</select>\n</form>\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+    ],
+    "ini_file": [
+      "[question]\ntext=Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\n\n[options]\nA=0\nB=4\nC=2\nD=6\n\n[instruction]\nSelect the correct option by responding with a single letter (A, B, C, or D).\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+    ],
+    "key_equals": [
+      "QUESTION=Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q. OPTION_A=0 OPTION_B=4 OPTION_C=2 OPTION_D=6\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+    ],
+    "protobuf_msg": [
+      "message MCQ {\n  required string question = 1 [default = \"Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\"];\n  repeated string options = 2 [\n    (option) = \"A) 0\",\n    (option) = \"B) 4\",\n    (option) = \"C) 2\",\n    (option) = \"D) 6\"\n  ];\n  required string answer_field = 3 [default = \"Select the correct option letter (A, B, C, or D):\"];\n}\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+    ],
+    "shell_heredoc": [
+      "#!/bin/bash\ncat << 'EOF'\nFind the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\nSelect the correct answer by entering the corresponding letter.\n\nA) 0\nB) 4\nC) 2\nD) 6\n\nEOF\nread -p \"Enter your choice (A/B/C/D): \" answer\necho \"You selected: $answer\"\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+    ],
+    "toml_config": [
+      "[question]\ntext = \"Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\"\n\n[options]\nA = \"0\"\nB = \"4\"\nC = \"2\"\nD = \"6\"\n\n[instruction]\nselect = \"Answer with the letter (A, B, C, or D) corresponding to the correct option.\"\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+    ]
+  },
+  "num_items": 3000,
+  "num_rows": 24000,
+  "num_wrappers": 8,
+  "prompt_length_chars": {
+    "max": 5210,
+    "mean": 561.8137083333334,
+    "median": 458.0,
+    "min": 88
+  },
+  "schema_fields": [
+    "coarse_domain",
+    "correct_key",
+    "dataset",
+    "example_id",
+    "manifest_sha256",
+    "module",
+    "options",
+    "prompt_id",
+    "prompt_text",
+    "prompt_uid",
+    "question",
+    "split",
+    "subject",
+    "wrapper_description",
+    "wrapper_id"
+  ],
+  "source_num_rows": 60000,
+  "subject_counts": {
+    "abstract_algebra": 128,
+    "anatomy": 184,
+    "college_chemistry": 432,
+    "college_computer_science": 760,
+    "college_mathematics": 768,
+    "college_medicine": 320,
+    "college_physics": 776,
+    "computer_security": 792,
+    "conceptual_physics": 1224,
+    "elementary_mathematics": 1104,
+    "formal_logic": 432,
+    "high_school_biology": 680,
+    "high_school_chemistry": 1568,
+    "high_school_computer_science": 448,
+    "miscellaneous": 2000,
+    "philosophy": 200,
+    "prehistory": 2000,
+    "professional_accounting": 2000,
+    "professional_law": 2000,
+    "professional_medicine": 1496,
+    "professional_psychology": 2000,
+    "virology": 1320,
+    "world_religions": 1368
+  },
+  "wrapper_category_counts": {
+    "pure_interface": 24000
+  },
+  "wrapper_counts": {
+    "csv_inline": 3000,
+    "graphql_query": 3000,
+    "html_form": 3000,
+    "ini_file": 3000,
+    "key_equals": 3000,
+    "protobuf_msg": 3000,
+    "shell_heredoc": 3000,
+    "toml_config": 3000
+  },
+  "wrapper_policy": "verified_pure_interface_only"
+}

@@ -1,0 +1,2 @@
+number_of_mmlu_items,number_of_wrappers,number_of_prompts,number_of_pure_interface_wrappers,number_of_style_transforming_wrappers,mean_prompt_chars,max_prompt_chars,behavioral_run_type,behavioral_rows_scored
+3000,8,24000,8,0,561.8137083333334,5210,final,24000

@@ -1,0 +1,21 @@
+wrapper_name,category,verified_pure_interface,contains_question_verbatim,contains_all_choices_verbatim,question_preservation_rate,choice_preservation_rate,mean_prompt_chars,notes
+academic_abstract,style_transforming,False,False,False,0.5666666666666667,0.9536666666666667,862.8863333333334,manual/name heuristic indicates semantic or stylistic transformation
+ascii_box,pure_interface_unverified,False,True,False,0.9836666666666667,0.9796666666666667,1414.181,manual/name pure-interface candidate; excluded from primary claims because canonical-field checks fail
+changelog_entry,style_transforming,False,False,False,0.6763333333333333,0.9686666666666667,564.872,manual/name heuristic indicates semantic or stylistic transformation
+csv_inline,pure_interface,True,True,True,0.9426666666666667,0.9913333333333333,516.8886666666667,verified pure-interface: canonical-field checks pass
+graphql_query,pure_interface,True,True,True,0.9856666666666667,0.994,561.4753333333333,verified pure-interface: canonical-field checks pass
+haiku_riddle,style_transforming,False,False,True,0.024,0.9823333333333333,293.6186666666667,manual/name heuristic indicates semantic or stylistic transformation
+html_form,pure_interface,True,True,True,0.9993333333333333,0.993,685.9616666666667,verified pure-interface: canonical-field checks pass
+ini_file,pure_interface,True,True,True,0.992,0.993,522.3656666666667,verified pure-interface: canonical-field checks pass
+irc_log,style_transforming,False,True,False,0.9313333333333333,0.9783333333333334,623.2003333333333,manual/name heuristic indicates semantic or stylistic transformation
+key_equals,pure_interface,True,True,True,0.9966666666666667,0.9946666666666667,439.3996666666667,verified pure-interface: canonical-field checks pass
+legal_clause,style_transforming,False,False,False,0.731,0.9746666666666667,607.6066666666667,manual/name heuristic indicates semantic or stylistic transformation
+meeting_minutes,style_transforming,False,False,False,0.655,0.9703333333333334,820.741,manual/name heuristic indicates semantic or stylistic transformation
+protobuf_msg,pure_interface,True,True,True,0.9963333333333333,0.9936666666666667,667.077,verified pure-interface: canonical-field checks pass
+quest_briefing,style_transforming,False,False,False,0.5176666666666667,0.962,650.1393333333333,manual/name heuristic indicates semantic or stylistic transformation
+recipe_instruction,style_transforming,False,False,False,0.788,0.9703333333333334,694.0536666666667,manual/name heuristic indicates semantic or stylistic transformation
+regex_match,pure_interface_unverified,False,False,True,0.737,0.983,529.3413333333333,manual/name pure-interface candidate; excluded from primary claims because canonical-field checks fail
+s_expression,pure_interface_unverified,False,False,False,0.7626666666666667,0.8926666666666667,455.5933333333333,manual/name pure-interface candidate; excluded from primary claims because canonical-field checks fail
+shell_heredoc,pure_interface,True,True,True,0.9926666666666667,0.9936666666666667,556.4083333333333,verified pure-interface: canonical-field checks pass
+toml_config,pure_interface,True,True,True,0.998,0.9936666666666667,544.9333333333333,verified pure-interface: canonical-field checks pass
+tweet_thread,style_transforming,False,False,False,0.563,0.9233333333333333,471.766,manual/name heuristic indicates semantic or stylistic transformation
