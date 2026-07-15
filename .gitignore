@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
+uv.lock
 
 # Local and historical run material. The public repo keeps compact final
 # results under results/ and paper/, not raw GPU logs or retired archives.
@@ -17,6 +19,7 @@ artifacts/
 
 # Generated paper build outputs and bundled submission zips.
 paper/build/
+paper/main.pdf
 paper/submission/*.zip
 paper/submission/SHA256SUMS.txt
 results/metadata/plot_cache/
