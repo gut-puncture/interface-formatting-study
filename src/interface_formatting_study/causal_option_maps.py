@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import difflib
 import hashlib
 import io
 import re
@@ -572,3 +573,181 @@ def transform_with_option_map(
                 for target_span, moving_span in zip(target.payload_spans, moving.payload_spans, strict=True)
             )
     return _replace_spans(source, replacements)
+
+
+def remap_option_map_by_redaction_diff(
+    parsed: ParsedPrompt,
+    source: str,
+    redacted: str,
+) -> ParsedPrompt:
+    """Transfer a verified map when redaction changes only payload regions."""
+
+    validate_option_map(parsed, source)
+    if not parsed.separable:
+        raise ValueError("cannot remap a nonseparable option map")
+    opcodes = difflib.SequenceMatcher(a=source, b=redacted, autojunk=False).get_opcodes()
+
+    def unchanged(span: SourceSpan) -> SourceSpan:
+        for tag, source_start, source_end, target_start, _target_end in opcodes:
+            if tag == "equal" and source_start <= span.start and span.end <= source_end:
+                offset = target_start - source_start
+                return SourceSpan(span.start + offset, span.end + offset)
+        raise ValueError("redaction changed an option label span")
+
+    payload_map: dict[SourceSpan, SourceSpan] = {}
+    for content_id, label in enumerate(LETTERS):
+        source_spans = sorted(
+            (
+                span
+                for representation in parsed.representations
+                for slot in representation.slots
+                if slot.content_id == content_id
+                for span in slot.payload_spans
+            ),
+            key=lambda span: span.start,
+        )
+        token = f"OPTION_{label}_PLACEHOLDER"
+        target_spans = [_span(match) for match in re.finditer(re.escape(token), redacted)]
+        if len(source_spans) != len(target_spans):
+            raise ValueError(f"redaction payload count mismatch for option {label}")
+        payload_map.update(zip(source_spans, target_spans, strict=True))
+
+    remapped = ParsedPrompt(
+        wrapper_name=parsed.wrapper_name,
+        source_sha256=hashlib.sha256(redacted.encode("utf-8")).hexdigest(),
+        representations=tuple(
+            OptionRepresentation(
+                tuple(
+                    OptionSlot(
+                        slot.content_id,
+                        tuple(unchanged(span) for span in slot.label_spans),
+                        tuple(payload_map[span] for span in slot.payload_spans),
+                    )
+                    for slot in representation.slots
+                )
+            )
+            for representation in parsed.representations
+        ),
+        separable=True,
+        not_applicable_reason="",
+        provenance=parsed.provenance,
+    )
+    validate_option_map(remapped, redacted)
+    return remapped
+
+
+def remap_option_map_through_canonical_redaction(
+    parsed: ParsedPrompt,
+    source: str,
+    *,
+    question: str,
+    choices: Sequence[str],
+    redacted: str,
+) -> ParsedPrompt:
+    """Track intended option spans through the project's exact redaction steps.
+
+    Short answer strings can also occur in wrapper syntax.  The existing
+    calibration protocol replaces those occurrences too; event tracking lets
+    us preserve that prompt byte-for-byte while mapping only the replacements
+    that came from the four verified option payload spans.
+    """
+
+    validate_option_map(parsed, source)
+    if not parsed.separable:
+        raise ValueError("cannot remap a nonseparable option map")
+    if len(choices) != 4:
+        raise ValueError("canonical redaction requires four choices")
+
+    # Each unit retains the source character it descended from and, for an
+    # inserted option placeholder, the unique replacement event that made it.
+    units: list[tuple[str, int | None, int | None]] = [
+        (character, index, None) for index, character in enumerate(source)
+    ]
+    event_origins: dict[int, tuple[int, ...]] = {}
+    next_event = 0
+
+    def text() -> str:
+        return "".join(character for character, _origin, _event in units)
+
+    def replace_matches(pattern: str, replacement: str, *, track_event: bool) -> None:
+        nonlocal next_event
+        flags = re.IGNORECASE if not track_event else 0
+        matches = list(re.finditer(re.escape(pattern), text(), flags=flags))
+        for match in reversed(matches):
+            removed = units[match.start() : match.end()]
+            event = next_event if track_event else None
+            if track_event:
+                event_origins[next_event] = tuple(
+                    origin for _character, origin, _old_event in removed if origin is not None
+                )
+                next_event += 1
+            units[match.start() : match.end()] = [
+                (character, None, event) for character in replacement
+            ]
+
+    replace_matches(question, "QUESTION_TEXT_PLACEHOLDER", track_event=False)
+    for label, choice in zip(LETTERS, choices, strict=True):
+        replace_matches(str(choice), f"OPTION_{label}_PLACEHOLDER", track_event=True)
+    if text() != redacted:
+        raise ValueError("redacted prompt does not match canonical redaction")
+
+    origin_positions: dict[int, list[int]] = {}
+    event_positions: dict[int, list[int]] = {}
+    for position, (_character, origin, event) in enumerate(units):
+        if origin is not None:
+            origin_positions.setdefault(origin, []).append(position)
+        if event is not None:
+            event_positions.setdefault(event, []).append(position)
+
+    def consecutive_span(positions: Sequence[int], *, description: str) -> SourceSpan:
+        if not positions or list(positions) != list(range(positions[0], positions[-1] + 1)):
+            raise ValueError(f"{description} is not contiguous after redaction")
+        return SourceSpan(positions[0], positions[-1] + 1)
+
+    def translate_label(span: SourceSpan) -> SourceSpan:
+        positions = [
+            position
+            for origin in range(span.start, span.end)
+            for position in origin_positions.get(origin, ())
+        ]
+        return consecutive_span(positions, description="option label span")
+
+    payload_events: dict[SourceSpan, int] = {}
+    for representation in parsed.representations:
+        for slot in representation.slots:
+            for span in slot.payload_spans:
+                expected = tuple(range(span.start, span.end))
+                matches = [event for event, origins in event_origins.items() if origins == expected]
+                if len(matches) != 1:
+                    raise ValueError("could not identify the intended option replacement event")
+                payload_events[span] = matches[0]
+
+    representations = tuple(
+        OptionRepresentation(
+            tuple(
+                OptionSlot(
+                    slot.content_id,
+                    tuple(translate_label(span) for span in slot.label_spans),
+                    tuple(
+                        consecutive_span(
+                            event_positions[payload_events[span]],
+                            description="option payload span",
+                        )
+                        for span in slot.payload_spans
+                    ),
+                )
+                for slot in representation.slots
+            )
+        )
+        for representation in parsed.representations
+    )
+    remapped = ParsedPrompt(
+        wrapper_name=parsed.wrapper_name,
+        source_sha256=hashlib.sha256(redacted.encode("utf-8")).hexdigest(),
+        representations=representations,
+        separable=True,
+        not_applicable_reason="",
+        provenance=parsed.provenance,
+    )
+    validate_option_map(remapped, redacted)
+    return remapped

@@ -100,6 +100,17 @@ def cmd_prepare(args) -> None:
     write_table_atomic(design, output)
     applicability_path = output.with_name(output.stem + ".applicability.parquet")
     write_table_atomic(applicability, applicability_path)
+    option_audit = None
+    if getattr(args, "option_audit", None):
+        audit_root = Path(args.option_audit)
+        option_audit = {
+            "path": str(audit_root),
+            "manifest_sha256": sha256_file(audit_root / "manifest.json"),
+            "label_hashes": {
+                path.name: sha256_file(path)
+                for path in sorted((audit_root / "labels").glob("*.jsonl"))
+            },
+        }
     _atomic_json(
         {
             "design_schema_version": DESIGN_SCHEMA_VERSION,
@@ -123,7 +134,7 @@ def cmd_prepare(args) -> None:
                 "label_only": 3,
             },
             "answer_text_rows": 1,
-            "option_audit": str(args.option_audit) if getattr(args, "option_audit", None) else None,
+            "option_audit": option_audit,
             "scope": DESIGN_SCOPE,
         },
         output.with_name(output.name + ".manifest.json"),

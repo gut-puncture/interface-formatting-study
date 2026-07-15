@@ -98,10 +98,18 @@ def test_prepare_keeps_all_items_and_records_arm_applicability(tmp_path, monkeyp
     monkeypatch.setattr(causal_cli, "read_yaml", lambda _path: {})
     monkeypatch.setattr(causal_cli, "prepare_dataset", lambda _config: (frame, pd.DataFrame()))
     output = tmp_path / "design.parquet"
+    audit = tmp_path / "audit"
+    (audit / "labels").mkdir(parents=True)
+    (audit / "manifest.json").write_text('{"schema_version":1}\n')
+    (audit / "labels" / "annotations.jsonl").write_text('{"annotation_id":"x"}\n')
+    monkeypatch.setattr(causal_cli, "load_causal_option_annotations", lambda _path: {})
 
     causal_cli.cmd_prepare(
         argparse.Namespace(
-            config="unused.yaml", splits="train,validation", output=str(output), option_audit=None
+            config="unused.yaml",
+            splits="train,validation",
+            output=str(output),
+            option_audit=str(audit),
         )
     )
 
@@ -110,6 +118,13 @@ def test_prepare_keeps_all_items_and_records_arm_applicability(tmp_path, monkeyp
     assert manifest["scope"] == "source_prompt_counterfactual"
     assert manifest["source_items"] == 2
     assert manifest["retained_items"] == 2
+    assert manifest["option_audit"] == {
+        "path": str(audit),
+        "manifest_sha256": sha256_file(audit / "manifest.json"),
+        "label_hashes": {
+            "annotations.jsonl": sha256_file(audit / "labels" / "annotations.jsonl")
+        },
+    }
     applicability = pd.read_parquet(output.with_name(output.stem + ".applicability.parquet"))
     unresolved = applicability[
         (applicability["item_id"] == "item-2")

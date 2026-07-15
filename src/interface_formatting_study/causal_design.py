@@ -7,8 +7,14 @@ from typing import Sequence
 
 import pandas as pd
 
-from .calibration import make_content_free_prompt_with_metadata
-from .causal_option_maps import ParsedPrompt, parse_prompt_options, transform_with_option_map
+from .calibration import SAME_WRAPPER_REDACTION, make_content_free_prompt_with_metadata
+from .causal_option_maps import (
+    ParsedPrompt,
+    parse_prompt_options,
+    remap_option_map_by_redaction_diff,
+    remap_option_map_through_canonical_redaction,
+    transform_with_option_map,
+)
 from .vanilla import build_vanilla_prompt
 
 
@@ -516,6 +522,24 @@ def _v3_rows_for_item_format(
             )
         except ValueError as exc:
             parse_reason = f"calibration:{exc}"
+            if calibration["content_free_calibration_kind"] == SAME_WRAPPER_REDACTION:
+                try:
+                    parsed_calibration = remap_option_map_through_canonical_redaction(
+                        parsed_source,
+                        source_prompt,
+                        question=str(item["question"]),
+                        choices=choices,
+                        redacted=source_calibration,
+                    )
+                except ValueError:
+                    try:
+                        parsed_calibration = remap_option_map_by_redaction_diff(
+                            parsed_source,
+                            source_prompt,
+                            source_calibration,
+                        )
+                    except ValueError:
+                        pass
     separable = bool(
         parsed_source is not None
         and parsed_source.separable

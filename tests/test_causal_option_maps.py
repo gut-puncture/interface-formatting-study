@@ -3,7 +3,13 @@ from __future__ import annotations
 import hashlib
 
 from interface_formatting_study.causal_option_maps import (
+    OptionRepresentation,
+    OptionSlot,
+    ParsedPrompt,
+    SourceSpan,
     parse_prompt_options,
+    remap_option_map_by_redaction_diff,
+    remap_option_map_through_canonical_redaction,
     transform_with_option_map,
 )
 
@@ -260,3 +266,62 @@ def test_source_redacted_calibration_shapes_remain_transformable():
         transformed = transform_with_option_map(parsed, prompt, position_shift=1, label_shift=0)
         assert transformed != prompt
         assert transformed.count("OPTION_A_PLACEHOLDER") == 1
+
+
+def test_canonical_redaction_remap_ignores_accidental_short_choice_replacements():
+    source = "Question=e?\nA=3\nB=e\nC=sqrt(5)\nD=0" + SUFFIX
+    choices = ["3", "e", "sqrt(5)", "0"]
+    parsed = parse_prompt_options(source, "key_equals", choices)
+    redacted = source.replace("Question=e?", "QUESTION_TEXT_PLACEHOLDER")
+    for label, choice in zip("ABCD", choices, strict=True):
+        redacted = redacted.replace(choice, f"OPTION_{label}_PLACEHOLDER")
+
+    remapped = remap_option_map_through_canonical_redaction(
+        parsed,
+        source,
+        question="Question=e?",
+        choices=choices,
+        redacted=redacted,
+    )
+    transformed = transform_with_option_map(remapped, redacted, position_shift=1, label_shift=0)
+
+    assert redacted.count("OPTION_B_PLACEHOLDER") > 1
+    assert len(remapped.representations[0].slots[1].payload_spans) == 1
+    assert transformed.count("OPTION_B_PLACEHOLDER") == redacted.count("OPTION_B_PLACEHOLDER")
+
+
+def test_redaction_diff_remap_handles_parser_payload_punctuation():
+    source = "A,NaBr\nB, NiSO3\nC, CrCl3\nD, Mn(NO3)2" + SUFFIX
+    choices = ["NaBr", "NiSO3", "CrCl3", "Mn(NO3)2"]
+    parsed = ParsedPrompt(
+        wrapper_name="csv_inline",
+        source_sha256=hashlib.sha256(source.encode()).hexdigest(),
+        representations=(
+            OptionRepresentation(
+                tuple(
+                    OptionSlot(
+                        index,
+                        (SourceSpan(source.index(f"{label},"), source.index(f"{label},") + 1),),
+                        (
+                            SourceSpan(
+                                source.index(choice) - (1 if index else 0),
+                                source.index(choice) + len(choice),
+                            ),
+                        ),
+                    )
+                    for index, (label, choice) in enumerate(zip("ABCD", choices, strict=True))
+                )
+            ),
+        ),
+        separable=True,
+        not_applicable_reason="",
+    )
+    redacted = source
+    for label, choice in zip("ABCD", choices, strict=True):
+        redacted = redacted.replace(choice, f"OPTION_{label}_PLACEHOLDER")
+
+    remapped = remap_option_map_by_redaction_diff(parsed, source, redacted)
+    transformed = transform_with_option_map(remapped, redacted, position_shift=1, label_shift=0)
+
+    assert transformed.count("OPTION_A_PLACEHOLDER") == 1
+    assert transformed != redacted
