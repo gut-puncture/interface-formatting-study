@@ -10,8 +10,9 @@ import pandas as pd
 import pytest
 import torch
 
+from causal_fixtures import source_prompt_frame
 from interface_formatting_study import causal_cli
-from interface_formatting_study.causal_design import ACTIVE_WRAPPERS, build_causal_design
+from interface_formatting_study.causal_design import build_causal_design
 from interface_formatting_study.run_identity import sha256_file
 
 
@@ -24,29 +25,70 @@ VERIFY_SPEC.loader.exec_module(VERIFY)
 
 
 def _write_design(tmp_path):
-    design = build_causal_design(
-        pd.DataFrame(
-            [
-                {
-                    "item_id": "item-1",
-                    "subject": "math",
-                    "split": "train",
-                    "question": "What is 2+2?",
-                    "choices": ["3", "4", "5", "6"],
-                    "correct_index": 1,
-                    "wrapper_name": wrapper,
-                    "wrapped_prompt": f"original-{wrapper}",
-                }
-                for wrapper in ACTIVE_WRAPPERS
-            ]
-        )
-    )
+    design = build_causal_design(source_prompt_frame())
     path = tmp_path / "design.parquet"
     design.to_parquet(path, index=False)
     path.with_name(path.name + ".manifest.json").write_text(
-        json.dumps({"sha256": sha256_file(path), "rows": len(design)})
+        json.dumps(
+            {
+                "design_schema_version": 4,
+                "scope": "source_prompt_counterfactual",
+                "sha256": sha256_file(path),
+                "rows": len(design),
+            }
+        )
     )
     return path, design
+
+
+def test_load_design_rejects_old_canonical_template_manifest(tmp_path):
+    path, design = _write_design(tmp_path)
+    path.with_name(path.name + ".manifest.json").write_text(
+        json.dumps(
+            {
+                "design_schema_version": 3,
+                "scope": "controlled canonical templates; original prompts remain in the observational study",
+                "sha256": sha256_file(path),
+                "rows": len(design),
+            }
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="source-preserving"):
+        causal_cli._load_design(path)
+
+
+def test_prepare_records_source_preservation_and_whole_item_exclusions(tmp_path, monkeypatch):
+    source = source_prompt_frame()
+    excluded = source.copy()
+    excluded["item_id"] = "item-2"
+    excluded.loc[excluded["wrapper_name"] == "protobuf_msg", "wrapped_prompt"] = (
+        'message MCQ { repeated string options = 1 ["3", "4", "5", "6"]; }'
+        "\n\nReturn only the letter (A, B, C, or D).\nAnswer: "
+    )
+    frame = pd.concat([source, excluded], ignore_index=True)
+    monkeypatch.setattr(causal_cli, "read_yaml", lambda _path: {})
+    monkeypatch.setattr(causal_cli, "prepare_dataset", lambda _config: (frame, pd.DataFrame()))
+    output = tmp_path / "design.parquet"
+
+    causal_cli.cmd_prepare(
+        argparse.Namespace(config="unused.yaml", splits="train,validation", output=str(output))
+    )
+
+    manifest = json.loads(output.with_name(output.name + ".manifest.json").read_text())
+    assert manifest["design_schema_version"] == 4
+    assert manifest["scope"] == "source_prompt_counterfactual"
+    assert manifest["source_items"] == 2
+    assert manifest["eligible_items"] == 1
+    assert manifest["excluded_items"] == 1
+    exclusions = pd.read_parquet(output.with_name(output.stem + ".exclusions.parquet"))
+    assert exclusions.to_dict("records") == [
+        {
+            "item_id": "item-2",
+            "wrapper_name": "protobuf_msg",
+            "reason": "option_labels_not_unambiguous",
+        }
+    ]
 
 
 def test_causal_cli_runs_identity_bound_canary(

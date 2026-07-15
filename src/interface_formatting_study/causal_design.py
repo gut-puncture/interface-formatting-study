@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import csv
 import hashlib
-import html
-import io
-import json
+import re
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Sequence
 
 import pandas as pd
+
+from .calibration import make_content_free_prompt_with_metadata
+from .vanilla import build_vanilla_prompt
 
 
 ACTIVE_WRAPPERS = (
@@ -36,12 +36,164 @@ class Assignment:
 
 
 @dataclass(frozen=True)
-class RenderedPrompt:
-    prompt: str
-    prompt_sha256: str
-    correct_output: str
-    calibration_prompt: str | None
-    calibration_prompt_sha256: str | None
+class _Span:
+    start: int
+    end: int
+    value: str
+
+
+_LETTER_INSTRUCTION = "Return only the letter (A, B, C, or D)."
+_TEXT_INSTRUCTION = "Return only the exact answer text, not its letter."
+
+
+_LABEL_PATTERNS: dict[str, tuple[str, ...]] = {
+    "csv_inline": (
+        r"(?m)^(?:[^,\n]*,)?[ \t]*(?P<label>[A-D])(?=[ \t]*,)",
+        r"(?<=,)(?P<label>[A-D])(?=,)",
+        r"(?m)\bOption[ \t]+(?P<label>[A-D])(?=[ \t]*(?:,|$))",
+        r"(?<![A-Za-z0-9_])(?P<label>[A-D])(?=\))",
+    ),
+    "graphql_query": (
+        r'\bletter\s*:\s*"(?P<label>[A-D])"',
+        r'\blabel\s*:\s*"(?P<label>[A-D])"',
+        r"\bchoice\s*:\s*(?P<label>[A-D])(?![A-Za-z0-9_])",
+        r'\boption\s*:\s*"(?P<label>[A-D])"',
+        r"\boption(?P<label>[A-D])(?=\s*:)",
+        r'(?<![A-Za-z0-9_])(?P<label>[A-D])(?=\s*:\s*")',
+    ),
+    "html_form": (
+        r'\bvalue=["\'](?P<label>[A-D])["\']',
+        r"(?<=>|[ \t])(?P<label>[A-D])(?=\)|:)",
+    ),
+    "ini_file": (
+        r'(?mi)^[ \t]*(?:option_|choice_)?(?P<label>[A-D])(?=[ \t]*=)',
+    ),
+    "key_equals": (
+        r'(?mi)(?<![A-Za-z0-9_])(?:OPTION_)?(?P<label>[A-D])(?=[ \t]*=)',
+        r"(?mi)\bOPTIONS_(?P<label>[A-D])(?==)",
+        r"(?m)(?<![A-Za-z0-9_])(?P<label>[A-D])(?=\))",
+    ),
+    "protobuf_msg": (
+        r"(?i)\bOPTION_(?P<label>[A-D])\b",
+        r"(?i)\boption_(?P<label>[A-D])\b",
+        r"(?i)\boption(?P<label>[A-D])\b",
+        r'\blabel\s*:\s*"(?P<label>[A-D])"',
+        r'(?<=["\'])(?P<label>[A-D])(?=\))',
+        r"\b(?:Option|option)[ \t]+(?P<label>[A-D])(?=\s*:)",
+        r"(?m)^[ \t]*(?P<label>[A-D])(?=[ \t]*=)",
+        r"(?m)//[ \t]*(?P<label>[A-D])(?=\))",
+    ),
+    "shell_heredoc": (
+        r"(?m)^[ \t]*(?P<label>[A-D])(?=\))",
+        r"(?<=[\"'])(?P<label>[A-D])(?=\))",
+        r"(?m)^[ \t]*(?P<label>[A-D])(?==)",
+        r'\bANSWER=["\'](?P<label>[A-D])["\'](?=[ \t]*#)',
+    ),
+    "toml_config": (
+        r'(?mi)^[ \t]*(?:option_|choice_|option\.|["\'])(?P<label>[A-D])(?:["\'])?(?=[ \t]*=)',
+        r"(?mi)^[ \t]*(?P<label>[A-D])(?=[ \t]*=)",
+    ),
+    "plain": (r"(?m)^[ \t]*(?P<label>[A-D])(?=\))",),
+}
+
+
+def _label_spans(prompt: str, wrapper_name: str) -> tuple[_Span, ...]:
+    patterns = _LABEL_PATTERNS.get(wrapper_name)
+    if patterns is None:
+        raise ValueError(f"unknown_source_wrapper:{wrapper_name}")
+    option_region = prompt.split(f"\n\n{_LETTER_INSTRUCTION}", 1)[0]
+    instruction_lists = [
+        match.span()
+        for match in re.finditer(
+            r"\(\s*A\s*[,/]\s*B\s*[,/]\s*C\s*(?:,\s*or|[,/])\s*D\s*\)",
+            option_region,
+            flags=re.IGNORECASE,
+        )
+    ]
+    by_position: dict[tuple[int, int], _Span] = {}
+    for pattern in patterns:
+        for match in re.finditer(pattern, option_region):
+            start, end = match.span("label")
+            if any(list_start <= start < list_end for list_start, list_end in instruction_lists):
+                continue
+            by_position[(start, end)] = _Span(start, end, match.group("label").upper())
+    spans = tuple(sorted(by_position.values(), key=lambda span: span.start))
+    counts = {label: sum(span.value == label for span in spans) for label in LETTERS}
+    if not spans or len(set(counts.values())) != 1 or next(iter(counts.values())) < 1:
+        raise ValueError("option_labels_not_unambiguous")
+    return spans
+
+
+def _text_spans(
+    prompt: str, choices: Sequence[str], label_spans: Sequence[_Span]
+) -> tuple[_Span, ...]:
+    if len(choices) != 4 or len(set(map(str, choices))) != 4:
+        raise ValueError("option_texts_not_unambiguous")
+    first_label_position = {
+        label: min(span.start for span in label_spans if span.value == label) for label in LETTERS
+    }
+    option_region_end = prompt.find(f"\n\n{_LETTER_INSTRUCTION}")
+    if option_region_end < 0:
+        option_region_end = len(prompt)
+    spans: list[_Span] = []
+    for index, choice in enumerate(map(str, choices)):
+        occurrences = list(re.finditer(re.escape(choice), prompt))
+        if len(occurrences) > 1:
+            lower = first_label_position[LETTERS[index]]
+            upper = (
+                first_label_position[LETTERS[index + 1]]
+                if index + 1 < len(LETTERS)
+                else option_region_end
+            )
+            occurrences = [match for match in occurrences if lower <= match.start() < upper]
+        if len(occurrences) != 1:
+            raise ValueError("option_texts_not_unambiguous")
+        match = occurrences[0]
+        spans.append(_Span(match.start(), match.end(), choice))
+    if len({(span.start, span.end) for span in spans}) != 4:
+        raise ValueError("option_texts_not_unambiguous")
+    return tuple(spans)
+
+
+def _replace_spans(prompt: str, replacements: Sequence[tuple[_Span, str]]) -> str:
+    ordered = sorted(replacements, key=lambda pair: pair[0].start)
+    parts: list[str] = []
+    cursor = 0
+    for span, replacement in ordered:
+        if span.start < cursor:
+            raise ValueError("option_spans_overlap")
+        parts.extend((prompt[cursor : span.start], replacement))
+        cursor = span.end
+    parts.append(prompt[cursor:])
+    return "".join(parts)
+
+
+def _source_counterfactual(
+    prompt: str,
+    wrapper_name: str,
+    assignment: Assignment,
+    choices: Sequence[str],
+) -> str:
+    if assignment.manipulation == "controlled_baseline":
+        return prompt
+    if assignment.manipulation not in {"position_only", "label_only"}:
+        raise ValueError(f"Unknown manipulation {assignment.manipulation!r}")
+    label_spans = _label_spans(prompt, wrapper_name)
+    replacements = [
+        (span, assignment.labels_by_position[LETTERS.index(span.value)]) for span in label_spans
+    ]
+    if assignment.manipulation == "position_only":
+        replacements.extend(
+            (span, str(choices[assignment.content_ids_by_position[index]]))
+            for index, span in enumerate(_text_spans(prompt, choices, label_spans))
+        )
+    return _replace_spans(prompt, replacements)
+
+
+def _text_readout_prompt(prompt: str) -> str:
+    if prompt.count(_LETTER_INSTRUCTION) != 1:
+        raise ValueError("Source prompt must contain exactly one terminal letter instruction")
+    return prompt.replace(_LETTER_INSTRUCTION, _TEXT_INSTRUCTION)
 
 
 def _assignment(variant: int, manipulation: str, position_shift: int, label_shift: int) -> Assignment:
@@ -68,150 +220,6 @@ def balanced_assignments() -> tuple[Assignment, ...]:
     rows.extend(_assignment(shift, "position_only", shift, 0) for shift in range(1, 4))
     rows.extend(_assignment(shift + 3, "label_only", 0, shift) for shift in range(1, 4))
     return tuple(rows)
-
-
-def _quoted(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
-def _plain(question: str, options: list[tuple[str, str]]) -> str:
-    rows = "\n".join(f"{label}) {text}" for label, text in options)
-    return f"{question}\n\n{rows}"
-
-
-def _csv(question: str, options: list[tuple[str, str]]) -> str:
-    output = io.StringIO(newline="")
-    writer = csv.writer(output, lineterminator="\n")
-    writer.writerow(["field", "label", "text"])
-    writer.writerow(["question", "", question])
-    for label, text in options:
-        writer.writerow(["option", label, text])
-    return output.getvalue().rstrip("\n")
-
-
-def _graphql(question: str, options: list[tuple[str, str]]) -> str:
-    option_lines = "\n".join(
-        f"    slot{position}: option(label: {_quoted(label)}, text: {_quoted(text)})"
-        for position, (label, text) in enumerate(options)
-    )
-    return f"query MultipleChoice {{\n  question(text: {_quoted(question)})\n  options {{\n{option_lines}\n  }}\n}}"
-
-
-def _html(question: str, options: list[tuple[str, str]]) -> str:
-    rows = "\n".join(
-        f'  <label><input type="radio" name="answer" value="{html.escape(label, quote=True)}"> '
-        f"{html.escape(label)}: {html.escape(text)}</label>"
-        for label, text in options
-    )
-    return f"<form>\n  <fieldset>\n    <legend>{html.escape(question)}</legend>\n{rows}\n  </fieldset>\n</form>"
-
-
-def _ini(question: str, options: list[tuple[str, str]]) -> str:
-    rows = "\n".join(f"{label} = {_quoted(text)}" for label, text in options)
-    return f"[question]\ntext = {_quoted(question)}\n\n[options]\n{rows}"
-
-
-def _key_equals(question: str, options: list[tuple[str, str]]) -> str:
-    rows = "\n".join(f"option_{label}={_quoted(text)}" for label, text in options)
-    return f"question={_quoted(question)}\n{rows}"
-
-
-def _protobuf(question: str, options: list[tuple[str, str]]) -> str:
-    rows = "\n".join(
-        f"options {{ label: {_quoted(label)} text: {_quoted(text)} }}" for label, text in options
-    )
-    return f"question: {_quoted(question)}\n{rows}"
-
-
-def _shell(question: str, options: list[tuple[str, str]]) -> str:
-    body = "\n".join([f"Question: {question}", *(f"{label}) {text}" for label, text in options)])
-    marker = "MCQ_EOF"
-    while marker in body:
-        marker += "_X"
-    return f"cat <<'{marker}'\n{body}\n{marker}"
-
-
-def _toml(question: str, options: list[tuple[str, str]]) -> str:
-    rows = "\n".join(f"{label} = {_quoted(text)}" for label, text in options)
-    return f"[multiple_choice]\nquestion = {_quoted(question)}\n\n[multiple_choice.options]\n{rows}"
-
-
-_RENDERERS: dict[str, Callable[[str, list[tuple[str, str]]], str]] = {
-    "plain": _plain,
-    "csv_inline": _csv,
-    "graphql_query": _graphql,
-    "html_form": _html,
-    "ini_file": _ini,
-    "key_equals": _key_equals,
-    "protobuf_msg": _protobuf,
-    "shell_heredoc": _shell,
-    "toml_config": _toml,
-}
-
-
-def _render_body(
-    format_name: str,
-    question: str,
-    choices: Sequence[str],
-    assignment: Assignment,
-) -> str:
-    options = [
-        (assignment.labels_by_position[position], str(choices[content_id]))
-        for position, content_id in enumerate(assignment.content_ids_by_position)
-    ]
-    return _RENDERERS[format_name](question, options)
-
-
-def render_causal_prompt(
-    format_name: str,
-    question: str,
-    choices: Sequence[str],
-    assignment: Assignment,
-    *,
-    correct_content_id: int,
-    readout: str,
-) -> RenderedPrompt:
-    if format_name not in _RENDERERS:
-        raise ValueError(f"Unknown controlled format {format_name!r}")
-    if len(choices) != 4 or not 0 <= int(correct_content_id) < 4:
-        raise ValueError("Causal prompts require four choices and a correct content id in [0, 3]")
-    if readout not in {"letter", "text"}:
-        raise ValueError("readout must be 'letter' or 'text'")
-
-    body = _render_body(format_name, str(question), choices, assignment)
-    instruction = (
-        "Return only the letter A, B, C, or D."
-        if readout == "letter"
-        else "Return only the exact answer text, not its letter."
-    )
-    prompt = f"{body}\n\n{instruction}\nAnswer: "
-    correct_position = assignment.content_ids_by_position.index(int(correct_content_id))
-    correct_output = (
-        assignment.labels_by_position[correct_position]
-        if readout == "letter"
-        else str(choices[int(correct_content_id)])
-    )
-
-    calibration_prompt = None
-    calibration_sha = None
-    if readout == "letter":
-        placeholders = [f"OPTION_{index}_PLACEHOLDER" for index in range(4)]
-        calibration_body = _render_body(
-            format_name,
-            "QUESTION_TEXT_PLACEHOLDER",
-            placeholders,
-            assignment,
-        )
-        calibration_prompt = f"{calibration_body}\n\n{instruction}\nAnswer: "
-        calibration_sha = hashlib.sha256(calibration_prompt.encode("utf-8")).hexdigest()
-
-    return RenderedPrompt(
-        prompt=prompt,
-        prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-        correct_output=correct_output,
-        calibration_prompt=calibration_prompt,
-        calibration_prompt_sha256=calibration_sha,
-    )
 
 
 def _canonical_items(frame: pd.DataFrame) -> list[dict[str, object]]:
@@ -249,35 +257,85 @@ def _canonical_items(frame: pd.DataFrame) -> list[dict[str, object]]:
     return items
 
 
-def build_causal_design(frame: pd.DataFrame, *, splits: Sequence[str] | None = None) -> pd.DataFrame:
-    allowed_splits = None if splits is None else {str(split) for split in splits}
+def _format_sources(
+    item: dict[str, object], format_name: str
+) -> tuple[str, dict[str, object], str]:
+    choices = [str(choice) for choice in item["choices"]]
+    source_prompt = (
+        build_vanilla_prompt(item["question"], choices)
+        if format_name == "plain"
+        else str(item["source_prompts"][format_name])
+    )
+    calibration = make_content_free_prompt_with_metadata(
+        {
+            "wrapped_prompt": source_prompt,
+            "question": item["question"],
+            "choices": choices,
+        }
+    )
+    calibration_wrapper = (
+        format_name
+        if calibration["content_free_calibration_kind"] == "same_wrapper_redaction"
+        else "key_equals"
+    )
+    return source_prompt, calibration, calibration_wrapper
+
+
+def _exclusion_reasons(item: dict[str, object]) -> list[dict[str, str]]:
+    choices = [str(choice) for choice in item["choices"]]
+    placeholders = [f"OPTION_{label}_PLACEHOLDER" for label in LETTERS]
+    reasons: list[dict[str, str]] = []
+    assignments = balanced_assignments()
+    for format_name in CONTROLLED_FORMATS:
+        try:
+            source_prompt, calibration, calibration_wrapper = _format_sources(item, format_name)
+            _text_readout_prompt(source_prompt)
+            source_calibration = str(calibration["content_free_prompt"])
+            for assignment in assignments[1:]:
+                _source_counterfactual(source_prompt, format_name, assignment, choices)
+                _source_counterfactual(
+                    source_calibration,
+                    calibration_wrapper,
+                    assignment,
+                    placeholders,
+                )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason.startswith("unknown_source_wrapper:"):
+                reason = "unknown_source_wrapper"
+            reasons.append(
+                {
+                    "item_id": str(item["item_id"]),
+                    "wrapper_name": format_name,
+                    "reason": reason,
+                }
+            )
+    return reasons
+
+
+def _build_design_from_items(items: Sequence[dict[str, object]]) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     assignments = balanced_assignments()
-    for item in _canonical_items(frame):
-        if allowed_splits is not None and str(item["split"]) not in allowed_splits:
-            continue
+    placeholders = [f"OPTION_{label}_PLACEHOLDER" for label in LETTERS]
+    for item in items:
         item_id = str(item["item_id"])
         question = str(item["question"])
         choices = [str(choice) for choice in item["choices"]]
         correct_content_id = int(item["correct_index"])
-        source_prompts = item["source_prompts"]
         for format_name in CONTROLLED_FORMATS:
-            source_prompt = None if format_name == "plain" else source_prompts[format_name]
-            source_prompt_sha = (
-                None
-                if source_prompt is None
-                else hashlib.sha256(str(source_prompt).encode("utf-8")).hexdigest()
-            )
+            source_prompt, calibration, calibration_wrapper = _format_sources(item, format_name)
+            source_prompt_sha = hashlib.sha256(source_prompt.encode("utf-8")).hexdigest()
+            source_calibration = str(calibration["content_free_prompt"])
             for assignment in assignments:
-                rendered = render_causal_prompt(
-                    format_name,
-                    question,
-                    choices,
+                prompt = _source_counterfactual(source_prompt, format_name, assignment, choices)
+                calibration_prompt = _source_counterfactual(
+                    source_calibration,
+                    calibration_wrapper,
                     assignment,
-                    correct_content_id=correct_content_id,
-                    readout="letter",
+                    placeholders,
                 )
                 correct_position = assignment.content_ids_by_position.index(correct_content_id)
+                correct_label = assignment.labels_by_position[correct_position]
                 rows.append(
                     {
                         "work_key": f"letter|{item_id}|{format_name}|{assignment.variant}",
@@ -290,30 +348,31 @@ def build_causal_design(frame: pd.DataFrame, *, splits: Sequence[str] | None = N
                         "manipulation": assignment.manipulation,
                         "position_shift": assignment.position_shift,
                         "label_shift": assignment.label_shift,
-                        "template_scope": "controlled_canonical",
+                        "template_scope": "source_prompt_counterfactual",
                         "source_prompt_sha256": source_prompt_sha,
-                        "prompt": rendered.prompt,
-                        "prompt_sha256": rendered.prompt_sha256,
-                        "calibration_prompt": rendered.calibration_prompt,
-                        "calibration_prompt_sha256": rendered.calibration_prompt_sha256,
+                        "prompt": prompt,
+                        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                        "calibration_prompt": calibration_prompt,
+                        "calibration_prompt_sha256": hashlib.sha256(
+                            calibration_prompt.encode("utf-8")
+                        ).hexdigest(),
+                        "content_free_calibration_kind": calibration[
+                            "content_free_calibration_kind"
+                        ],
+                        "content_free_fallback_reason": calibration[
+                            "content_free_fallback_reason"
+                        ],
                         "content_ids_by_position": list(assignment.content_ids_by_position),
                         "labels_by_position": list(assignment.labels_by_position),
                         "candidate_texts": choices,
                         "correct_content_id": correct_content_id,
                         "correct_position": correct_position,
-                        "correct_label": rendered.correct_output,
+                        "correct_label": correct_label,
                         "correct_text": choices[correct_content_id],
                     }
                 )
             identity = assignments[0]
-            rendered = render_causal_prompt(
-                format_name,
-                question,
-                choices,
-                identity,
-                correct_content_id=correct_content_id,
-                readout="text",
-            )
+            text_prompt = _text_readout_prompt(source_prompt)
             rows.append(
                 {
                     "work_key": f"text|{item_id}|{format_name}|0",
@@ -326,22 +385,56 @@ def build_causal_design(frame: pd.DataFrame, *, splits: Sequence[str] | None = N
                     "manipulation": "controlled_baseline",
                     "position_shift": 0,
                     "label_shift": 0,
-                    "template_scope": "controlled_canonical",
+                    "template_scope": "source_prompt_counterfactual",
                     "source_prompt_sha256": source_prompt_sha,
-                    "prompt": rendered.prompt,
-                    "prompt_sha256": rendered.prompt_sha256,
+                    "prompt": text_prompt,
+                    "prompt_sha256": hashlib.sha256(text_prompt.encode("utf-8")).hexdigest(),
                     "calibration_prompt": None,
                     "calibration_prompt_sha256": None,
+                    "content_free_calibration_kind": None,
+                    "content_free_fallback_reason": None,
                     "content_ids_by_position": list(identity.content_ids_by_position),
                     "labels_by_position": list(identity.labels_by_position),
                     "candidate_texts": choices,
                     "correct_content_id": correct_content_id,
                     "correct_position": correct_content_id,
                     "correct_label": LETTERS[correct_content_id],
-                    "correct_text": rendered.correct_output,
+                    "correct_text": choices[correct_content_id],
                 }
             )
     design = pd.DataFrame(rows)
-    if not design.empty and not design["work_key"].is_unique:
+    if design.empty:
+        return design
+    if not design["work_key"].is_unique:
         raise AssertionError("Causal design produced duplicate work keys")
     return design.sort_values("work_key", kind="mergesort").reset_index(drop=True)
+
+
+def build_causal_design_with_exclusions(
+    frame: pd.DataFrame, *, splits: Sequence[str] | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    allowed_splits = None if splits is None else {str(split) for split in splits}
+    eligible: list[dict[str, object]] = []
+    exclusions: list[dict[str, str]] = []
+    for item in _canonical_items(frame):
+        if allowed_splits is not None and str(item["split"]) not in allowed_splits:
+            continue
+        item_reasons = _exclusion_reasons(item)
+        if item_reasons:
+            exclusions.extend(item_reasons)
+        else:
+            eligible.append(item)
+    exclusion_frame = pd.DataFrame(
+        exclusions, columns=["item_id", "wrapper_name", "reason"]
+    ).sort_values(["item_id", "wrapper_name"], kind="mergesort", ignore_index=True)
+    return _build_design_from_items(eligible), exclusion_frame
+
+
+def build_causal_design(frame: pd.DataFrame, *, splits: Sequence[str] | None = None) -> pd.DataFrame:
+    design, exclusions = build_causal_design_with_exclusions(frame, splits=splits)
+    if not exclusions.empty:
+        raise ValueError(
+            "Some items are not safely transformable; use "
+            "build_causal_design_with_exclusions to retain the exclusion record"
+        )
+    return design

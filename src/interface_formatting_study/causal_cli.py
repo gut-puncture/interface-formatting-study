@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .causal_design import CONTROLLED_FORMATS, build_causal_design
+from .causal_design import CONTROLLED_FORMATS, build_causal_design_with_exclusions
 from .causal_runner import run_causal_design, validate_causal_design
 from .experiment import prepare_dataset
 from .model_loader import load_model_and_tokenizer
@@ -26,7 +26,11 @@ from .utils import read_table, read_yaml, write_table_atomic
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DESIGN = Path("artifacts/causal_followup/v1/design_train_validation.parquet")
+DEFAULT_DESIGN = Path(
+    "artifacts/causal_followup/v2_source_preserving/design_train_validation.parquet"
+)
+DESIGN_SCHEMA_VERSION = 4
+DESIGN_SCOPE = "source_prompt_counterfactual"
 
 
 def _atomic_json(payload: object, path: Path) -> None:
@@ -51,19 +55,29 @@ def cmd_prepare(args) -> None:
     splits = tuple(part.strip() for part in args.splits.split(",") if part.strip())
     if not splits or set(splits) - {"train", "validation", "test"}:
         raise ValueError("--splits must contain train, validation, and/or test")
-    design = build_causal_design(frame, splits=splits)
+    design, exclusions = build_causal_design_with_exclusions(frame, splits=splits)
+    source_items = int(frame[frame["split"].astype(str).isin(splits)]["item_id"].nunique())
     validate_causal_design(design)
     items = int(design["item_id"].nunique())
     if len(design) != items * len(CONTROLLED_FORMATS) * 8:
         raise RuntimeError("Causal design row count violates the 9 formats x 8 rows contract")
     output = Path(args.output)
     write_table_atomic(design, output)
+    exclusions_path = output.with_name(output.stem + ".exclusions.parquet")
+    write_table_atomic(exclusions, exclusions_path)
     _atomic_json(
         {
-            "design_schema_version": 3,
+            "design_schema_version": DESIGN_SCHEMA_VERSION,
             "sha256": sha256_file(output),
             "rows": len(design),
-            "items": items,
+            "source_items": source_items,
+            "eligible_items": items,
+            "excluded_items": source_items - items,
+            "exclusions": {
+                "path_name": exclusions_path.name,
+                "sha256": sha256_file(exclusions_path),
+                "rows": len(exclusions),
+            },
             "splits": list(splits),
             "formats": list(CONTROLLED_FORMATS),
             "rows_per_item_format": 8,
@@ -73,7 +87,7 @@ def cmd_prepare(args) -> None:
                 "label_only": 3,
             },
             "answer_text_rows": 1,
-            "scope": "controlled canonical templates; original prompts remain in the observational study",
+            "scope": DESIGN_SCOPE,
         },
         output.with_name(output.name + ".manifest.json"),
     )
@@ -85,6 +99,11 @@ def _load_design(path: Path) -> pd.DataFrame:
     if not path.exists() or not manifest_path.exists():
         raise FileNotFoundError(f"Missing causal design or manifest: {path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("design_schema_version") != DESIGN_SCHEMA_VERSION
+        or manifest.get("scope") != DESIGN_SCOPE
+    ):
+        raise RuntimeError("Causal run requires a schema-v4 source-preserving design")
     if sha256_file(path) != manifest.get("sha256"):
         raise RuntimeError("Causal design checksum mismatch")
     design = read_table(path)
@@ -184,7 +203,7 @@ def cmd_run(args) -> None:
     actual_dtype = _assert_gpu_contract(model, device, allow_cpu=bool(getattr(args, "allow_cpu", False)))
     dependencies = _dependency_versions()
     scientific_config = {
-        "study": "causal_followup_v2_controlled",
+        "study": "causal_followup_v3_source_preserving",
         "design_splits": sorted(design["split"].astype(str).unique()),
         "formats": list(CONTROLLED_FORMATS),
         "arms": {

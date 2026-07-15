@@ -5,29 +5,15 @@ import json
 import pandas as pd
 import pytest
 
-from interface_formatting_study.causal_design import ACTIVE_WRAPPERS, build_causal_design
+from causal_fixtures import source_prompt_frame
+from interface_formatting_study.causal_design import build_causal_design
 from interface_formatting_study.causal_runner import run_causal_design, validate_causal_design
 from interface_formatting_study.model_profiles import get_model_profile
 from interface_formatting_study.run_identity import build_semantic_identity
 
 
 def _design() -> pd.DataFrame:
-    source = pd.DataFrame(
-        [
-            {
-                "item_id": "item-1",
-                "subject": "math",
-                "split": "train",
-                "question": "What is 2+2?",
-                "choices": ["3", "4", "5", "6"],
-                "correct_index": 1,
-                "wrapper_name": wrapper,
-                "wrapped_prompt": f"original-{wrapper}",
-            }
-            for wrapper in ACTIVE_WRAPPERS
-        ]
-    )
-    return build_causal_design(source)
+    return build_causal_design(source_prompt_frame())
 
 
 def _identity(tmp_path, design: pd.DataFrame):
