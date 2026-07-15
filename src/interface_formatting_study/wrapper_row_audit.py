@@ -217,3 +217,52 @@ def merge_audit_labels(output_dir: str | Path) -> pd.DataFrame:
     write_table_atomic(merged, root / "wrapper_audit_labels.parquet")
     write_table_atomic(summary, root / "wrapper_audit_summary.csv")
     return merged
+
+
+def finalize_audit_labels(
+    first_pass_path: str | Path,
+    adjudication_path: str | Path,
+    output_path: str | Path,
+) -> pd.DataFrame:
+    """Strictly apply the second pass to every row flagged by the first pass."""
+
+    first = pd.read_parquet(first_pass_path)
+    adjudication = pd.read_parquet(adjudication_path)
+    required_first = {"audit_row_id", "label", "confidence", "reason"}
+    required_second = required_first | {
+        "adjudicated_label",
+        "adjudicated_confidence",
+        "adjudicated_reason",
+    }
+    if missing := required_first - set(first.columns):
+        raise ValueError(f"First-pass audit is missing columns: {sorted(missing)}")
+    if missing := required_second - set(adjudication.columns):
+        raise ValueError(f"Adjudication is missing columns: {sorted(missing)}")
+    if first["audit_row_id"].duplicated().any() or adjudication["audit_row_id"].duplicated().any():
+        raise ValueError("Audit finalization inputs contain duplicate audit_row_id values")
+    flagged = first[first["label"].isin({"content_changed", "ambiguous"})]
+    if set(adjudication["audit_row_id"].astype(str)) != set(flagged["audit_row_id"].astype(str)):
+        raise ValueError("Adjudication must cover exactly every initially content-changed or ambiguous row")
+    original = adjudication.set_index("audit_row_id")[["label", "confidence", "reason"]]
+    expected = flagged.set_index("audit_row_id")[["label", "confidence", "reason"]]
+    pd.testing.assert_frame_equal(original.sort_index(), expected.sort_index(), check_names=False)
+    if not set(adjudication["adjudicated_label"]).issubset(LABELS):
+        raise ValueError("Adjudication contains an invalid label")
+    if not set(adjudication["adjudicated_confidence"]).issubset(CONFIDENCE):
+        raise ValueError("Adjudication contains an invalid confidence")
+    if adjudication["adjudicated_reason"].astype(str).str.strip().eq("").any():
+        raise ValueError("Adjudication contains an empty reason")
+
+    second = adjudication.set_index("audit_row_id")
+    final = first.copy().set_index("audit_row_id")
+    for column in ("adjudicated_label", "adjudicated_confidence", "adjudicated_reason"):
+        final[column] = second[column]
+    final["final_label"] = final["adjudicated_label"].fillna(final["label"])
+    final["final_confidence"] = final["adjudicated_confidence"].fillna(final["confidence"])
+    final["final_reason"] = final["adjudicated_reason"].fillna(final["reason"])
+    final = final.reset_index().sort_values("audit_row_id", kind="mergesort").reset_index(drop=True)
+    write_table_atomic(final, output_path)
+    summary_path = Path(output_path).with_name(Path(output_path).stem + "_summary.csv")
+    summary = final.groupby(["wrapper_name", "final_label"], as_index=False).size().rename(columns={"size": "rows"})
+    write_table_atomic(summary, summary_path)
+    return final

@@ -8,6 +8,7 @@ import pytest
 from interface_formatting_study.wrapper_row_audit import (
     LABELS,
     build_audit_packets,
+    finalize_audit_labels,
     merge_audit_labels,
     row_audit_id,
 )
@@ -100,3 +101,47 @@ def test_merge_rejects_changed_packet(tmp_path):
 
     with pytest.raises(ValueError, match="checksum mismatch"):
         merge_audit_labels(tmp_path)
+
+
+def test_finalize_audit_applies_exact_flagged_second_pass(tmp_path):
+    first = pd.DataFrame(
+        [
+            {
+                "audit_row_id": "one",
+                "wrapper_name": "csv_inline",
+                "label": "formatting_only",
+                "confidence": "high",
+                "reason": "preserved",
+            },
+            {
+                "audit_row_id": "two",
+                "wrapper_name": "html_form",
+                "label": "ambiguous",
+                "confidence": "low",
+                "reason": "needs review",
+            },
+        ]
+    )
+    second = pd.DataFrame(
+        [
+            {
+                "audit_row_id": "two",
+                "label": "ambiguous",
+                "confidence": "low",
+                "reason": "needs review",
+                "adjudicated_label": "content_changed",
+                "adjudicated_confidence": "high",
+                "adjudicated_reason": "choice omitted",
+            }
+        ]
+    )
+    first_path, second_path, output = tmp_path / "first.parquet", tmp_path / "second.parquet", tmp_path / "final.parquet"
+    first.to_parquet(first_path, index=False)
+    second.to_parquet(second_path, index=False)
+
+    final = finalize_audit_labels(first_path, second_path, output)
+
+    assert final.set_index("audit_row_id").loc["one", "final_label"] == "formatting_only"
+    assert final.set_index("audit_row_id").loc["two", "final_label"] == "content_changed"
+    assert output.exists()
+    assert (tmp_path / "final_summary.csv").exists()
