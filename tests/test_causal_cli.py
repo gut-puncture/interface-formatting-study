@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import sys
+from pathlib import Path
 
 import pandas as pd
+import pytest
 import torch
 
 from interface_formatting_study import causal_cli
 from interface_formatting_study.causal_design import build_causal_design
 from interface_formatting_study.run_identity import sha256_file
+
+
+VERIFY_SCRIPT = Path(__file__).parents[1] / "scripts" / "verify_causal_followup_artifacts.py"
+VERIFY_SPEC = importlib.util.spec_from_file_location("verify_causal_followup_artifacts", VERIFY_SCRIPT)
+VERIFY = importlib.util.module_from_spec(VERIFY_SPEC)
+assert VERIFY_SPEC.loader is not None
+sys.modules[VERIFY_SPEC.name] = VERIFY
+VERIFY_SPEC.loader.exec_module(VERIFY)
 
 
 def _write_design(tmp_path):
@@ -69,3 +81,35 @@ def test_causal_cli_runs_identity_bound_canary(
     assert manifest["model"]["id"] == "Qwen/Qwen2.5-1.5B-Instruct"
     assert manifest["design"]["completed_rows"] == len(design)
     assert manifest["runtime"]["single_token_label_fast_path"]
+    assert "torch" in manifest["runtime"]["dependencies"]
+    root = manifests[0].parent
+    result = VERIFY.verify(
+        root,
+        manifest["semantic_identity"]["semantic_run_id"],
+        manifest["model"]["slug"],
+        "complete",
+    )
+    assert result["work_keys"] == len(design)
+
+    shard_data = next((root / "shards" / "causal_behavior").glob("shard-*/data.parquet"))
+    shard_data.write_bytes(shard_data.read_bytes() + b"corruption")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        VERIFY.verify(
+            root,
+            manifest["semantic_identity"]["semantic_run_id"],
+            manifest["model"]["slug"],
+            "complete",
+        )
+
+
+def test_profiling_canary_spans_prompt_length_distribution():
+    frame = pd.DataFrame(
+        {
+            "item_id": [f"item-{index}" for index in range(10)],
+            "prompt": ["x" * (index + 1) for index in range(10)],
+        }
+    )
+
+    subset = causal_cli._canary_subset(frame, 3)
+
+    assert set(subset["item_id"]) == {"item-0", "item-4", "item-9"}

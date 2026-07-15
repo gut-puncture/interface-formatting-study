@@ -297,6 +297,22 @@ def run_causal_design(
     merged = store.merge(sort_by=["work_key"])
     output = root / "raw" / "causal_behavior.parquet"
     write_table_atomic(merged, output)
+    complete = len(merged) == len(source)
+    _atomic_json(
+        {
+            "status": "complete" if complete else "interrupted",
+            "completed": len(merged),
+            "total": len(source),
+            "elapsed_seconds": time.monotonic() - started,
+            "batches": telemetry.batches,
+            "actual_tokens": telemetry.actual_tokens,
+            "padded_tokens": telemetry.padded_tokens,
+            "padding_ratio": telemetry.padding_ratio,
+            "input_preparation_seconds": telemetry.input_preparation_seconds,
+            "output_write_seconds": store.write_seconds,
+        },
+        root / "progress.json",
+    )
     _atomic_json(
         {
             "artifact_schema_version": 1,

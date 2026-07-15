@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import signal
@@ -8,6 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 
@@ -87,8 +89,27 @@ def _load_design(path: Path) -> pd.DataFrame:
 def _canary_subset(design: pd.DataFrame, item_count: int) -> pd.DataFrame:
     if item_count < 1:
         raise ValueError("--canary-items must be positive")
-    item_ids = sorted(design["item_id"].astype(str).unique())[:item_count]
+    item_lengths = (
+        design.assign(prompt_chars=design["prompt"].astype(str).str.len())
+        .groupby("item_id", as_index=False)["prompt_chars"]
+        .max()
+        .sort_values(["prompt_chars", "item_id"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    count = min(item_count, len(item_lengths))
+    positions = np.linspace(0, len(item_lengths) - 1, num=count, dtype=int)
+    item_ids = item_lengths.iloc[positions]["item_id"].astype(str).tolist()
     return design[design["item_id"].astype(str).isin(item_ids)].copy()
+
+
+def _dependency_versions() -> dict[str, str]:
+    versions = {}
+    for package in ("torch", "transformers", "pandas", "pyarrow", "numpy"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = "not-installed"
+    return versions
 
 
 def cmd_run(args) -> None:
@@ -191,6 +212,7 @@ def cmd_run(args) -> None:
                 "batch_size": args.batch_size,
                 "max_batch_tokens": args.max_batch_tokens,
                 "checkpoint_size": args.checkpoint_size,
+                "dependencies": _dependency_versions(),
             },
             "stop_signal": stop_state.signal_name,
         }

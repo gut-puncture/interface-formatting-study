@@ -95,7 +95,7 @@ def _csv(question: str, options: list[tuple[str, str]]) -> str:
 
 def _graphql(question: str, options: list[tuple[str, str]]) -> str:
     option_lines = "\n".join(
-        f"    option(label: {_quoted(label)}, text: {_quoted(text)})" for label, text in options
+        f"    {label}: option(label: {_quoted(label)}, text: {_quoted(text)})" for label, text in options
     )
     return f"query MultipleChoice {{\n  question(text: {_quoted(question)})\n  options {{\n{option_lines}\n  }}\n}}"
 

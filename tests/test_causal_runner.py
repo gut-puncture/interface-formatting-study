@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 
@@ -91,6 +93,9 @@ def test_causal_runner_interrupt_resume_matches_uninterrupted(
     pd.testing.assert_frame_equal(full, resumed)
     assert len(resumed) == len(design)
     assert set(resumed["arm"]) == {"letter_permutation", "answer_text"}
+    progress = json.loads((tmp_path / "resumed" / "progress.json").read_text())
+    assert progress["status"] == "complete"
+    assert progress["completed"] == len(design)
 
 
 def test_causal_design_validation_rejects_duplicate_or_inconsistent_work():
