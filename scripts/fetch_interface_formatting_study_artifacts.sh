@@ -4,22 +4,30 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/fetch_interface_formatting_study_artifacts.sh <user@host> [remote_dir] [local_dir] [ssh_key] [ssh_port]
+  scripts/fetch_interface_formatting_study_artifacts.sh <user@host> <model-slug> <semantic-run-id> [remote_dir] [local_dir] [ssh_key] [ssh_port] [complete|partial]
 
-Fetches only compact INTERFACE_FORMATTING_STUDY analysis bundles from the GPU host.
+Fetches one model-specific run tree and validates semantic identity plus every
+incremental shard checksum on the Mac.
 USAGE
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 1 ]]; then
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 3 ]]; then
   usage
   exit 0
 fi
 
 REMOTE="${1:?remote user@host is required}"
-REMOTE_DIR="${2:-/home/ubuntu/interface_formatting_study}"
-LOCAL_DIR="${3:-$(pwd)/gpu_artifacts}"
-SSH_KEY="${4:-}"
-SSH_PORT="${5:-}"
+MODEL_SLUG="${2:?model slug is required}"
+SEMANTIC_RUN_ID="${3:?semantic run id is required}"
+REMOTE_DIR="${4:-/home/ubuntu/interface_formatting_study}"
+LOCAL_DIR="${5:-$(pwd)/gpu_artifacts}"
+SSH_KEY="${6:-}"
+SSH_PORT="${7:-}"
+FETCH_MODE="${8:-complete}"
+if [[ "$FETCH_MODE" != "complete" && "$FETCH_MODE" != "partial" ]]; then
+  echo "fetch mode must be complete or partial" >&2
+  exit 2
+fi
 
 SSH_ARGS=(-o StrictHostKeyChecking=accept-new)
 if [[ -n "$SSH_KEY" ]]; then
@@ -31,53 +39,16 @@ fi
 
 RSYNC_RSH=(ssh "${SSH_ARGS[@]}")
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-DEST="${LOCAL_DIR}/${STAMP}"
+DEST="${LOCAL_DIR}/${MODEL_SLUG}/${SEMANTIC_RUN_ID}/${STAMP}"
 mkdir -p "$DEST"
 
-echo "Fetching compact INTERFACE_FORMATTING_STUDY artifacts into ${DEST}"
+REMOTE_RUN="${REMOTE_DIR}/results/model_runs/${MODEL_SLUG}/${SEMANTIC_RUN_ID}"
+echo "Fetching ${REMOTE_RUN} into ${DEST}"
 rsync -az \
   -e "${RSYNC_RSH[*]}" \
-  --include='artifacts/' \
-  --include='artifacts/interface_formatting_study_analysis_*.tar.gz' \
-  --include='artifacts/interface_formatting_study_focused_mechanistic_*.tar.gz' \
-  --include='artifacts/SHA256SUMS_*.txt' \
-  --include='artifacts/SHA256SUMS_focused_mechanistic_*.txt' \
-  --include='run_logs/' \
-  --include='run_logs/interface_formatting_study_gpu_*.log' \
-  --exclude='*' \
-  "${REMOTE}:${REMOTE_DIR}/" "${DEST}/"
+  "${REMOTE}:${REMOTE_RUN}/" "${DEST}/"
 
-shopt -s nullglob
-checksum_files=("${DEST}"/artifacts/SHA256SUMS_*.txt)
-if (( ${#checksum_files[@]} == 0 )); then
-  echo "No SHA256SUMS files were fetched" >&2
-  exit 1
-fi
+python3 "$(dirname "$0")/verify_interface_formatting_study_artifacts.py" \
+  "$DEST" "$SEMANTIC_RUN_ID" "$MODEL_SLUG" "$FETCH_MODE"
 
-for checksum in "${checksum_files[@]}"; do
-  echo "Verifying $(basename "$checksum")"
-  while read -r expected path; do
-    [[ -z "${expected:-}" || -z "${path:-}" ]] && continue
-    local_path="${DEST}/${path}"
-    if [[ "$path" == artifacts/* ]]; then
-      local_path="${DEST}/${path}"
-    fi
-    if [[ ! -f "$local_path" ]]; then
-      if [[ "$(basename "$path")" == interface_formatting_study_*.tar.gz ]]; then
-        local_path="${DEST}/artifacts/$(basename "$path")"
-      else
-        echo "Skipping remote-only checksum entry not fetched separately: ${path}"
-        continue
-      fi
-    fi
-    actual="$(shasum -a 256 "$local_path" | awk '{print $1}')"
-    if [[ "$actual" != "$expected" ]]; then
-      echo "Checksum mismatch for ${local_path}" >&2
-      echo "expected ${expected}" >&2
-      echo "actual   ${actual}" >&2
-      exit 1
-    fi
-  done < "$checksum"
-done
-
-echo "Fetched and verified compact artifacts in ${DEST}"
+echo "Fetched and independently verified model run in ${DEST}"

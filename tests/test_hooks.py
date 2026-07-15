@@ -10,6 +10,28 @@ def test_find_transformer_blocks(tiny_hook_model):
     assert len(blocks) == 2
 
 
+def test_phi_and_mistral_transformer_block_discovery():
+    from transformers import MistralConfig, MistralForCausalLM, Phi3Config, Phi3ForCausalLM
+
+    common = dict(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    phi = Phi3ForCausalLM(Phi3Config(**common, original_max_position_embeddings=128))
+    mistral = MistralForCausalLM(MistralConfig(**common))
+
+    assert len(find_transformer_blocks(phi)) == 2
+    assert len(find_transformer_blocks(mistral)) == 2
+
+
 def test_hook_replaces_only_selected_position_and_is_removed(tiny_hook_model):
     input_ids = torch.tensor([[1, 2, 3]])
     baseline = tiny_hook_model(input_ids=input_ids, output_hidden_states=True).hidden_states[-1]

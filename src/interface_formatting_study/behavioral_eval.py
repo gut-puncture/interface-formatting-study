@@ -7,7 +7,7 @@ import torch
 from tqdm import tqdm
 
 from .calibration import calibrate_scores, make_content_free_prompt_with_metadata, score_with_calibration
-from .scoring import correct_answer_margin, score_labels, score_labels_many, tokenize_text
+from .scoring import ScoringTelemetry, correct_answer_margin, score_labels, score_labels_many, tokenize_text
 from .utils import LABELS, read_table, write_table
 
 
@@ -19,6 +19,7 @@ def _score_labels_many_with_backoff(
     sequence_batch_size: int,
     max_batch_tokens: int | None,
     device=None,
+    telemetry: ScoringTelemetry | None = None,
 ) -> list[dict[str, float]]:
     batch_size = max(1, int(sequence_batch_size))
     token_cap = None if max_batch_tokens is None else max(1, int(max_batch_tokens))
@@ -31,7 +32,8 @@ def _score_labels_many_with_backoff(
                 batch_size=batch_size,
                 max_batch_tokens=token_cap,
                 device=device,
-                use_cache=True,
+                use_cache=False,
+                telemetry=telemetry,
             )
         except RuntimeError as exc:
             message = str(exc).lower()
@@ -54,6 +56,7 @@ def _score_records_batched(
     max_batch_tokens: int | None,
     bias_cache: dict[str, dict[str, float]],
     device=None,
+    telemetry: ScoringTelemetry | None = None,
 ) -> pd.DataFrame:
     raw_scores_list = _score_labels_many_with_backoff(
         model,
@@ -62,6 +65,7 @@ def _score_records_batched(
         sequence_batch_size=sequence_batch_size,
         max_batch_tokens=max_batch_tokens,
         device=device,
+        telemetry=telemetry,
     )
     content_free_meta = [make_content_free_prompt_with_metadata(row) for row in records]
     missing_bias_prompts = sorted(
@@ -79,6 +83,7 @@ def _score_records_batched(
             sequence_batch_size=sequence_batch_size,
             max_batch_tokens=max_batch_tokens,
             device=device,
+            telemetry=telemetry,
         )
         bias_cache.update(zip(missing_bias_prompts, bias_scores_list, strict=True))
 
@@ -184,6 +189,7 @@ def evaluate_behavioral(
     resume: bool = False,
     limit: int | None = None,
     device=None,
+    telemetry: ScoringTelemetry | None = None,
 ) -> pd.DataFrame:
     source = (df.head(limit).copy() if limit is not None else df.copy()).reset_index(drop=True)
     if sequence_batch_size is None:
@@ -211,13 +217,15 @@ def evaluate_behavioral(
         if resume and shard_path is not None and shard_path.exists():
             frames.append(read_table(shard_path))
             continue
-        frame = _score_records_reference(
+        frame = _score_records_batched(
             source.iloc[start:end].to_dict("records"),
             model,
             tokenizer,
-            batch_size=int(batch_size),
+            sequence_batch_size=int(sequence_batch_size),
+            max_batch_tokens=max_batch_tokens,
             bias_cache=bias_cache,
             device=device,
+            telemetry=telemetry,
         )
         if shard_path is not None:
             tmp_path = shard_path.with_suffix(".tmp.parquet")

@@ -64,6 +64,23 @@ class RuleLogitModel(torch.nn.Module):
         return SimpleNamespace(logits=logits)
 
 
+class CausalLabelModel(torch.nn.Module):
+    """Context-independent causal logits suitable for fast/reference parity."""
+
+    def __init__(self, tokenizer: BoundaryTokenizer):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.dummy = torch.nn.Parameter(torch.zeros(()))
+
+    def forward(self, input_ids=None, attention_mask=None, **_kwargs):
+        vocab_size = max(256, len(self.tokenizer.vocab) + 64)
+        logits = torch.full((*input_ids.shape, vocab_size), -10.0, device=input_ids.device)
+        for rank, label in enumerate(("A", "B", "C", "D")):
+            for token_id in self.tokenizer.encode(label, add_special_tokens=False):
+                logits[..., token_id] = float(4 - rank)
+        return SimpleNamespace(logits=logits)
+
+
 class TinyBlock(torch.nn.Module):
     def forward(self, hidden):
         return hidden + 1.0
@@ -99,6 +116,10 @@ def rule_model(boundary_tokenizer):
 
 
 @pytest.fixture
+def causal_label_model(boundary_tokenizer):
+    return CausalLabelModel(boundary_tokenizer)
+
+
+@pytest.fixture
 def tiny_hook_model():
     return TinyHookModel()
-

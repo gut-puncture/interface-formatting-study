@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, Mapping
@@ -20,6 +21,20 @@ class MarginResult:
     is_tie: bool
     correct_score: float
     best_wrong_score: float
+
+
+@dataclass
+class ScoringTelemetry:
+    batches: int = 0
+    actual_tokens: int = 0
+    padded_tokens: int = 0
+    input_preparation_seconds: float = 0.0
+
+    @property
+    def padding_ratio(self) -> float:
+        if self.padded_tokens == 0:
+            return 0.0
+        return 1.0 - (self.actual_tokens / self.padded_tokens)
 
 
 def label_variants(label: str) -> list[str]:
@@ -51,6 +66,88 @@ def _model_device(model) -> torch.device:
         return torch.device("cpu")
     except AttributeError:
         return torch.device("cpu")
+
+
+def single_token_label_ids(
+    tokenizer,
+    *,
+    labels: tuple[str, ...] = LABELS,
+) -> dict[str, int] | None:
+    token_ids: dict[str, int] = {}
+    for label in labels:
+        validate_label(label)
+        ids = tokenize_text(tokenizer, label)
+        if len(ids) != 1:
+            return None
+        token_ids[label] = int(ids[0])
+    return token_ids
+
+
+def _score_single_token_labels_many(
+    model,
+    tokenizer,
+    prompts: list[str],
+    label_ids: Mapping[str, int],
+    *,
+    batch_size: int,
+    max_batch_tokens: int | None,
+    device: torch.device | str | None,
+    telemetry: ScoringTelemetry | None,
+) -> list[dict[str, float]]:
+    prompt_ids = [tokenize_text(tokenizer, prompt) for prompt in prompts]
+    if any(not ids for ids in prompt_ids):
+        raise ValueError("Prompts must contain at least one token to score completions")
+    device_obj = torch.device(device) if device is not None else _model_device(model)
+    pad_token_id = _pad_id(tokenizer)
+    ordered = sorted(range(len(prompts)), key=lambda index: (len(prompt_ids[index]), index))
+    output: list[dict[str, float] | None] = [None for _ in prompts]
+
+    def flush(indices: list[int]) -> None:
+        if not indices:
+            return
+        preparation_started = time.monotonic()
+        max_len = max(len(prompt_ids[index]) for index in indices)
+        input_ids = torch.full((len(indices), max_len), pad_token_id, dtype=torch.long, device=device_obj)
+        attention_mask = torch.zeros_like(input_ids)
+        for row, index in enumerate(indices):
+            ids = prompt_ids[index]
+            input_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device_obj)
+            attention_mask[row, : len(ids)] = 1
+        if telemetry is not None:
+            telemetry.batches += 1
+            telemetry.actual_tokens += sum(len(prompt_ids[index]) for index in indices)
+            telemetry.padded_tokens += len(indices) * max_len
+            telemetry.input_preparation_seconds += time.monotonic() - preparation_started
+        with torch.inference_mode():
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            for row, index in enumerate(indices):
+                log_probs = torch.log_softmax(logits[row, len(prompt_ids[index]) - 1], dim=-1)
+                output[index] = {
+                    label: float(log_probs[token_id].detach().cpu())
+                    for label, token_id in label_ids.items()
+                }
+
+    current: list[int] = []
+    current_max_len = 0
+    for index in ordered:
+        length = len(prompt_ids[index])
+        candidate_max_len = max(current_max_len, length)
+        count_exceeded = len(current) >= batch_size
+        tokens_exceeded = (
+            max_batch_tokens is not None
+            and current
+            and candidate_max_len * (len(current) + 1) > max_batch_tokens
+        )
+        if count_exceeded or tokens_exceeded:
+            flush(current)
+            current = []
+            current_max_len = 0
+        current.append(index)
+        current_max_len = max(current_max_len, length)
+    flush(current)
+    if any(scores is None for scores in output):
+        raise RuntimeError("single-token scorer failed to produce every prompt result")
+    return [scores for scores in output if scores is not None]
 
 
 def completion_logps(
@@ -208,6 +305,7 @@ def completion_logps_many(
     device: torch.device | str | None = None,
     forward_context_factory: Callable[[], object] | None = None,
     use_cache: bool = False,
+    telemetry: ScoringTelemetry | None = None,
 ) -> list[list[float]]:
     """Score the same completion set for many prompts in length-aware batches."""
 
@@ -246,6 +344,7 @@ def completion_logps_many(
     def flush(batch: list[tuple[int, int, int]]) -> None:
         if not batch:
             return
+        preparation_started = time.monotonic()
         sequences: list[list[int]] = []
         for _, prompt_index, completion_index in batch:
             sequences.append(prompt_ids_by_index[prompt_index] + completion_ids[completion_index])
@@ -256,6 +355,11 @@ def completion_logps_many(
             seq_tensor = torch.tensor(seq, dtype=torch.long, device=device_obj)
             input_ids[row_index, : len(seq)] = seq_tensor
             attention_mask[row_index, : len(seq)] = 1
+        if telemetry is not None:
+            telemetry.batches += 1
+            telemetry.actual_tokens += sum(len(sequence) for sequence in sequences)
+            telemetry.padded_tokens += len(sequences) * max_len
+            telemetry.input_preparation_seconds += time.monotonic() - preparation_started
 
         context = forward_context_factory() if forward_context_factory else nullcontext()
         with context:
@@ -341,7 +445,20 @@ def score_labels_many(
     device: torch.device | str | None = None,
     forward_context_factory: Callable[[], object] | None = None,
     use_cache: bool = False,
+    telemetry: ScoringTelemetry | None = None,
 ) -> list[dict[str, float]]:
+    label_ids = single_token_label_ids(tokenizer, labels=labels)
+    if label_ids is not None and forward_context_factory is None and not use_cache:
+        return _score_single_token_labels_many(
+            model,
+            tokenizer,
+            prompts,
+            label_ids,
+            batch_size=batch_size,
+            max_batch_tokens=max_batch_tokens,
+            device=device,
+            telemetry=telemetry,
+        )
     completions: list[str] = []
     label_for_completion: list[str] = []
     for label in labels:
@@ -360,6 +477,7 @@ def score_labels_many(
         device=device,
         forward_context_factory=forward_context_factory,
         use_cache=use_cache,
+        telemetry=telemetry,
     )
     all_scores: list[dict[str, float]] = []
     for logps in logps_by_prompt:

@@ -86,6 +86,22 @@ def test_write_manifest_source_hashes_do_not_depend_on_cwd(tmp_path):
     assert "src/interface_formatting_study/cli.py" in manifest["source_hashes"]
 
 
+def test_write_manifest_records_cli_selected_model_instead_of_config_default(tmp_path):
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text('{"item_id":"i0"}\n')
+    metadata_dir = tmp_path / "metadata"
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"dataset_path: {dataset}\nmodel_name: default-qwen\noutputs:\n  metadata_dir: {metadata_dir}\n"
+    )
+    write_json({"num_rows": 1}, metadata_dir / "dataset_audit.json")
+    write_json({"train": {"num_items": 1}}, metadata_dir / "split_manifest.json")
+
+    cmd_write_manifest(SimpleNamespace(config=str(config), model="selected-model"))
+
+    assert read_json(metadata_dir / "experiment_manifest.json")["model"]["name"] == "selected-model"
+
+
 def test_figures_refuse_partial_non_smoke_behavioral_table(tmp_path):
     metadata_dir = tmp_path / "metadata"
     figures_dir = tmp_path / "figures"

@@ -37,6 +37,8 @@ from .experiment import (
     write_conflict_artifacts,
 )
 from .model_loader import load_model_and_tokenizer
+from .model_profiles import MODEL_PROFILES
+from .model_runner import DEFAULT_PHASES, run_model
 from .patching import run_validation_patching_sweep, select_best_location
 from .plots import conflict_histogram, wrapper_accuracy_heatmap
 from .splits import assign_splits_by_item
@@ -741,7 +743,7 @@ def cmd_write_manifest(args) -> None:
             "sha256": _sha256_file(cfg["dataset_path"]),
             "audit": read_json(dataset_audit_path),
         },
-        "model": {"name": cfg["model_name"]},
+        "model": {"name": getattr(args, "model", None) or cfg["model_name"]},
         "config": cfg,
         "split_manifest": read_json(split_manifest_path),
         "dependency_versions": _dependency_versions(),
@@ -904,11 +906,28 @@ def build_parser() -> argparse.ArgumentParser:
     cfree.add_argument("--local-files-only", action="store_true")
     cfree.set_defaults(func=cmd_content_free_control)
 
-    sub.add_parser("write-manifest").set_defaults(func=cmd_write_manifest)
+    manifest = sub.add_parser("write-manifest")
+    manifest.add_argument("--model", default=None)
+    manifest.set_defaults(func=cmd_write_manifest)
 
     deliverables = sub.add_parser("deliverables")
     deliverables.add_argument("--no-compile", action="store_true")
     deliverables.set_defaults(func=cmd_deliverables)
+
+    model_run = sub.add_parser("run-model", help="run one pinned Phi or Mistral focused experiment")
+    model_run.add_argument("--profile", choices=sorted(MODEL_PROFILES), required=True)
+    model_run.add_argument("--phases", default=",".join(DEFAULT_PHASES))
+    model_run.add_argument("--local-files-only", action="store_true")
+    model_run.add_argument("--canary", action="store_true")
+    model_run.add_argument("--canary-name", default="functional")
+    model_run.add_argument("--canary-items", type=int, default=64)
+    model_run.add_argument("--sequence-batch-size", type=int, default=None)
+    model_run.add_argument("--max-batch-tokens", type=int, default=None)
+    model_run.add_argument("--behavioral-checkpoint-size", type=int, default=None)
+    model_run.add_argument("--max-shard-pairs", type=int, default=16)
+    model_run.add_argument("--max-shard-seconds", type=float, default=300.0)
+    model_run.add_argument("--profile-timings", action="store_true")
+    model_run.set_defaults(func=run_model)
 
     return parser
 

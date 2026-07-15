@@ -218,9 +218,13 @@ def run_focused_patching_controls(
     conditions: tuple[str, ...] = FOCUSED_CONTROL_CONDITIONS,
     seed: int = 1729,
     device=None,
+    target_item_ids: set[str] | None = None,
 ) -> pd.DataFrame:
     donor_pool = conflict_pairs[conflict_pairs["split"] == split].copy()
     source = _cap_frame(donor_pool.copy(), cap=cap, seed=seed)
+    if target_item_ids is not None:
+        normalized_targets = {str(item_id) for item_id in target_item_ids}
+        source = source[source["item_id"].astype(str).isin(normalized_targets)].reset_index(drop=True)
     rows: list[dict[str, object]] = []
     for _, pair in tqdm(source.iterrows(), total=len(source), desc="focused patching controls"):
         target = pair.to_dict()

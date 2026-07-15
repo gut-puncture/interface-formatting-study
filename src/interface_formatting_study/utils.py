@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -52,6 +54,17 @@ def write_table(df: pd.DataFrame, path: str | Path) -> None:
         raise ValueError(f"Unsupported table suffix for {out}")
 
 
+def write_table_atomic(df: pd.DataFrame, path: str | Path) -> None:
+    destination = ensure_parent(path)
+    temporary = destination.with_name(f".{destination.stem}.{uuid.uuid4().hex}.tmp{destination.suffix}")
+    try:
+        write_table(df, temporary)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def read_table(path: str | Path) -> pd.DataFrame:
     src = Path(path)
     suffix = src.suffix.lower()
@@ -80,4 +93,3 @@ def validate_label(label: str, *, name: str = "label") -> str:
     if normalized not in LABELS:
         raise ValueError(f"{name} must be one of {LABELS}, got {label!r}")
     return normalized
-

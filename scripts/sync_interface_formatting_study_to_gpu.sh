@@ -6,9 +6,9 @@ usage() {
 Usage:
   scripts/sync_interface_formatting_study_to_gpu.sh <user@host> [remote_dir] [ssh_key] [ssh_port]
 
-Copies the minimal INTERFACE_FORMATTING_STUDY repo payload to a GPU host. It excludes local caches,
-large generated outputs, and model caches, but includes the source dataset and
-small reusable behavioral/conflict artifacts when present.
+Copies only source, configuration, packaging metadata, and the active dataset
+to a GPU host. Existing results, paper assets, analysis, tests, logs, and caches
+are never transferred.
 USAGE
 }
 
@@ -38,29 +38,22 @@ echo "Creating ${REMOTE_DIR} on ${REMOTE}"
 ssh "${SSH_ARGS[@]}" "$REMOTE" "mkdir -p '$REMOTE_DIR'"
 
 echo "Syncing INTERFACE_FORMATTING_STUDY payload from ${ROOT_DIR}"
+PAYLOAD_BYTES="$(du -sk \
+  "${ROOT_DIR}/src" \
+  "${ROOT_DIR}/configs" \
+  "${ROOT_DIR}/pyproject.toml" \
+  "${ROOT_DIR}/README.md" \
+  "${ROOT_DIR}/mmlu_20_wrapper_robustness_60000.jsonl" | awk '{total += $1} END {print total * 1024}')"
+echo "Thin payload bytes: ${PAYLOAD_BYTES}"
 rsync -az --delete \
-  --exclude '.git/' \
-  --exclude '.venv/' \
-  --exclude '__pycache__/' \
-  --exclude '.pytest_cache/' \
-  --exclude '.mypy_cache/' \
-  --exclude '.ruff_cache/' \
-  --exclude '.cache/' \
-  --exclude 'artifacts/' \
-  --exclude 'gpu_artifacts/' \
-  --exclude 'run_logs/' \
-  --exclude 'results/raw/behavioral_shards/' \
-  --exclude 'results/processed/patching_results.parquet' \
-  --exclude 'results/processed/interface_formatting_study_vector.pt' \
-  --exclude 'results/processed/shuffled_pair_vector.pt' \
-  --exclude 'results/processed/alpha_tuning_details.parquet' \
-  --exclude 'results/processed/access_vector_results.parquet' \
-  --exclude 'results/processed/control_results.parquet' \
-  --exclude 'results/processed/removal_results.parquet' \
-  --exclude 'results/processed/content_free_control.parquet' \
-  --exclude 'results/figures/' \
-  --exclude 'results/tables/' \
-  --exclude 'results/smoke/' \
+  --include '/src/' \
+  --include '/src/***' \
+  --include '/configs/' \
+  --include '/configs/***' \
+  --include '/pyproject.toml' \
+  --include '/README.md' \
+  --include '/mmlu_20_wrapper_robustness_60000.jsonl' \
+  --exclude '*' \
   -e "${RSYNC_RSH[*]}" \
   "${ROOT_DIR}/" "${REMOTE}:${REMOTE_DIR}/"
 
