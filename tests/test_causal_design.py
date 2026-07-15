@@ -8,6 +8,7 @@ from interface_formatting_study.causal_design import (
     CONTROLLED_FORMATS,
     balanced_assignments,
     build_causal_design,
+    build_causal_design_v3,
     build_causal_design_with_exclusions,
 )
 from interface_formatting_study.vanilla import build_vanilla_prompt
@@ -252,3 +253,55 @@ def test_source_prompt_hashes_bind_original_wrappers_without_calling_them_identi
     assert wrappers["source_prompt_sha256"].notna().all()
     assert set(wrappers["template_scope"]) == {"source_prompt_counterfactual"}
     assert design[design["wrapper_name"] == "plain"]["source_prompt_sha256"].notna().all()
+
+
+def test_v3_retains_whole_item_when_one_format_has_implicit_labels():
+    source = _source_frame()
+    source.loc[source["wrapper_name"] == "graphql_query", "wrapped_prompt"] = (
+        'query { answer(options: ["3", "4", "5", "6"]) }' + SUFFIX
+    )
+
+    design, applicability = build_causal_design_v3(source)
+
+    assert set(design["wrapper_name"]) == set(CONTROLLED_FORMATS)
+    graphql = design[design["wrapper_name"] == "graphql_query"]
+    assert set(graphql["arm"]) == {"letter_intervention", "answer_text"}
+    assert graphql[graphql["arm"] == "letter_intervention"]["manipulation"].tolist() == [
+        "controlled_baseline"
+    ]
+    row = applicability.set_index("wrapper_name").loc["graphql_query"]
+    assert bool(row["baseline_applicable"])
+    assert bool(row["text_applicable"])
+    assert not bool(row["position_applicable"])
+    assert not bool(row["label_applicable"])
+    assert row["not_applicable_reason"] == "independent_label_position_not_identifiable"
+
+
+def test_v3_generates_complete_rotations_for_separable_formats():
+    design, applicability = build_causal_design_v3(_source_frame())
+
+    assert len(design) == len(CONTROLLED_FORMATS) * 8
+    columns = ["baseline_applicable", "text_applicable", "position_applicable", "label_applicable"]
+    assert applicability[columns].all().all()
+    for _, group in design.groupby(["item_id", "wrapper_name"]):
+        assert set(group[group["manipulation"] == "position_only"]["variant"]) == {1, 2, 3}
+        assert set(group[group["manipulation"] == "label_only"]["variant"]) == {4, 5, 6}
+
+
+def test_v3_preserves_shapes_already_supported_by_the_legacy_transformer():
+    source = _source_frame()
+    source.loc[source["wrapper_name"] == "csv_inline", "wrapped_prompt"] = (
+        "Question,Option A,Option B,Option C,Option D\n"
+        "What is 2+2?,3,4,5,6" + SUFFIX
+    )
+
+    legacy = build_causal_design(source)
+    design, applicability = build_causal_design_v3(source)
+
+    csv_legacy = legacy[legacy["wrapper_name"] == "csv_inline"].set_index("work_key")
+    csv_v3 = design[design["wrapper_name"] == "csv_inline"].set_index("work_key")
+    assert csv_v3["prompt"].to_dict() == csv_legacy["prompt"].to_dict()
+    status = applicability.set_index("wrapper_name").loc["csv_inline"]
+    assert bool(status["position_applicable"])
+    assert bool(status["label_applicable"])
+    assert status["parse_provenance"] == "legacy_deterministic"

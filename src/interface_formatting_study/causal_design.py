@@ -8,6 +8,7 @@ from typing import Sequence
 import pandas as pd
 
 from .calibration import make_content_free_prompt_with_metadata
+from .causal_option_maps import ParsedPrompt, parse_prompt_options, transform_with_option_map
 from .vanilla import build_vanilla_prompt
 
 
@@ -485,3 +486,199 @@ def build_causal_design(frame: pd.DataFrame, *, splits: Sequence[str] | None = N
             "build_causal_design_with_exclusions to retain the exclusion record"
         )
     return design
+
+
+def _v3_rows_for_item_format(
+    item: dict[str, object],
+    format_name: str,
+    parsed_source: ParsedPrompt | None,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    item_id = str(item["item_id"])
+    choices = [str(choice) for choice in item["choices"]]
+    correct_content_id = int(item["correct_index"])
+    source_prompt, calibration, calibration_wrapper = _format_sources(item, format_name)
+    source_prompt_sha = hashlib.sha256(source_prompt.encode("utf-8")).hexdigest()
+    source_calibration = str(calibration["content_free_prompt"])
+    placeholders = [f"OPTION_{label}_PLACEHOLDER" for label in LETTERS]
+    parse_reason = ""
+    if parsed_source is None:
+        try:
+            parsed_source = parse_prompt_options(source_prompt, format_name, choices)
+        except ValueError as exc:
+            parse_reason = str(exc)
+    parsed_calibration = None
+    if parsed_source is not None and parsed_source.separable:
+        try:
+            parsed_calibration = parse_prompt_options(
+                source_calibration,
+                calibration_wrapper,
+                placeholders,
+            )
+        except ValueError as exc:
+            parse_reason = f"calibration:{exc}"
+    separable = bool(
+        parsed_source is not None
+        and parsed_source.separable
+        and parsed_calibration is not None
+        and parsed_calibration.separable
+    )
+    transform_provenance = "deterministic"
+    legacy_prompts: dict[int, tuple[str, str]] = {}
+    if parsed_source is not None and not parsed_source.separable:
+        parse_reason = parsed_source.not_applicable_reason
+    elif not separable:
+        try:
+            legacy_prompts = {
+                assignment.variant: (
+                    _source_counterfactual(source_prompt, format_name, assignment, choices),
+                    _source_counterfactual(
+                        source_calibration,
+                        calibration_wrapper,
+                        assignment,
+                        placeholders,
+                    ),
+                )
+                for assignment in balanced_assignments()[1:]
+            }
+        except ValueError:
+            legacy_prompts = {}
+        else:
+            separable = True
+            transform_provenance = "legacy_deterministic"
+    if not separable and not parse_reason:
+        parse_reason = "option_structure_not_resolved"
+
+    rows: list[dict[str, object]] = []
+
+    def append_letter(assignment: Assignment, prompt: str, calibration_prompt: str) -> None:
+        correct_position = assignment.content_ids_by_position.index(correct_content_id)
+        correct_label = assignment.labels_by_position[correct_position]
+        rows.append(
+            {
+                "work_key": f"letter|{item_id}|{format_name}|{assignment.variant}",
+                "item_id": item_id,
+                "subject": item["subject"],
+                "split": item["split"],
+                "wrapper_name": format_name,
+                "arm": "letter_intervention",
+                "variant": assignment.variant,
+                "manipulation": assignment.manipulation,
+                "position_shift": assignment.position_shift,
+                "label_shift": assignment.label_shift,
+                "template_scope": "source_prompt_counterfactual",
+                "source_prompt_sha256": source_prompt_sha,
+                "prompt": prompt,
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "calibration_prompt": calibration_prompt,
+                "calibration_prompt_sha256": hashlib.sha256(calibration_prompt.encode("utf-8")).hexdigest(),
+                "content_free_calibration_kind": calibration["content_free_calibration_kind"],
+                "content_free_fallback_reason": calibration["content_free_fallback_reason"],
+                "content_ids_by_position": list(assignment.content_ids_by_position),
+                "labels_by_position": list(assignment.labels_by_position),
+                "candidate_texts": choices,
+                "correct_content_id": correct_content_id,
+                "correct_position": correct_position,
+                "correct_label": correct_label,
+                "correct_text": choices[correct_content_id],
+            }
+        )
+
+    assignments = balanced_assignments()
+    append_letter(assignments[0], source_prompt, source_calibration)
+    if separable:
+        for assignment in assignments[1:]:
+            if legacy_prompts:
+                prompt, calibration_prompt = legacy_prompts[assignment.variant]
+            else:
+                assert parsed_source is not None and parsed_calibration is not None
+                prompt = transform_with_option_map(
+                    parsed_source,
+                    source_prompt,
+                    position_shift=assignment.position_shift,
+                    label_shift=assignment.label_shift,
+                )
+                calibration_prompt = transform_with_option_map(
+                    parsed_calibration,
+                    source_calibration,
+                    position_shift=assignment.position_shift,
+                    label_shift=assignment.label_shift,
+                )
+            append_letter(assignment, prompt, calibration_prompt)
+
+    text_prompt = _text_readout_prompt(source_prompt)
+    rows.append(
+        {
+            "work_key": f"text|{item_id}|{format_name}|0",
+            "item_id": item_id,
+            "subject": item["subject"],
+            "split": item["split"],
+            "wrapper_name": format_name,
+            "arm": "answer_text",
+            "variant": 0,
+            "manipulation": "controlled_baseline",
+            "position_shift": 0,
+            "label_shift": 0,
+            "template_scope": "source_prompt_counterfactual",
+            "source_prompt_sha256": source_prompt_sha,
+            "prompt": text_prompt,
+            "prompt_sha256": hashlib.sha256(text_prompt.encode("utf-8")).hexdigest(),
+            "calibration_prompt": None,
+            "calibration_prompt_sha256": None,
+            "content_free_calibration_kind": None,
+            "content_free_fallback_reason": None,
+            "content_ids_by_position": [0, 1, 2, 3],
+            "labels_by_position": list(LETTERS),
+            "candidate_texts": choices,
+            "correct_content_id": correct_content_id,
+            "correct_position": correct_content_id,
+            "correct_label": LETTERS[correct_content_id],
+            "correct_text": choices[correct_content_id],
+        }
+    )
+    applicability = {
+        "item_id": item_id,
+        "subject": item["subject"],
+        "split": item["split"],
+        "correct_label": LETTERS[correct_content_id],
+        "wrapper_name": format_name,
+        "source_prompt_sha256": source_prompt_sha,
+        "baseline_applicable": True,
+        "text_applicable": True,
+        "position_applicable": separable,
+        "label_applicable": separable,
+        "parse_provenance": transform_provenance if separable else "unresolved",
+        "not_applicable_reason": "" if separable else parse_reason,
+    }
+    return rows, applicability
+
+
+def build_causal_design_v3(
+    frame: pd.DataFrame,
+    *,
+    splits: Sequence[str] | None = None,
+    option_maps: dict[tuple[str, str], ParsedPrompt] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the full-population design without whole-item parser exclusions."""
+
+    allowed_splits = None if splits is None else {str(split) for split in splits}
+    rows: list[dict[str, object]] = []
+    applicability: list[dict[str, object]] = []
+    supplied = option_maps or {}
+    for item in _canonical_items(frame):
+        if allowed_splits is not None and str(item["split"]) not in allowed_splits:
+            continue
+        for format_name in CONTROLLED_FORMATS:
+            block, status = _v3_rows_for_item_format(
+                item,
+                format_name,
+                supplied.get((str(item["item_id"]), format_name)),
+            )
+            rows.extend(block)
+            applicability.append(status)
+    design = pd.DataFrame(rows).sort_values("work_key", kind="mergesort").reset_index(drop=True)
+    if design["work_key"].duplicated().any():
+        raise AssertionError("Causal v3 design produced duplicate work keys")
+    applicability_frame = pd.DataFrame(applicability).sort_values(
+        ["item_id", "wrapper_name"], kind="mergesort", ignore_index=True
+    )
+    return design, applicability_frame

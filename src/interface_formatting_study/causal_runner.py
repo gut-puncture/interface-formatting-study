@@ -105,31 +105,42 @@ def validate_causal_design(design: pd.DataFrame) -> None:
     for (item_id, wrapper_name), group in design.groupby(["item_id", "wrapper_name"], sort=True):
         letter = group[group["arm"] == "letter_intervention"]
         text = group[group["arm"] == "answer_text"]
-        if set(letter["variant"].astype(int)) != set(range(7)) or len(letter) != 7 or len(text) != 1:
-            raise ValueError(
-                f"Causal design requires seven letter variants and one text row for {item_id}/{wrapper_name}"
-            )
-        expected = {"controlled_baseline": 1, "position_only": 3, "label_only": 3}
-        if letter["manipulation"].value_counts().to_dict() != expected:
-            raise ValueError(f"Causal design manipulations are not isolated for {item_id}/{wrapper_name}")
-        identity = letter[letter["manipulation"] == "controlled_baseline"]
+        baseline = letter[letter["manipulation"] == "controlled_baseline"]
         position = letter[letter["manipulation"] == "position_only"]
         label = letter[letter["manipulation"] == "label_only"]
-        if set(position["label_shift"].astype(int)) != {0} or set(label["position_shift"].astype(int)) != {0}:
+        if len(baseline) != 1 or set(baseline["variant"].astype(int)) != {0} or len(text) != 1:
+            raise ValueError(f"Causal design requires one baseline and one text row for {item_id}/{wrapper_name}")
+        for name, block, variants in (
+            ("position_only", position, {1, 2, 3}),
+            ("label_only", label, {4, 5, 6}),
+        ):
+            observed = set(block["variant"].astype(int))
+            if observed not in (set(), variants) or len(block) not in (0, 3):
+                raise ValueError(
+                    f"Causal design requires a complete three-row block for {name} on {item_id}/{wrapper_name}"
+                )
+        if (not position.empty and set(position["label_shift"].astype(int)) != {0}) or (
+            not label.empty and set(label["position_shift"].astype(int)) != {0}
+        ):
             raise ValueError(f"Causal design main effects are confounded for {item_id}/{wrapper_name}")
         for content_id in range(4):
-            position_block = pd.concat([identity, position])
-            positions = [list(values).index(content_id) for values in position_block["content_ids_by_position"]]
-            labels = [
-                list(labels_by_position)[position]
-                for labels_by_position, position in zip(
-                    pd.concat([identity, label])["labels_by_position"],
-                    [list(values).index(content_id) for values in pd.concat([identity, label])["content_ids_by_position"]],
-                    strict=True,
-                )
-            ]
-            if sorted(positions) != [0, 1, 2, 3] or sorted(labels) != ["A", "B", "C", "D"]:
-                raise ValueError(f"Causal design is not balanced for {item_id}/{wrapper_name}")
+            if not position.empty:
+                position_block = pd.concat([baseline, position])
+                positions = [list(values).index(content_id) for values in position_block["content_ids_by_position"]]
+                if sorted(positions) != [0, 1, 2, 3]:
+                    raise ValueError(f"Causal design is not balanced for {item_id}/{wrapper_name}")
+            if not label.empty:
+                label_block = pd.concat([baseline, label])
+                labels = [
+                    list(labels_by_position)[position]
+                    for labels_by_position, position in zip(
+                        label_block["labels_by_position"],
+                        [list(values).index(content_id) for values in label_block["content_ids_by_position"]],
+                        strict=True,
+                    )
+                ]
+                if sorted(labels) != ["A", "B", "C", "D"]:
+                    raise ValueError(f"Causal design is not balanced for {item_id}/{wrapper_name}")
 
 
 def _choice_entropy(scores: dict[str, float]) -> float:

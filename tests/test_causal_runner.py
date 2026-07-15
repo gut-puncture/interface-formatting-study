@@ -112,3 +112,17 @@ def test_causal_design_validation_rejects_duplicate_or_inconsistent_work():
     unbalanced.at[first_letter, "correct_label"] = unbalanced.at[first_letter, "labels_by_position"][correct_position]
     with pytest.raises(ValueError, match="not balanced"):
         validate_causal_design(unbalanced)
+
+
+def test_validator_accepts_complete_missing_arm_but_rejects_partial_rotation():
+    design = _design()
+    selected = (design["item_id"] == "item-1") & (design["wrapper_name"] == "graphql_query")
+    without_label = design[~(selected & (design["manipulation"] == "label_only"))].copy()
+
+    validate_causal_design(without_label)
+
+    partial = design[
+        ~(selected & (design["manipulation"] == "label_only") & (design["variant"] == 6))
+    ].copy()
+    with pytest.raises(ValueError, match="complete three-row block"):
+        validate_causal_design(partial)
