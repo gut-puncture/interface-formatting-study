@@ -23,6 +23,13 @@ class MarginResult:
     best_wrong_score: float
 
 
+@dataclass(frozen=True)
+class CandidateScore:
+    total_logp: float
+    mean_logp: float
+    token_count: int
+
+
 @dataclass
 class ScoringTelemetry:
     batches: int = 0
@@ -395,6 +402,113 @@ def completion_logps_many(
         current_max_len = max(current_max_len, total_len)
     flush(current)
     return out
+
+
+def score_candidate_sets_many(
+    model,
+    tokenizer,
+    prompts: list[str],
+    candidate_sets: list[list[str]],
+    *,
+    batch_size: int = 128,
+    max_batch_tokens: int | None = None,
+    device: torch.device | str | None = None,
+    telemetry: ScoringTelemetry | None = None,
+) -> list[list[CandidateScore]]:
+    """Score a different candidate completion set for each prompt in shared batches."""
+
+    if len(prompts) != len(candidate_sets):
+        raise ValueError("prompts and candidate_sets must have the same length")
+    if not prompts:
+        return []
+    if batch_size < 1 or (max_batch_tokens is not None and max_batch_tokens < 1):
+        raise ValueError("batch_size and max_batch_tokens must be positive")
+    if any(not candidates for candidates in candidate_sets):
+        raise ValueError("Each prompt requires a non-empty candidate set")
+
+    prompt_ids = [tokenize_text(tokenizer, prompt) for prompt in prompts]
+    if any(not ids for ids in prompt_ids):
+        raise ValueError("Prompts must contain at least one token to score candidates")
+    candidate_ids = [
+        [tokenize_text(tokenizer, candidate) for candidate in candidates]
+        for candidates in candidate_sets
+    ]
+    if any(not ids for candidates in candidate_ids for ids in candidates):
+        raise ValueError("Candidate answers must contain at least one token")
+
+    device_obj = torch.device(device) if device is not None else _model_device(model)
+    pad_token_id = _pad_id(tokenizer)
+    results: list[list[CandidateScore | None]] = [
+        [None for _ in candidates] for candidates in candidate_sets
+    ]
+    entries = sorted(
+        (
+            (len(prompt_ids[prompt_index]) + len(ids), prompt_index, candidate_index)
+            for prompt_index, candidates in enumerate(candidate_ids)
+            for candidate_index, ids in enumerate(candidates)
+        ),
+        key=lambda entry: (entry[0], entry[1], entry[2]),
+    )
+
+    def flush(batch: list[tuple[int, int, int]]) -> None:
+        if not batch:
+            return
+        preparation_started = time.monotonic()
+        sequences = [
+            prompt_ids[prompt_index] + candidate_ids[prompt_index][candidate_index]
+            for _, prompt_index, candidate_index in batch
+        ]
+        max_len = max(len(sequence) for sequence in sequences)
+        input_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long, device=device_obj)
+        attention_mask = torch.zeros_like(input_ids)
+        for row_index, sequence in enumerate(sequences):
+            input_ids[row_index, : len(sequence)] = torch.tensor(sequence, dtype=torch.long, device=device_obj)
+            attention_mask[row_index, : len(sequence)] = 1
+        if telemetry is not None:
+            telemetry.batches += 1
+            telemetry.actual_tokens += sum(len(sequence) for sequence in sequences)
+            telemetry.padded_tokens += len(sequences) * max_len
+            telemetry.input_preparation_seconds += time.monotonic() - preparation_started
+
+        with torch.inference_mode():
+            log_probs = torch.log_softmax(
+                model(input_ids=input_ids, attention_mask=attention_mask).logits,
+                dim=-1,
+            )
+        for row_index, (_, prompt_index, candidate_index) in enumerate(batch):
+            completion = candidate_ids[prompt_index][candidate_index]
+            prompt_len = len(prompt_ids[prompt_index])
+            total = torch.zeros((), dtype=log_probs.dtype, device=log_probs.device)
+            for offset, token_id in enumerate(completion):
+                total = total + log_probs[row_index, prompt_len + offset - 1, token_id]
+            total_value = float(total.detach().cpu())
+            results[prompt_index][candidate_index] = CandidateScore(
+                total_logp=total_value,
+                mean_logp=total_value / len(completion),
+                token_count=len(completion),
+            )
+
+    current: list[tuple[int, int, int]] = []
+    current_max_len = 0
+    for entry in entries:
+        candidate_max_len = max(current_max_len, entry[0])
+        count_exceeded = len(current) >= batch_size
+        tokens_exceeded = (
+            max_batch_tokens is not None
+            and current
+            and candidate_max_len * (len(current) + 1) > max_batch_tokens
+        )
+        if count_exceeded or tokens_exceeded:
+            flush(current)
+            current = []
+            current_max_len = 0
+        current.append(entry)
+        current_max_len = max(current_max_len, entry[0])
+    flush(current)
+
+    if any(score is None for row in results for score in row):
+        raise RuntimeError("Candidate scorer failed to produce every requested score")
+    return [[score for score in row if score is not None] for row in results]
 
 
 def score_labels(

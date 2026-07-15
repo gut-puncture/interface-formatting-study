@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 MECHANISTIC_LAYERS = (2, 5, 7, 9, 11, 14, 16, 18)
+QWEN_MECHANISTIC_LAYERS = (2, 4, 6, 8, 10, 12, 14, 16)
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,14 @@ class ModelProfile:
 
 
 MODEL_PROFILES: dict[str, ModelProfile] = {
+    "qwen": ModelProfile(
+        name="qwen",
+        model_id="Qwen/Qwen2.5-1.5B-Instruct",
+        revision="989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+        slug="qwen2.5-1.5b-instruct",
+        expected_layers=28,
+        mechanistic_layers=QWEN_MECHANISTIC_LAYERS,
+    ),
     "phi": ModelProfile(
         name="phi",
         model_id="microsoft/Phi-3.5-mini-instruct",

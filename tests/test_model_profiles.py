@@ -24,6 +24,17 @@ def test_two_model_profiles_are_pinned_and_isolated(tmp_path):
         assert profile.output_base(tmp_path) == tmp_path / "results" / "model_runs" / profile.slug
 
 
+def test_qwen_profile_is_pinned_for_the_three_model_followup(tmp_path):
+    qwen = get_model_profile("qwen")
+
+    assert qwen.model_id == "Qwen/Qwen2.5-1.5B-Instruct"
+    assert qwen.revision == "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+    assert qwen.slug == "qwen2.5-1.5b-instruct"
+    assert qwen.expected_layers == 28
+    assert qwen.mechanistic_layers == (2, 4, 6, 8, 10, 12, 14, 16)
+    assert qwen.output_base(tmp_path) == tmp_path / "results" / "model_runs" / qwen.slug
+
+
 def test_profile_loader_uses_builtin_transformers_implementation_for_sdpa(monkeypatch):
     captured = {}
 

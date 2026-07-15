@@ -13,6 +13,7 @@ from interface_formatting_study.scoring import (
     predict_from_scores,
     score_labels,
     score_labels_many,
+    score_candidate_sets_many,
     single_token_label_ids,
     tokenize_text,
 )
@@ -99,6 +100,36 @@ def test_multi_token_label_automatically_uses_generic_scorer(boundary_tokenizer)
     scores = score_labels_many(model, boundary_tokenizer, ["Q", "X"], batch_size=16)
     assert len(scores) == 2
     assert model.forward_batch_sizes[0] == 8
+
+
+def test_variable_candidate_sets_match_row_wise_reference(boundary_tokenizer, rule_model):
+    prompts = ["Q", "Longer"]
+    candidate_sets = [["A", " BC", "D"], ["X", " YY", "Z"]]
+
+    batched = score_candidate_sets_many(
+        rule_model,
+        boundary_tokenizer,
+        prompts,
+        candidate_sets,
+        batch_size=8,
+        max_batch_tokens=256,
+    )
+    reference = [
+        completion_logps(rule_model, boundary_tokenizer, prompt, candidates)
+        for prompt, candidates in zip(prompts, candidate_sets, strict=True)
+    ]
+
+    for scored_row, expected_row in zip(batched, reference, strict=True):
+        assert [score.total_logp for score in scored_row] == pytest.approx(expected_row)
+        assert all(score.token_count >= 1 for score in scored_row)
+        assert all(score.mean_logp == pytest.approx(score.total_logp / score.token_count) for score in scored_row)
+
+
+def test_variable_candidate_sets_reject_empty_or_misaligned_inputs(boundary_tokenizer, rule_model):
+    with pytest.raises(ValueError, match="same length"):
+        score_candidate_sets_many(rule_model, boundary_tokenizer, ["Q"], [], batch_size=4)
+    with pytest.raises(ValueError, match="non-empty"):
+        score_candidate_sets_many(rule_model, boundary_tokenizer, ["Q"], [[]], batch_size=4)
 
 
 def test_margin_math_and_tie_handling():

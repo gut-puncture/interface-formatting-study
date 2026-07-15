@@ -27,6 +27,7 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 interface-formatting-study = "interface_formatting_study.cli:main"
 interface_formatting_study = "interface_formatting_study.cli:main"
+interface-formatting-causal = "interface_formatting_study.causal_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
