@@ -6,8 +6,10 @@ This is an exploratory causal follow-up on the fixed train and validation
 partitions. The 599 internal-test items remain untouched until the explanation
 and analysis are frozen.
 
-- Active design: 2,401 items, eight fixed wrapper templates plus one matched
-  plain MCQ, 172,872 durable rows per model.
+- Active design: 2,401 source items, of which 1,732 are safely transformable;
+  eight exact stored wrapper baselines plus one matched plain MCQ yield 124,704
+  durable rows per model. The 669 whole-item exclusions are checksum-bound in
+  the adjacent exclusion ledger.
 - Letter arm: one controlled baseline, three position-only rotations (the
   displayed letters stay attached to their answer texts), and three
   letter-only rotations (physical order stays fixed) per item/format. The two
@@ -16,36 +18,35 @@ and analysis are frozen.
 - Text arm: one controlled-baseline prompt per item/format. Deterministic
   generated exact-answer match is primary. Total and mean candidate
   log-likelihood are explicitly secondary length-sensitive diagnostics.
-- This is a controlled causal experiment, not a byte-level mutation of the old
-  generated prompts. The old runs establish the phenomenon; fixed canonical
-  templates and the matched plain control test whether format amplifies
-  position or displayed-letter sensitivity without uncontrolled wording drift.
+- This is a controlled causal experiment over the exact prompts used in the
+  observational runs. Baselines are byte-identical. Counterfactuals change only
+  the unambiguous stored answer texts/labels or the terminal readout instruction.
+  If any wrapper for an item cannot be transformed without guessing, the whole
+  item is excluded.
 - Models: pinned Qwen2.5-1.5B, Phi-3.5-mini, and Mistral-7B-v0.3 profiles.
 - Active design SHA-256:
-  `f30d1056a131a9d62257a5d1028defaf7e6100c558d65ce3ea19c10d0c1bc336`.
+  `6055ca15bd2558e55589bf0e64620ae5d4898f4e04d0b730449bf5c0b4f772da`.
   The launch operator must re-read the committed manifest rather than trust
   this copied value if the design is regenerated.
 
-The older model-assisted wrapper audit is outcome-blind. Its first pass covered
-all 24,000 rows exactly; a separate second-pass context adjudicated all 134
-initially questionable rows. Final labels are 22,081 formatting-only, 1,808
-meaning-preserving rewrites, 107 content changes, and four ambiguous rows. The
-causal design does not reuse those generated prompt strings: it renders directly
-from the canonical question and four canonical choices. This is deliberate so
-the new causal evidence is not contaminated by the 111 non-preserving or
-uncertain old rows.
+The older model-assisted wrapper audit remains stored but does not determine
+causal eligibility. Eligibility depends only on whether all eight exact stored
+prompts can be transformed unambiguously. Because eligibility varies by subject,
+the causal estimate applies to the recorded 1,732-item eligible population; the
+manifest records inclusion rates by split, correct label, and subject.
 
 ## Local readiness gate
 
 Before rental, all of the following must be green:
 
 1. Full local tests from the project root.
-2. Causal design checksum and 172,872-row/2,401-item contract.
+2. Causal design checksum and 124,704-row/1,732-eligible-item contract, plus the
+   checksum-bound 669-item exclusion ledger.
 3. Functional fake-model run, interruption/resume equality, shard conflict
    rejection, verified fetch, and local analysis consumer tests.
 4. Thin payload inventory: `src/`, `configs/`, causal operator scripts, pinned
    non-Torch environment, packaging metadata, README, and the 24 MB active
-   design plus manifest only.
+   design, manifest, and exclusion ledger only.
 5. Independent review wave reconciled; no unresolved correctness blocker.
 6. No unexpected live Prime pod. Never terminate another project's pod.
 
@@ -97,7 +98,7 @@ wallet, and SSH endpoint. Prove SSH and CUDA before syncing.
 ssh -i <key> -p <port> ubuntu@<host> 'whoami; nvidia-smi; df -h'
 scripts/sync_interface_formatting_study_to_gpu.sh \
   ubuntu@<host> /home/ubuntu/interface_formatting_study <key> <port> \
-  artifacts/causal_followup/v1/design_train_validation.parquet
+  artifacts/causal_followup/v2_source_preserving/design_train_validation.parquet
 ssh -i <key> -p <port> ubuntu@<host> \
   'cd /home/ubuntu/interface_formatting_study && scripts/bootstrap_causal_followup_gpu.sh'
 ssh -i <key> -p <port> ubuntu@<host> \
@@ -122,7 +123,7 @@ per-model lock. Replace `<ssh>` with `ssh -i <key> -p <port> ubuntu@<host>`.
 The profiling canary is 32 items = 2,304 durable rows. For each model record
 model-load seconds separately from scoring seconds, forward time/calls, peak
 VRAM, padding ratio, completed rows/second, and input-preparation time. Forecast
-each full run as `one model load + scoring_seconds / completed_rows * 172872`,
+each full run as `one model load + scoring_seconds / completed_rows * 124704`,
 then apply a 1.25 P90 multiplier and add measured setup time. Start full scale
 only if combined P90 cost fits below $6.00. Otherwise perform at most one
 batch/token-budget optimization canary; accept only if categorical outputs are

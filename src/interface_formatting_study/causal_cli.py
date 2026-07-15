@@ -49,6 +49,33 @@ def _write_identity(identity, path: Path) -> None:
     _atomic_json(payload, path)
 
 
+def _eligibility_summary(
+    frame: pd.DataFrame, design: pd.DataFrame, splits: tuple[str, ...]
+) -> dict[str, object]:
+    items = frame[frame["split"].astype(str).isin(splits)].drop_duplicates("item_id").copy()
+    items["correct_label"] = items["correct_index"].map(dict(enumerate("ABCD")))
+    eligible_ids = set(design["item_id"].astype(str))
+    items["eligible"] = items["item_id"].astype(str).isin(eligible_ids)
+
+    def summarize(column: str) -> dict[str, dict[str, object]]:
+        result: dict[str, dict[str, object]] = {}
+        for value, group in items.groupby(column, sort=True):
+            source_count = int(len(group))
+            eligible_count = int(group["eligible"].sum())
+            result[str(value)] = {
+                "source_items": source_count,
+                "eligible_items": eligible_count,
+                "eligibility_rate": eligible_count / source_count,
+            }
+        return result
+
+    return {
+        "by_split": summarize("split"),
+        "by_correct_label": summarize("correct_label"),
+        "by_subject": summarize("subject"),
+    }
+
+
 def cmd_prepare(args) -> None:
     config = read_yaml(args.config)
     frame, _ = prepare_dataset(config)
@@ -65,6 +92,7 @@ def cmd_prepare(args) -> None:
     write_table_atomic(design, output)
     exclusions_path = output.with_name(output.stem + ".exclusions.parquet")
     write_table_atomic(exclusions, exclusions_path)
+    eligibility = _eligibility_summary(frame, design, splits)
     _atomic_json(
         {
             "design_schema_version": DESIGN_SCHEMA_VERSION,
@@ -78,6 +106,7 @@ def cmd_prepare(args) -> None:
                 "sha256": sha256_file(exclusions_path),
                 "rows": len(exclusions),
             },
+            "eligibility": eligibility,
             "splits": list(splits),
             "formats": list(CONTROLLED_FORMATS),
             "rows_per_item_format": 8,
@@ -106,6 +135,18 @@ def _load_design(path: Path) -> pd.DataFrame:
         raise RuntimeError("Causal run requires a schema-v4 source-preserving design")
     if sha256_file(path) != manifest.get("sha256"):
         raise RuntimeError("Causal design checksum mismatch")
+    exclusions_meta = manifest.get("exclusions")
+    expected_exclusions_name = path.stem + ".exclusions.parquet"
+    if not isinstance(exclusions_meta, dict) or exclusions_meta.get("path_name") != expected_exclusions_name:
+        raise RuntimeError("Causal design exclusion ledger metadata is missing or invalid")
+    exclusions_path = path.with_name(expected_exclusions_name)
+    if not exclusions_path.exists():
+        raise RuntimeError("Causal design exclusion ledger is missing")
+    if sha256_file(exclusions_path) != exclusions_meta.get("sha256"):
+        raise RuntimeError("Causal design exclusion ledger checksum mismatch")
+    exclusions = read_table(exclusions_path)
+    if len(exclusions) != int(exclusions_meta.get("rows", -1)):
+        raise RuntimeError("Causal design exclusion ledger row count mismatch")
     design = read_table(path)
     if len(design) != int(manifest.get("rows", -1)):
         raise RuntimeError("Causal design row count does not match its manifest")
@@ -180,6 +221,10 @@ def cmd_run(args) -> None:
     _validate_run_args(args)
     design_path = Path(args.design)
     design = _load_design(design_path)
+    design_manifest = json.loads(
+        design_path.with_name(design_path.name + ".manifest.json").read_text(encoding="utf-8")
+    )
+    exclusions_meta = design_manifest["exclusions"]
     profile = get_model_profile(args.profile)
     source = design
     if args.canary:
@@ -221,6 +266,7 @@ def cmd_run(args) -> None:
             "max_batch_tokens": args.max_batch_tokens,
         },
         "selected_work_sha256": _selected_work_sha(source),
+        "design_exclusions_sha256": exclusions_meta["sha256"],
         "runtime_contract": {
             "python": sys.version.split()[0],
             "torch": dependencies["torch"],
@@ -266,6 +312,9 @@ def cmd_run(args) -> None:
             "source_rows": len(design),
             "run_rows": len(source),
             "selected_work_sha256": _selected_work_sha(source),
+            "exclusions_path_name": exclusions_meta["path_name"],
+            "exclusions_sha256": exclusions_meta["sha256"],
+            "exclusion_rows": exclusions_meta["rows"],
         },
         "runtime": {
             "device": str(device),

@@ -119,7 +119,8 @@ def _label_spans(prompt: str, wrapper_name: str) -> tuple[_Span, ...]:
             by_position[(start, end)] = _Span(start, end, match.group("label").upper())
     spans = tuple(sorted(by_position.values(), key=lambda span: span.start))
     counts = {label: sum(span.value == label for span in spans) for label in LETTERS}
-    if not spans or len(set(counts.values())) != 1 or next(iter(counts.values())) < 1:
+    per_label = next(iter(counts.values())) if len(set(counts.values())) == 1 else 0
+    if not spans or per_label < 1 or (wrapper_name != "html_form" and per_label != 1):
         raise ValueError("option_labels_not_unambiguous")
     return spans
 
@@ -306,6 +307,9 @@ def _exclusion_reasons(item: dict[str, object]) -> list[dict[str, str]]:
             reasons.append(
                 {
                     "item_id": str(item["item_id"]),
+                    "split": str(item["split"]),
+                    "subject": str(item["subject"]),
+                    "correct_label": LETTERS[int(item["correct_index"])],
                     "wrapper_name": format_name,
                     "reason": reason,
                 }
@@ -425,7 +429,8 @@ def build_causal_design_with_exclusions(
         else:
             eligible.append(item)
     exclusion_frame = pd.DataFrame(
-        exclusions, columns=["item_id", "wrapper_name", "reason"]
+        exclusions,
+        columns=["item_id", "split", "subject", "correct_label", "wrapper_name", "reason"],
     ).sort_values(["item_id", "wrapper_name"], kind="mergesort", ignore_index=True)
     return _build_design_from_items(eligible), exclusion_frame
 

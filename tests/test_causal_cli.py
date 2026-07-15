@@ -28,6 +28,10 @@ def _write_design(tmp_path):
     design = build_causal_design(source_prompt_frame())
     path = tmp_path / "design.parquet"
     design.to_parquet(path, index=False)
+    exclusions = path.with_name(path.stem + ".exclusions.parquet")
+    pd.DataFrame(columns=["item_id", "wrapper_name", "reason"]).to_parquet(
+        exclusions, index=False
+    )
     path.with_name(path.name + ".manifest.json").write_text(
         json.dumps(
             {
@@ -35,6 +39,11 @@ def _write_design(tmp_path):
                 "scope": "source_prompt_counterfactual",
                 "sha256": sha256_file(path),
                 "rows": len(design),
+                "exclusions": {
+                    "path_name": exclusions.name,
+                    "sha256": sha256_file(exclusions),
+                    "rows": 0,
+                },
             }
         )
     )
@@ -55,6 +64,27 @@ def test_load_design_rejects_old_canonical_template_manifest(tmp_path):
     )
 
     with pytest.raises(RuntimeError, match="source-preserving"):
+        causal_cli._load_design(path)
+
+
+def test_load_design_rejects_canonical_rows_under_a_v4_manifest(tmp_path):
+    path, design = _write_design(tmp_path)
+    design["template_scope"] = "controlled_canonical_template"
+    design.to_parquet(path, index=False)
+    manifest_path = path.with_name(path.name + ".manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    manifest["sha256"] = sha256_file(path)
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="template_scope"):
+        causal_cli._load_design(path)
+
+
+def test_load_design_requires_the_checksum_bound_exclusion_ledger(tmp_path):
+    path, _ = _write_design(tmp_path)
+    path.with_name(path.stem + ".exclusions.parquet").unlink()
+
+    with pytest.raises(RuntimeError, match="exclusion"):
         causal_cli._load_design(path)
 
 
@@ -81,10 +111,15 @@ def test_prepare_records_source_preservation_and_whole_item_exclusions(tmp_path,
     assert manifest["source_items"] == 2
     assert manifest["eligible_items"] == 1
     assert manifest["excluded_items"] == 1
+    assert manifest["eligibility"]["by_split"]["train"]["source_items"] == 2
+    assert manifest["eligibility"]["by_correct_label"]["B"]["eligible_items"] == 1
     exclusions = pd.read_parquet(output.with_name(output.stem + ".exclusions.parquet"))
     assert exclusions.to_dict("records") == [
         {
             "item_id": "item-2",
+            "split": "train",
+            "subject": "math",
+            "correct_label": "B",
             "wrapper_name": "protobuf_msg",
             "reason": "option_labels_not_unambiguous",
         }
@@ -130,6 +165,7 @@ def test_causal_cli_runs_identity_bound_canary(
     assert manifest["status"] == "complete"
     assert manifest["model"]["id"] == "Qwen/Qwen2.5-1.5B-Instruct"
     assert manifest["design"]["completed_rows"] == len(design)
+    assert manifest["design"]["exclusions_sha256"]
     assert manifest["runtime"]["single_token_label_fast_path"]
     assert "torch" in manifest["runtime"]["dependencies"]
     root = manifests[0].parent

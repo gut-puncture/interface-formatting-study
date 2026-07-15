@@ -46,6 +46,8 @@ def validate_causal_design(design: pd.DataFrame) -> None:
         "manipulation",
         "prompt",
         "prompt_sha256",
+        "template_scope",
+        "source_prompt_sha256",
         "calibration_prompt",
         "calibration_prompt_sha256",
         "content_ids_by_position",
@@ -65,6 +67,8 @@ def validate_causal_design(design: pd.DataFrame) -> None:
         raise ValueError("Causal design contains duplicate work keys")
     if set(design["arm"]) - {"letter_intervention", "answer_text"}:
         raise ValueError("Causal design contains an unknown experiment arm")
+    if set(design["template_scope"].astype(str)) != {"source_prompt_counterfactual"}:
+        raise ValueError("Causal design template_scope is not source-preserving")
     for row in design.itertuples(index=False):
         contents = [int(value) for value in row.content_ids_by_position]
         labels = [str(value) for value in row.labels_by_position]
@@ -84,6 +88,11 @@ def validate_causal_design(design: pd.DataFrame) -> None:
         actual_prompt_sha = hashlib.sha256(str(row.prompt).encode("utf-8")).hexdigest()
         if str(row.prompt_sha256) != actual_prompt_sha:
             raise ValueError(f"Causal design has a prompt checksum mismatch for {row.work_key}")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(row.source_prompt_sha256)):
+            raise ValueError(f"Causal design has an invalid source prompt checksum for {row.work_key}")
+        if row.manipulation == "controlled_baseline" and row.arm == "letter_intervention":
+            if str(row.prompt_sha256) != str(row.source_prompt_sha256):
+                raise ValueError(f"Causal baseline does not match its source prompt for {row.work_key}")
         if row.arm == "letter_intervention":
             if not isinstance(row.calibration_prompt, str) or not row.calibration_prompt:
                 raise ValueError(f"Letter row is missing calibration_prompt for {row.work_key}")

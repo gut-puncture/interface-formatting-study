@@ -187,12 +187,30 @@ def test_untransformable_wrapper_excludes_the_whole_item_with_a_reason():
     assert exclusions.to_dict("records") == [
         {
             "item_id": "item-1",
+            "split": "train",
+            "subject": "math",
+            "correct_label": "B",
             "wrapper_name": "protobuf_msg",
             "reason": "option_labels_not_unambiguous",
         }
     ]
     with pytest.raises(ValueError, match="build_causal_design_with_exclusions"):
         build_causal_design(source)
+
+
+def test_balanced_non_option_label_construct_is_excluded_instead_of_edited():
+    source = _source_frame()
+    source.loc[source["wrapper_name"] == "csv_inline", "wrapped_prompt"] = (
+        "Statement,Truth\nA,True\nB,True\nC,False\nD,False\n\n"
+        "Options: A) 3; B) 4; C) 5; D) 6" + SUFFIX
+    )
+
+    design, exclusions = build_causal_design_with_exclusions(source)
+
+    assert design.empty
+    assert exclusions[exclusions["wrapper_name"] == "csv_inline"]["reason"].tolist() == [
+        "option_labels_not_unambiguous"
+    ]
 
 
 def test_source_prompt_hashes_bind_original_wrappers_without_calling_them_identity():

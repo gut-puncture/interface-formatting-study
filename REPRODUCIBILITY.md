@@ -109,25 +109,27 @@ The operator contract, spend gates, and exact teardown proof are in
 
 ## Prepared causal follow-up
 
-The next experiment uses a deterministic 172,872-row design over the train and
-validation partitions. For each of eight fixed wrapper templates and one
-matched plain MCQ, it has one controlled baseline, three position-only
-rotations, three letter-only rotations, and one generated answer-text prompt.
+The next experiment uses a deterministic 124,704-row design over 1,732 safely
+transformable train and validation items. For each of eight exact stored
+wrapper prompts and one matched plain MCQ, it has one controlled baseline,
+three position-only rotations, three letter-only rotations, and one generated
+answer-text prompt.
 Raw and content-free-calibrated letter outcomes are saved; deterministic exact
 generation is the primary text outcome, with candidate likelihoods secondary.
 The internal test partition is not included.
 
 ```bash
 interface-formatting-causal prepare \
-  --output artifacts/causal_followup/v1/design_train_validation.parquet
+  --output artifacts/causal_followup/v2_source_preserving/design_train_validation.parquet
 scripts/run_causal_followup_gpu.sh mistral functional
 ```
 
 The design manifest, numerical-environment-bound semantic identity, atomic
 shards, verified partial/complete fetch, analysis command, canary forecast,
 budget gates, and teardown procedure are in `CAUSAL_FOLLOWUP_RUN_CARD.md`.
-This controlled experiment deliberately uses fixed canonical templates; the
-completed original-prompt runs remain the observational phenomenon it tests.
+The baseline rows are byte-identical to the completed original-prompt runs.
+Items that cannot be transformed without guessing are excluded as a whole and
+recorded in the checksum-bound exclusion ledger.
 
 The outcome-blind audit artifacts are retained under
 `artifacts/wrapper_audit/20260715-v1/`. Its exact-coverage first pass and
