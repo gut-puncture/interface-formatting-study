@@ -1,0 +1,4 @@
+model,model_id,semantic_run_id,behavioral_rows,items,calibrated_accuracy,mean_calibrated_margin,full_conflict_items,full_conflict_denominator,full_conflict_rate,eligible_conflict_items,eligible_conflict_denominator,eligible_conflict_rate
+Mistral,mistralai/Mistral-7B-Instruct-v0.3,e468f7b1bb2a121e6904,24000,3000,0.5025833333333334,0.2540888455708822,1987,3000,0.6623333333333333,1591,2672,0.5954341317365269
+Phi,microsoft/Phi-3.5-mini-instruct,a0f18fe1c8c223d8aec8,24000,3000,0.5677916666666667,1.0495462239583333,1654,3000,0.5513333333333333,1334,2672,0.49925149700598803
+Qwen,Qwen/Qwen2.5-1.5B-Instruct,,24000,3000,0.4841666666666667,0.24358072916666668,1861,3000,0.6203333333333333,1485,2672,0.5557634730538922

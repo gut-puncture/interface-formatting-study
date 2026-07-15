@@ -84,6 +84,36 @@ def _behavioral_summary(run: ModelRun) -> dict[str, object]:
     }
 
 
+def build_audit_sensitivity(runs: list[ModelRun], audit: pd.DataFrame) -> pd.DataFrame:
+    required = {"item_id", "wrapper_name", "final_label"}
+    missing = required - set(audit.columns)
+    if missing:
+        raise ValueError(f"Wrapper audit is missing columns: {sorted(missing)}")
+    if len(audit) != 24000 or audit.duplicated(["item_id", "wrapper_name"]).any():
+        raise ValueError("Wrapper audit must contain exactly one row for each of 24,000 item-wrapper pairs")
+    rows = []
+    for run in runs:
+        behavioral = _read_required(run, "raw/behavioral_scores.parquet")
+        merged = behavioral.merge(audit[list(required)], on=["item_id", "wrapper_name"], validate="one_to_one")
+        populations = {
+            "all_source_rows": pd.Series(True, index=merged.index),
+            "meaning_preserving": ~merged["final_label"].isin({"content_changed", "ambiguous"}),
+            "formatting_only": merged["final_label"] == "formatting_only",
+        }
+        for population, keep in populations.items():
+            outcomes = item_conflict_outcomes(merged[keep])
+            summary = conflict_population_summary(outcomes, population=population)
+            rows.append(
+                {
+                    "model": run.label,
+                    **summary,
+                    "rows": int(keep.sum()),
+                    "minimum_wrappers_per_item": int(outcomes["observed_wrappers"].min()),
+                }
+            )
+    return pd.DataFrame(rows).sort_values(["model", "population"]).reset_index(drop=True)
+
+
 def _grouped_phase(
     run: ModelRun,
     relative: str,
@@ -286,6 +316,7 @@ def main() -> None:
     parser.add_argument("--model-run", action="append", required=True, help="LABEL=PATH; repeat for each model")
     parser.add_argument("--output-dir", default="results/cross_model")
     parser.add_argument("--paper-dir", default=None)
+    parser.add_argument("--wrapper-audit", default=None)
     args = parser.parse_args()
     runs = [load_model_run(spec) for spec in args.model_run]
     paths = build_comparison(
@@ -293,6 +324,11 @@ def main() -> None:
         Path(args.output_dir),
         paper_dir=None if args.paper_dir is None else Path(args.paper_dir),
     )
+    if args.wrapper_audit is not None:
+        audit = pd.read_parquet(args.wrapper_audit)
+        sensitivity_path = Path(args.output_dir) / "tables" / "wrapper_audit_sensitivity.csv"
+        build_audit_sensitivity(runs, audit).to_csv(sensitivity_path, index=False)
+        paths["wrapper_audit_sensitivity"] = sensitivity_path
     print(json.dumps({key: str(value) for key, value in paths.items()}, indent=2, sort_keys=True))
 
 

@@ -1,0 +1,10 @@
+model,population,eligible_items,conflict_items,denominator,conflict_rate,rows,minimum_wrappers_per_item
+Mistral,all_source_rows,3000,1987,3000,0.6623333333333333,24000,8
+Mistral,formatting_only,2994,1890,2994,0.6312625250501002,22081,1
+Mistral,meaning_preserving,3000,1982,3000,0.6606666666666666,23889,3
+Phi,all_source_rows,3000,1654,3000,0.5513333333333333,24000,8
+Phi,formatting_only,2994,1572,2994,0.5250501002004008,22081,1
+Phi,meaning_preserving,3000,1645,3000,0.5483333333333333,23889,3
+Qwen,all_source_rows,3000,1861,3000,0.6203333333333333,24000,8
+Qwen,formatting_only,2994,1759,2994,0.5875083500334002,22081,1
+Qwen,meaning_preserving,3000,1846,3000,0.6153333333333333,23889,3

@@ -23,7 +23,7 @@
 \maketitle
 
 \begin{abstract}
-Language models often receive questions through tables, forms, configuration files, and other structured interfaces. We test whether changing only this formatting changes whether a model answers the same multiple-choice question correctly. We evaluate \texttt{Qwen/Qwen2.5-1.5B-Instruct} on 3,000 MMLU items rendered through eight wrappers that preserve the question, answer choices, and labels while changing syntax and layout. Across 24,000 wrapped prompts, calibrated accuracy is 48.4\%, and 62.0\% of items are answered correctly under at least one wrapper and incorrectly under at least one other wrapper. We then test a simple mechanistic hypothesis: when the model succeeds, it may form an internal activation vector that identifies the real question and options despite the wrapper. We test this with attention patterns, cosine similarity to the unwrapped prompt activation, and activation patching at positions after the answer options. We do not find a clear difference between wrapper runs that succeed and wrapper runs that fail. If such a wrapper-independent task state exists, these probes did not isolate it.
+Language models often receive questions through tables, forms, configuration files, and other structured interfaces. We test whether changing only this formatting changes whether a model answers the same multiple-choice question correctly. We evaluate three instruction-tuned model families---Qwen2.5-1.5B, Phi-3.5-mini, and Mistral-7B-v0.3---on 3,000 MMLU items rendered through eight wrappers intended to preserve the question, answer choices, and labels while changing syntax and layout. Across 72,000 wrapped prompts, calibrated accuracy is 48.4\%, 56.8\%, and 50.3\%, respectively. The fraction of items answered correctly under at least one wrapper and incorrectly under another is 62.0\%, 55.1\%, and 66.2\%. We then test a simple mechanistic hypothesis: successful runs may form an internal activation vector that identifies the real question and options despite the wrapper. Across all three models, successful and failed wrappers have similar content attention, and activation patching is stronger for some answer-label-matched cross-item donors than for same-item successful donors. If a wrapper-independent task state exists, these probes did not isolate it.
 \end{abstract}
 
 \section{Introduction}
@@ -34,14 +34,14 @@ We study this effect on multiple-choice MMLU questions. Each item is rendered in
 
 The mechanistic question is whether successful wrapped prompts share a simple internal state. Our hypothesis was that the model might strip away the wrapper formatting, identify the real question and options, and form an internal activation vector that can be used for answer selection. We test that idea at semantic positions in the prompt: after each answer option and after all answer options have appeared.
 
-The result is a modest negative one. Interface wrappers produce large answer instability, but our probes do not find a clear internal activation vector that separates successful wrapper runs from failed wrapper runs. Attention to question and option tokens is almost the same for successful and failed wrapped prompts. Successful wrapped prompts become only slightly more similar, by cosine similarity, to the unwrapped prompt activation. Activation patching sometimes helps failed runs, but the strongest improvements come from cross-item donors that share the answer letter, not from the same item's successful wrapped run. If the model forms a wrapper-independent task state, these diagnostics did not isolate it.
+The behavioral result replicates across all three models. Interface wrappers produce item-level conflict rates from 55.1\% to 66.2\%, despite large differences in model family and calibrated accuracy. The mechanistic result is a modest negative one. Attention to question and option tokens is almost the same for successful and failed wrapped prompts. Successful wrapped prompts become only slightly more similar, by cosine similarity, to the unwrapped prompt activation. Activation patching sometimes helps failed runs, but the strongest average recovery in the two replication models comes from cross-item donors that share the answer letter, not from the same item's successful wrapped run. If the models form a wrapper-independent task state, these diagnostics did not isolate it.
 
 \FloatBarrier
 
 \section{Experimental Setup}
 
 \paragraph{Model and data.}
-We evaluate \texttt{Qwen/Qwen2.5-1.5B-Instruct} \citep{qwen2024qwen25} on 3,000 MMLU source-test items \citep{hendrycks2021mmlu}. Each item is rendered in eight wrappers: \texttt{csv\_inline}, \texttt{graphql\_query}, \texttt{html\_form}, \texttt{ini\_file}, \texttt{key\_equals}, \texttt{protobuf\_msg}, \texttt{shell\_heredoc}, and \texttt{toml\_config}. A verified pure-interface wrapper preserves the question, the four answer choices, and the label set while changing only the surrounding syntax and layout. The active policy excludes style-transforming wrappers.
+We evaluate \texttt{Qwen/Qwen2.5-1.5B-Instruct} \citep{qwen2024qwen25}, \texttt{microsoft/Phi-3.5-mini-instruct} \citep{microsoft2024phi35}, and \texttt{mistralai/Mistral-7B-Instruct-v0.3} \citep{mistralai2024mistral7bv03} on the same 3,000 MMLU source-test items \citep{hendrycks2021mmlu}. Each item is rendered in eight wrappers intended to preserve the task while changing syntax and layout: \texttt{csv\_inline}, \texttt{graphql\_query}, \texttt{html\_form}, \texttt{ini\_file}, \texttt{key\_equals}, \texttt{protobuf\_msg}, \texttt{shell\_heredoc}, and \texttt{toml\_config}. The active policy excludes overt style transformations, and the row audit below quantifies deviations from the intended interface-only contract.
 
 \begin{table}[htbp]
   \caption{Study design. The primary calibrated set contains only rows whose content-free prompt was produced by removing the question and option text from the same wrapper rather than by a generic fallback.}
@@ -52,12 +52,12 @@ We evaluate \texttt{Qwen/Qwen2.5-1.5B-Instruct} \citep{qwen2024qwen25} on 3,000 
   \toprule
   Quantity & Value \\
   \midrule
-  Model under test & \texttt{Qwen/Qwen2.5-1.5B-Instruct} \\
+  Models under test & Qwen2.5-1.5B, Phi-3.5-mini, Mistral-7B-v0.3 \\
   Dataset & 3,000 MMLU source-test items \\
-  Interface wrappers & 8 verified pure-interface wrappers \\
-  Wrapped prompts scored & 24,000 \\
-  Primary calibrated set & 18,577 rows over 2,672 items \\
-  Mechanistic validation pairs & 285 successful/failed wrapper pairs \\
+  Interface wrappers & 8 intended pure-interface wrappers \\
+  Wrapped prompts scored & 72,000 (24,000 per model) \\
+  Qwen primary calibrated set & 18,577 rows over 2,672 items \\
+  Mechanistic validation pairs & 285 Qwen; 264 Phi; 300 Mistral \\
   \bottomrule
   \end{tabular}}
 \end{table}
@@ -112,7 +112,9 @@ The unwrapped comparison prompt is a direct question-options rendering. The wrap
 For each wrapped prompt, we score the conditional likelihood of answer letters A/B/C/D at the answer position; the raw prediction is the highest-scoring letter. Some wrappers make one answer letter more likely even when the question and options are removed. We estimate this wrapper letter bias by scoring a content-free version of the same wrapper, produced by removing the question and option text while preserving the wrapper structure. The calibrated score for a letter is its wrapped-prompt score minus this content-free score. The calibrated correct-answer margin is the calibrated score of the correct letter minus the largest calibrated score among the three incorrect letters; a positive margin means calibration favors the correct answer.
 
 \paragraph{Conflict construction.}
-The behavioral analysis reports both the full 24,000 scored rows and the primary calibrated set of 18,577 rows over 2,672 items. The full set uses same-wrapper content removal where available and fallback calibration otherwise; the primary set keeps only rows where same-wrapper content removal succeeded. An item-level conflict means that at least one available wrapper is correct and at least one available wrapper is wrong for the same underlying item. After this point, a \emph{successful wrapper run} means a wrapped prompt whose calibrated answer is correct, and a \emph{failed wrapper run} means a wrapped prompt whose calibrated answer is incorrect. For mechanistic tests, each eligible validation item contributes the strongest successful wrapper run and the worst failed wrapper run after calibrated scoring. This yields 285 validation-split primary conflict pairs. The construction is item-clustered, so multiple wrappers of one question are not treated as independent evidence.
+The behavioral analysis reports the full 24,000 scored rows for each model. The original Qwen analysis additionally reports a primary calibrated set of 18,577 rows over 2,672 items. The full set uses same-wrapper content removal where available and fallback calibration otherwise; the primary set keeps only rows where same-wrapper content removal succeeded. An item-level conflict means that at least one available wrapper is correct and at least one available wrapper is wrong for the same underlying item. After this point, a \emph{successful wrapper run} means a wrapped prompt whose calibrated answer is correct, and a \emph{failed wrapper run} means a wrapped prompt whose calibrated answer is incorrect. For mechanistic tests, each eligible validation item contributes the strongest successful wrapper run and the worst failed wrapper run after calibrated scoring. This yields 285 Qwen, 264 Phi, and 300 Mistral validation-split conflict pairs. The construction is item-clustered, so multiple wrappers of one question are not treated as independent evidence.
+
+An outcome-blind model-assisted row audit followed by a separate adjudication pass found 107 prompts that changed task content and four ambiguous prompts among the 24,000 source rows. Removing those 111 rows leaves all 3,000 items represented and yields conflict rates of 61.5\% for Qwen, 54.8\% for Phi, and 66.1\% for Mistral. The behavioral conclusion is therefore not driven by the identified wrapper defects, although the source set is not perfectly pure-interface.
 
 \paragraph{Mechanistic diagnostics.}
 The main anchors are \texttt{options\_end}, the token position after the final answer option, and \texttt{all\_option\_ends}, the collection of positions after each answer option. Attention diagnostics measure mean attention mass from these anchor query positions to token roles. The content-attention measure is attention to question tokens plus attention to option tokens. This is descriptive, not causal. Activation-vector similarity measures cosine similarity between a wrapped internal activation vector at the anchor and the corresponding activation vector in the same item's unwrapped prompt.
@@ -121,7 +123,7 @@ The main anchors are \texttt{options\_end}, the token position after the final a
 Activation patching is the causal intervention used here: we copy activation vectors at the selected anchor from a donor run into an originally failed target run and then rescore the target \citep{meng2022locating,wang2022interpretability,zhang2024activationpatching}. Patched accuracy is the fraction of originally failed targets that become correct after patching. Mean margin improvement is the patched correct-answer margin minus the original failed-run margin. Mean recovery is the fraction of the successful-minus-failed margin gap closed by the patch, where 0 means no recovery and 1 means the patched margin reaches the successful-run margin. Donors include the same item's successful wrapper run, the same item's unwrapped prompt, cross-item successful wrapper runs, cross-item successful runs with the same correct answer letter, and cross-item successful runs with a different correct answer letter.
 
 \paragraph{Compute.}
-The final focused mechanistic run used one NVIDIA RTX A6000 GPU with 47.4 GiB reported memory on Ubuntu 22.04, CUDA 13.0, Python 3.10.12, and PyTorch 2.12.0. The run used the validation split with a cap of 300 conflict pairs and ran from 2026-05-31 01:39:05 UTC to 02:10:58 UTC. It reused full behavioral scores from a prior validated run on the same GPU class.
+The final Qwen focused mechanistic run used one NVIDIA RTX A6000 GPU with 47.4 GiB reported memory on Ubuntu 22.04, CUDA 13.0, Python 3.10.12, and PyTorch 2.12.0. It ran from 2026-05-31 01:39:05 UTC to 02:10:58 UTC and reused full behavioral scores from a prior validated run on the same GPU class. The Phi and Mistral replications ran sequentially on one 48GB-class RTX A6000 under Linux 6.8, CUDA 12.6, Python 3.10.12, and PyTorch 2.7.1. Their measured full GPU-phase times were 80.8 and 119.2 minutes, respectively, including behavioral scoring, convergence, controls, and attention diagnostics.
 
 \section{Wrapper-Induced Answer Instability}
 
@@ -196,19 +198,57 @@ The causal controls are more diagnostic. Same-item successful-to-failed patches 
 
 The strongest effects do not come from the donors predicted by a simple wrapper-independent state account. Same-answer-letter cross-item donors reach 20.4\% patched accuracy at \texttt{all\_option\_ends} layer 4, with average recovery 0.188 across layers and maximum recovery 0.244. Different-answer-letter cross-item donors also improve some cases, reaching 16.5\% patched accuracy at layer 6. This pattern suggests that patching transfers answer-letter-related structure. It may still reveal transferable computation, but it is not evidence for a wrapper-independent state that extracts the task from the formatting.
 
+\section{Replication in Phi-3.5-mini and Mistral-7B}
+
+The behavioral effect generalizes to the two larger replication checkpoints. Across the full 3,000-item population, Mistral has 50.3\% calibrated accuracy and 1,987 conflict items (66.2\%); Phi has 56.8\% calibrated accuracy and 1,654 conflict items (55.1\%). Thus higher average accuracy does not remove interface sensitivity: even for Phi, more than half of the source questions cross the correct/wrong boundary under wrapper changes.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{figures/cross_model_behavioral.pdf}
+  \caption{\textbf{Interface sensitivity replicates in both added models.} Each bar summarizes the same 24,000 wrapped prompts over 3,000 MMLU items. Phi is more accurate on average, but 55.1\% of its items still receive both correct and incorrect answers across the eight wrappers.}
+  \label{fig:cross-model-behavioral}
+\end{figure}
+
+\begin{table}[htbp]
+  \caption{Behavioral results for the two replication models. A conflict item has at least one calibrated-correct and at least one calibrated-wrong wrapper run.}
+  \label{tab:cross-model-behavioral}
+  \centering
+  \input{tables/table_cross_model_behavioral.tex}
+\end{table}
+
+The attention result also replicates. At \texttt{all\_option\_ends}, the layer-mean absolute successful-versus-failed content-attention gap is 0.0048 for Mistral and 0.0111 for Phi; the largest layer gap is 0.0290 and 0.0209, respectively. By comparison, the mean unwrapped-minus-successful content-attention gap is 0.412 for Mistral and 0.581 for Phi. Wrappers therefore substantially change attention allocation relative to direct prompts, while success and failure within wrapped prompts remain close.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{figures/cross_model_attention.pdf}
+  \caption{\textbf{Successful and failed wrapper runs have similar content attention in both replication models.} Curves show mean question-plus-option attention at \texttt{all\_option\_ends} across all validation conflict pairs: 300 for Mistral and 264 for Phi.}
+  \label{fig:cross-model-attention}
+\end{figure}
+
+Vanilla convergence is directionally consistent but small. The successful-minus-failed cosine-similarity delta to the same item's unwrapped prompt ranges from 0.0079 to 0.0219 across the eight measured Mistral layers and from 0.0048 to 0.0078 across the eight Phi layers at \texttt{all\_option\_ends}. This is evidence of a weak association, not a clean separating state.
+
+The causal controls sharpen that interpretation. At \texttt{all\_option\_ends}, mean recovery from same-item successful donors is 0.049 for Mistral and 0.042 for Phi. Same-label cross-item donors reach 0.069 and 0.098 mean recovery, with maximum patched accuracies of 11.7\% and 17.8\%; the corresponding same-item maxima are 9.3\% and 8.7\%. The two models differ in effect size, but both reproduce the key control result: donor usefulness is not specific to the same item's successful wrapper representation.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{figures/cross_model_controls.pdf}
+  \caption{\textbf{Same-label cross-item donors have the highest average recovery in both replication models.} Bars average recovery over the eight normalized-depth layers at \texttt{all\_option\_ends}. This pattern is inconsistent with treating patching gains as specific evidence for a same-item, wrapper-independent task vector.}
+  \label{fig:cross-model-controls}
+\end{figure}
+
 \section{Discussion and Limitations}
 
-The study supports a behavioral claim and does not support the simplest mechanistic account. The behavioral claim is that verified pure-interface wrappers can change whether an instruction-tuned model answers the same MMLU question correctly. This is not a parsing anecdote: the wrappers preserve the question, choices, and answer labels; scoring uses answer-label likelihood rather than generated prose; and primary calibrated rows subtract wrapper letter bias measured by removing the question and option text.
+The study supports a behavioral claim and does not support the simplest mechanistic account. The behavioral claim is that wrappers intended to preserve the task can change whether an instruction-tuned model answers the same MMLU question correctly. This is not driven by the small set of audited defects: the sensitivity analysis removes them, scoring uses answer-label likelihood rather than generated prose, and calibrated rows subtract wrapper letter bias measured by removing the question and option text.
 
 The mechanistic claim tested here is narrower. These experiments do not show a simple internal activation vector that can be copied from successful wrapper runs into failed wrapper runs. Attention diagnostics do not separate successful from failed wrapped prompts. Similarity to the unwrapped prompt is directionally consistent but very small. Patching improves some failed runs, but the strongest effects are entangled with answer-letter structure and cross-item donors. The safest interpretation is that wrapper robustness is mixed with answer formation rather than isolated in a reusable formatting-removal vector.
 
-The scope is limited in several ways. The study uses one instruction-tuned model family, one model size, one multiple-choice dataset, and eight wrappers. The wrappers are verified as pure-interface transformations by construction, but any wrapper can still interact with pretraining priors in ways that are not neutral for the model. The mechanistic probes use coarse token roles and two semantic anchors; a finer circuit analysis could find structure that these tests miss. The patching controls are also not proof that answer-letter information is the only thing transferred. They show that the observed patching effects are not clear evidence for the simpler hypothesis.
+The scope is limited in several ways. The study uses three instruction-tuned checkpoints from three model families, but still only one multiple-choice dataset and eight wrappers. Model size and family are not varied independently. The wrappers were intended as pure-interface transformations, but the audit found a small number of content-changing cases, and even content-preserving wrappers can interact with pretraining priors in ways that are not neutral for the model. The mechanistic probes use coarse token roles and two semantic anchors; a finer circuit analysis could find structure that these tests miss. The patching controls are also not proof that answer-letter information is the only thing transferred. They show that the observed patching effects are not clear evidence for the simpler hypothesis.
 
 The practical implication is two-sided. Interface sensitivity is a reliability problem for systems that route model inputs through tools or structured records, and wrapper tests could expose these failures before deployment. The same evidence could also help construct brittle or adversarial interfaces. The main mitigation is to evaluate wrapper robustness directly and to avoid treating small patching improvements as circuit-level explanations.
 
 \section{Conclusion}
 
-Changing only the interface wrapper around an MMLU question can change whether \texttt{Qwen/Qwen2.5-1.5B-Instruct} answers correctly. The study finds this instability under verified pure-interface wrappers and calibrated answer-letter scoring. It does not find evidence for the simplest mechanistic account: a reusable internal activation vector that strips away formatting and identifies the real task. The useful result is the negative one. Wrapper failures are real, but in this setting they appear entangled with answer formation, and causal patching needs strong controls before it can support mechanistic claims.
+Changing the intended interface wrapper around an MMLU question can change whether Qwen2.5-1.5B, Phi-3.5-mini, and Mistral-7B-v0.3 answer correctly. The study finds this instability under calibrated answer-letter scoring across 72,000 prompts, and the audit sensitivity analysis shows that it remains after identified defects are removed. It does not find evidence for the simplest mechanistic account: a reusable internal activation vector that strips away formatting and identifies the real task. The useful result is the negative one. Wrapper failures generalize across these model families, but in this setting they appear entangled with answer formation, and causal patching needs strong controls before it can support mechanistic claims.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
@@ -314,7 +354,7 @@ Changing only the interface wrapper around an MMLU question can change whether \
 \item {\bf Experiments compute resources}
   \item[] Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments?
   \item[] Answer: \answerYes{}.
-  \item[] Justification: The Experimental Setup section reports the model, validation cap, GPU class, reported GPU memory, operating system, CUDA/Python/PyTorch environment, and wall-clock time for the final focused mechanistic run. The run used \texttt{Qwen/Qwen2.5-1.5B-Instruct} with a validation cap of 300 conflict pairs on one NVIDIA RTX A6000 GPU with 48GB class memory (47.4 GiB reported), Ubuntu 22.04/Linux 6.8, CUDA 13.0, Python 3.10.12, and PyTorch 2.12.0+cu130. It started at 2026-05-31 01:39:05 UTC and finished at 2026-05-31 02:10:58 UTC, for about 31 minutes 53 seconds of wall time.
+  \item[] Justification: The Experimental Setup section reports all three checkpoints, validation-pair counts, GPU class, reported GPU memory, operating system, CUDA/Python/PyTorch environments, and wall-clock or measured GPU-phase time. Qwen used 285 validation pairs; Phi used 264; Mistral used 300. All focused mechanistic work ran on a single NVIDIA RTX A6000-class 48GB GPU. The Qwen run took about 31 minutes 53 seconds. The full Phi and Mistral GPU phases took 80.8 and 119.2 minutes, respectively.
 
 \item {\bf Research Ethics}
   \item[] Question: Does the research conducted in the paper conform with the \href{https://neurips.cc/Conferences/2026/MainTrackHandbook}{NeurIPS Code of Ethics}, except where CAISc's AI authorship policies apply?

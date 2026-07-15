@@ -110,3 +110,19 @@ def test_cross_model_analysis_writes_tables_figures_and_paper_assets(tmp_path):
     assert behavioral["full_conflict_rate"].tolist() == pytest.approx([2 / 3000, 2 / 3000])
     assert set(behavioral["eligible_conflict_items"]) == {1}
     assert set(behavioral["eligible_conflict_denominator"]) == {3000}
+
+
+def test_wrapper_audit_sensitivity_excludes_only_declared_rows(tmp_path):
+    root = tmp_path / "run"
+    _make_run(root, "model-a", 0.0)
+    behavioral = pd.read_parquet(root / "raw" / "behavioral_scores.parquet")
+    audit = behavioral[["item_id", "wrapper_name"]].copy()
+    audit["final_label"] = "formatting_only"
+    audit.loc[(audit["item_id"] == "i0") & (audit["wrapper_name"] == "wrapper-0"), "final_label"] = "content_changed"
+
+    result = MODULE.build_audit_sensitivity([MODULE.load_model_run(f"A={root}")], audit)
+
+    meaning = result[result["population"] == "meaning_preserving"].iloc[0]
+    assert meaning["rows"] == 23999
+    assert meaning["conflict_items"] == 1
+    assert meaning["denominator"] == 3000
