@@ -198,19 +198,50 @@ def test_untransformable_wrapper_excludes_the_whole_item_with_a_reason():
         build_causal_design(source)
 
 
-def test_balanced_non_option_label_construct_is_excluded_instead_of_edited():
+@pytest.mark.parametrize(
+    ("wrapper", "distracting"),
+    [
+        ("csv_inline", "A,extra\nB,extra\nC,extra\nD,extra\n"),
+        ("graphql_query", '{ A: "extra", B: "extra", C: "extra", D: "extra" }\n'),
+        ("ini_file", "A=extra\nB=extra\nC=extra\nD=extra\n"),
+        ("key_equals", "A=extra\nB=extra\nC=extra\nD=extra\n"),
+        ("protobuf_msg", "OPTION_A=extra\nOPTION_B=extra\nOPTION_C=extra\nOPTION_D=extra\n"),
+        ("shell_heredoc", "A) extra\nB) extra\nC) extra\nD) extra\n"),
+        ("toml_config", "A=\"extra\"\nB=\"extra\"\nC=\"extra\"\nD=\"extra\"\n"),
+    ],
+)
+def test_balanced_non_option_label_construct_is_excluded_instead_of_edited(wrapper, distracting):
     source = _source_frame()
-    source.loc[source["wrapper_name"] == "csv_inline", "wrapped_prompt"] = (
-        "Statement,Truth\nA,True\nB,True\nC,False\nD,False\n\n"
-        "Options: A) 3; B) 4; C) 5; D) 6" + SUFFIX
+    source.loc[source["wrapper_name"] == wrapper, "wrapped_prompt"] = (
+        distracting + _source_prompts()[wrapper]
     )
 
     design, exclusions = build_causal_design_with_exclusions(source)
 
     assert design.empty
-    assert exclusions[exclusions["wrapper_name"] == "csv_inline"]["reason"].tolist() == [
+    assert exclusions[exclusions["wrapper_name"] == wrapper]["reason"].tolist() == [
         "option_labels_not_unambiguous"
     ]
+
+
+def test_html_changes_only_labels_inside_the_answer_option_containers():
+    source = _source_frame()
+    original = _source_prompts()["html_form"]
+    distracting = "<legend>A) alpha B) beta C) gamma D) delta</legend>\n"
+    source.loc[source["wrapper_name"] == "html_form", "wrapped_prompt"] = (
+        original.replace("<form>\n", "<form>\n" + distracting)
+    )
+
+    design = build_causal_design(source)
+    prompt = design[
+        (design["wrapper_name"] == "html_form")
+        & (design["arm"] == "letter_intervention")
+        & (design["variant"] == 4)
+    ]["prompt"].item()
+
+    assert distracting in prompt
+    assert '<option value="B">B) 3</option>' in prompt
+    assert '<option value="C">C) 4</option>' in prompt
 
 
 def test_source_prompt_hashes_bind_original_wrappers_without_calling_them_identity():

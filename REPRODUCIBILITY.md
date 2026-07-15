@@ -109,7 +109,7 @@ The operator contract, spend gates, and exact teardown proof are in
 
 ## Prepared causal follow-up
 
-The next experiment uses a deterministic 124,704-row design over 1,732 safely
+The next experiment uses a deterministic 124,920-row design over 1,735 safely
 transformable train and validation items. For each of eight exact stored
 wrapper prompts and one matched plain MCQ, it has one controlled baseline,
 three position-only rotations, three letter-only rotations, and one generated

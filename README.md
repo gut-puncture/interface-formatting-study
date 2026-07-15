@@ -89,8 +89,8 @@ selected vanilla, control, and attention work keys.
 The controlled follow-up preserves the exact stored wrapper prompts plus a
 matched plain MCQ. It separately rotates physical answer position and displayed
 answer letter, and separately requests generated exact answer text. Of 2,401
-train and validation source items, 1,732 can be transformed without ambiguity;
-the other 669 are recorded as whole-item exclusions. The 599 internal-test items
+train and validation source items, 1,735 can be transformed without ambiguity;
+the other 666 are recorded as whole-item exclusions. The 599 internal-test items
 remain held out.
 
 ```bash
@@ -98,7 +98,7 @@ interface-formatting-causal prepare
 scripts/run_causal_followup_gpu.sh mistral functional
 ```
 
-The checked design has 124,704 rows per model. Runs are model-, environment-,
+The checked design has 124,920 rows per model. Runs are model-, environment-,
 and design-identity bound, atomically sharded, signal-safe, resumable, and locally
 checksum-verified before teardown. The paid-run gates and commands are in
 `CAUSAL_FOLLOWUP_RUN_CARD.md`.

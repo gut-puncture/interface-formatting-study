@@ -97,7 +97,7 @@ _LABEL_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _label_spans(prompt: str, wrapper_name: str) -> tuple[_Span, ...]:
+def _raw_label_spans(prompt: str, wrapper_name: str) -> tuple[_Span, ...]:
     patterns = _LABEL_PATTERNS.get(wrapper_name)
     if patterns is None:
         raise ValueError(f"unknown_source_wrapper:{wrapper_name}")
@@ -117,10 +117,52 @@ def _label_spans(prompt: str, wrapper_name: str) -> tuple[_Span, ...]:
             if any(list_start <= start < list_end for list_start, list_end in instruction_lists):
                 continue
             by_position[(start, end)] = _Span(start, end, match.group("label").upper())
-    spans = tuple(sorted(by_position.values(), key=lambda span: span.start))
+    return tuple(sorted(by_position.values(), key=lambda span: span.start))
+
+
+def _html_label_spans(prompt: str, choices: Sequence[str]) -> tuple[_Span, ...]:
+    option_region = prompt.split(f"\n\n{_LETTER_INSTRUCTION}", 1)[0]
+    candidates = _raw_label_spans(prompt, "html_form")
+    containers = list(
+        re.finditer(
+            r"(?is)<(?:option|label|div)\b[^>]*>.*?</(?:option|label|div)>",
+            option_region,
+        )
+    )
+    selected: list[_Span] = []
+    for label, choice in zip(LETTERS, map(str, choices), strict=True):
+        matches: dict[tuple[int, int], tuple[tuple[int, int], list[_Span]]] = {}
+        for occurrence in re.finditer(re.escape(choice), option_region):
+            for container in containers:
+                if container.start() <= occurrence.start() and occurrence.end() <= container.end():
+                    labels = [
+                        span
+                        for span in candidates
+                        if container.start() <= span.start and span.end <= container.end()
+                    ]
+                    if labels and {span.value for span in labels} == {label}:
+                        score = (len(labels), -(container.end() - container.start()))
+                        matches[container.span()] = (score, labels)
+        if not matches:
+            raise ValueError("option_labels_not_unambiguous")
+        best_score = max(score for score, _ in matches.values())
+        best = [labels for score, labels in matches.values() if score == best_score]
+        if len(best) != 1:
+            raise ValueError("option_labels_not_unambiguous")
+        selected.extend(best[0])
+    unique = {(span.start, span.end): span for span in selected}
+    return tuple(sorted(unique.values(), key=lambda span: span.start))
+
+
+def _label_spans(
+    prompt: str, wrapper_name: str, choices: Sequence[str]
+) -> tuple[_Span, ...]:
+    if wrapper_name == "html_form":
+        return _html_label_spans(prompt, choices)
+    spans = _raw_label_spans(prompt, wrapper_name)
     counts = {label: sum(span.value == label for span in spans) for label in LETTERS}
     per_label = next(iter(counts.values())) if len(set(counts.values())) == 1 else 0
-    if not spans or per_label < 1 or (wrapper_name != "html_form" and per_label != 1):
+    if not spans or per_label != 1:
         raise ValueError("option_labels_not_unambiguous")
     return spans
 
@@ -179,7 +221,7 @@ def _source_counterfactual(
         return prompt
     if assignment.manipulation not in {"position_only", "label_only"}:
         raise ValueError(f"Unknown manipulation {assignment.manipulation!r}")
-    label_spans = _label_spans(prompt, wrapper_name)
+    label_spans = _label_spans(prompt, wrapper_name, choices)
     replacements = [
         (span, assignment.labels_by_position[LETTERS.index(span.value)]) for span in label_spans
     ]
