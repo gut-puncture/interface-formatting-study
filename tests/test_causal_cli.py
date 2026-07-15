@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from interface_formatting_study import causal_cli
-from interface_formatting_study.causal_design import build_causal_design
+from interface_formatting_study.causal_design import ACTIVE_WRAPPERS, build_causal_design
 from interface_formatting_study.run_identity import sha256_file
 
 
@@ -34,7 +34,10 @@ def _write_design(tmp_path):
                     "question": "What is 2+2?",
                     "choices": ["3", "4", "5", "6"],
                     "correct_index": 1,
+                    "wrapper_name": wrapper,
+                    "wrapped_prompt": f"original-{wrapper}",
                 }
+                for wrapper in ACTIVE_WRAPPERS
             ]
         )
     )
@@ -58,6 +61,10 @@ def test_causal_cli_runs_identity_bound_canary(
         "load_model_and_tokenizer",
         lambda *args, **kwargs: (causal_label_model, boundary_tokenizer, torch.device("cpu")),
     )
+    monkeypatch.setattr(
+        "interface_formatting_study.causal_runner._generate_answers_many",
+        lambda _model, _tokenizer, records, **_kwargs: [str(row["correct_text"]) for row in records],
+    )
     args = argparse.Namespace(
         design=str(design_path),
         profile="qwen",
@@ -70,6 +77,7 @@ def test_causal_cli_runs_identity_bound_canary(
         canary=True,
         canary_name="functional",
         canary_items=1,
+        allow_cpu=True,
     )
 
     causal_cli.cmd_run(args)

@@ -5,7 +5,7 @@ import json
 import pandas as pd
 import pytest
 
-from interface_formatting_study.causal_design import build_causal_design
+from interface_formatting_study.causal_design import ACTIVE_WRAPPERS, build_causal_design
 from interface_formatting_study.causal_runner import run_causal_design, validate_causal_design
 from interface_formatting_study.model_profiles import get_model_profile
 from interface_formatting_study.run_identity import build_semantic_identity
@@ -21,7 +21,10 @@ def _design() -> pd.DataFrame:
                 "question": "What is 2+2?",
                 "choices": ["3", "4", "5", "6"],
                 "correct_index": 1,
+                "wrapper_name": wrapper,
+                "wrapped_prompt": f"original-{wrapper}",
             }
+            for wrapper in ACTIVE_WRAPPERS
         ]
     )
     return build_causal_design(source)
@@ -44,7 +47,12 @@ def test_causal_runner_interrupt_resume_matches_uninterrupted(
     tmp_path,
     boundary_tokenizer,
     causal_label_model,
+    monkeypatch,
 ):
+    monkeypatch.setattr(
+        "interface_formatting_study.causal_runner._generate_answers_many",
+        lambda _model, _tokenizer, records, **_kwargs: [str(row["correct_text"]) for row in records],
+    )
     design = _design()
     identity = _identity(tmp_path, design)
 
@@ -92,7 +100,7 @@ def test_causal_runner_interrupt_resume_matches_uninterrupted(
 
     pd.testing.assert_frame_equal(full, resumed)
     assert len(resumed) == len(design)
-    assert set(resumed["arm"]) == {"letter_permutation", "answer_text"}
+    assert set(resumed["arm"]) == {"letter_intervention", "answer_text"}
     progress = json.loads((tmp_path / "resumed" / "progress.json").read_text())
     assert progress["status"] == "complete"
     assert progress["completed"] == len(design)
@@ -105,12 +113,12 @@ def test_causal_design_validation_rejects_duplicate_or_inconsistent_work():
         validate_causal_design(duplicate)
 
     broken = design.copy()
-    broken.loc[broken["arm"] == "letter_permutation", "correct_label"] = "Z"
+    broken.loc[broken["arm"] == "letter_intervention", "correct_label"] = "Z"
     with pytest.raises(ValueError, match="correct_label"):
         validate_causal_design(broken)
 
     unbalanced = design.copy()
-    first_letter = unbalanced[unbalanced["arm"] == "letter_permutation"].index[0]
+    first_letter = unbalanced[unbalanced["arm"] == "letter_intervention"].index[0]
     unbalanced.at[first_letter, "content_ids_by_position"] = [0, 1, 3, 2]
     correct_content = int(unbalanced.at[first_letter, "correct_content_id"])
     correct_position = unbalanced.at[first_letter, "content_ids_by_position"].index(correct_content)
