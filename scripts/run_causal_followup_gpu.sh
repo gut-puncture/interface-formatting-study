@@ -18,7 +18,7 @@ fi
 
 PROFILE="$1"
 MODE="$2"
-DESIGN="${3:-artifacts/causal_followup/v2_source_preserving/design_train_validation.parquet}"
+DESIGN="${3:-artifacts/causal_followup/v3_source_preserving/design_train_validation.parquet}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 MAX_BATCH_TOKENS="${MAX_BATCH_TOKENS:-40000}"
 CHECKPOINT_SIZE="${CHECKPOINT_SIZE:-256}"

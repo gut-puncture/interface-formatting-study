@@ -124,8 +124,6 @@ def summarize_run(run: CausalRun, frame: pd.DataFrame, *, n_boot: int, seed: int
     keys = ["item_id", "wrapper_name"]
     letter = frame[frame["arm"] == "letter_intervention"].copy()
     text = frame[frame["arm"] == "answer_text"].copy()
-    if len(letter) * 1 != len(text) * 7:
-        raise ValueError(f"{run.label} does not have seven letter rows per text row")
 
     baseline_columns = [
         "raw_correct",
@@ -170,7 +168,7 @@ def summarize_run(run: CausalRun, frame: pd.DataFrame, *, n_boot: int, seed: int
                 },
             )
         )
-        blocks = blocks.merge(grouped, on=keys, validate="one_to_one")
+        blocks = blocks.merge(grouped, on=keys, how="left", validate="one_to_one")
 
     text = text.copy()
     text["text_generated_correct"] = pd.to_numeric(text["generated_correct"], errors="coerce")

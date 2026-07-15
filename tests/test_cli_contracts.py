@@ -201,5 +201,5 @@ def test_causal_fetch_and_control_scripts_cover_canaries_and_persist_mode():
 def test_causal_sync_copies_source_preserving_design_sidecars():
     sync = open("scripts/sync_interface_formatting_study_to_gpu.sh", encoding="utf-8").read()
 
-    assert 'ACTIVE_DATASET_PATH%.*}.exclusions.parquet' in sync
+    assert 'ACTIVE_DATASET_PATH%.*}.applicability.parquet' in sync
     assert 'ACTIVE_DATASET_PATH}.manifest.json' in sync

@@ -86,12 +86,12 @@ if [[ -f "${ACTIVE_DATASET_PATH}.manifest.json" ]]; then
     "${ROOT_DIR}/./${ACTIVE_DATASET}.manifest.json" \
     "${REMOTE}:${REMOTE_DIR}/"
 fi
-EXCLUSIONS_PATH="${ACTIVE_DATASET_PATH%.*}.exclusions.parquet"
-if [[ -f "$EXCLUSIONS_PATH" ]]; then
-  EXCLUSIONS_RELATIVE="${ACTIVE_DATASET%.*}.exclusions.parquet"
+APPLICABILITY_PATH="${ACTIVE_DATASET_PATH%.*}.applicability.parquet"
+if [[ -f "$APPLICABILITY_PATH" ]]; then
+  APPLICABILITY_RELATIVE="${ACTIVE_DATASET%.*}.applicability.parquet"
   rsync -az --relative \
     -e "${RSYNC_RSH[*]}" \
-    "${ROOT_DIR}/./${EXCLUSIONS_RELATIVE}" \
+    "${ROOT_DIR}/./${APPLICABILITY_RELATIVE}" \
     "${REMOTE}:${REMOTE_DIR}/"
 fi
 

@@ -83,3 +83,36 @@ def test_causal_analysis_consumes_verified_run_and_writes_effects(tmp_path):
         "wrapper_amplification_generated_text_readout_raw_descriptive",
         "wrapper_amplification_generated_text_readout_cal_descriptive",
     }
+
+
+def test_causal_analysis_retains_blocks_when_one_intervention_arm_is_not_applicable(tmp_path):
+    run = tmp_path / "run"
+    _run_fixture(run)
+    raw = run / "raw" / "causal_behavior.parquet"
+    frame = pd.read_parquet(raw)
+    missing_wrapper = "graphql_query"
+    frame = frame[
+        ~(
+            (frame["wrapper_name"] == missing_wrapper)
+            & (frame["manipulation"] == "label_only")
+        )
+    ].copy()
+    frame.to_parquet(raw, index=False)
+    raw.with_name(raw.name + ".manifest.json").write_text(
+        json.dumps({"semantic_run_id": "semantic-one", "sha256": sha256_file(raw), "row_count": len(frame)})
+    )
+    manifest_path = run / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["design"]["run_rows"] = len(frame)
+    manifest_path.write_text(json.dumps(manifest))
+
+    outputs = MODULE.analyze([f"Tiny={run}"], tmp_path / "analysis", n_boot=20)
+
+    blocks = pd.read_parquet(outputs["blocks"])
+    graphql = blocks[blocks["wrapper_name"] == missing_wrapper].iloc[0]
+    assert pd.isna(graphql["label_only_cal_correct"])
+    assert not pd.isna(graphql["position_only_cal_correct"])
+    effects = pd.read_csv(outputs["paired_effects"])
+    label = effects[effects["comparison"] == "label_only_minus_baseline_cal"].iloc[0]
+    position = effects[effects["comparison"] == "position_only_minus_baseline_cal"].iloc[0]
+    assert label["n_rows"] == position["n_rows"] - 1

@@ -12,7 +12,7 @@ import torch
 
 from causal_fixtures import source_prompt_frame
 from interface_formatting_study import causal_cli
-from interface_formatting_study.causal_design import build_causal_design
+from interface_formatting_study.causal_design import build_causal_design_v3
 from interface_formatting_study.run_identity import sha256_file
 
 
@@ -25,24 +25,22 @@ VERIFY_SPEC.loader.exec_module(VERIFY)
 
 
 def _write_design(tmp_path):
-    design = build_causal_design(source_prompt_frame())
+    design, applicability = build_causal_design_v3(source_prompt_frame())
     path = tmp_path / "design.parquet"
     design.to_parquet(path, index=False)
-    exclusions = path.with_name(path.stem + ".exclusions.parquet")
-    pd.DataFrame(columns=["item_id", "wrapper_name", "reason"]).to_parquet(
-        exclusions, index=False
-    )
+    applicability_path = path.with_name(path.stem + ".applicability.parquet")
+    applicability.to_parquet(applicability_path, index=False)
     path.with_name(path.name + ".manifest.json").write_text(
         json.dumps(
             {
-                "design_schema_version": 4,
+                "design_schema_version": 5,
                 "scope": "source_prompt_counterfactual",
                 "sha256": sha256_file(path),
                 "rows": len(design),
-                "exclusions": {
-                    "path_name": exclusions.name,
-                    "sha256": sha256_file(exclusions),
-                    "rows": 0,
+                "applicability": {
+                    "path_name": applicability_path.name,
+                    "sha256": sha256_file(applicability_path),
+                    "rows": len(applicability),
                 },
             }
         )
@@ -50,13 +48,13 @@ def _write_design(tmp_path):
     return path, design
 
 
-def test_load_design_rejects_old_canonical_template_manifest(tmp_path):
+def test_load_design_rejects_old_source_preserving_manifest(tmp_path):
     path, design = _write_design(tmp_path)
     path.with_name(path.name + ".manifest.json").write_text(
         json.dumps(
             {
-                "design_schema_version": 3,
-                "scope": "controlled canonical templates; original prompts remain in the observational study",
+                "design_schema_version": 4,
+                "scope": "source_prompt_counterfactual",
                 "sha256": sha256_file(path),
                 "rows": len(design),
             }
@@ -67,7 +65,7 @@ def test_load_design_rejects_old_canonical_template_manifest(tmp_path):
         causal_cli._load_design(path)
 
 
-def test_load_design_rejects_canonical_rows_under_a_v4_manifest(tmp_path):
+def test_load_design_rejects_canonical_rows_under_a_v5_manifest(tmp_path):
     path, design = _write_design(tmp_path)
     design["template_scope"] = "controlled_canonical_template"
     design.to_parquet(path, index=False)
@@ -80,15 +78,15 @@ def test_load_design_rejects_canonical_rows_under_a_v4_manifest(tmp_path):
         causal_cli._load_design(path)
 
 
-def test_load_design_requires_the_checksum_bound_exclusion_ledger(tmp_path):
+def test_load_design_requires_the_checksum_bound_applicability_ledger(tmp_path):
     path, _ = _write_design(tmp_path)
-    path.with_name(path.stem + ".exclusions.parquet").unlink()
+    path.with_name(path.stem + ".applicability.parquet").unlink()
 
-    with pytest.raises(RuntimeError, match="exclusion"):
+    with pytest.raises(RuntimeError, match="applicability"):
         causal_cli._load_design(path)
 
 
-def test_prepare_records_source_preservation_and_whole_item_exclusions(tmp_path, monkeypatch):
+def test_prepare_keeps_all_items_and_records_arm_applicability(tmp_path, monkeypatch):
     source = source_prompt_frame()
     excluded = source.copy()
     excluded["item_id"] = "item-2"
@@ -102,28 +100,23 @@ def test_prepare_records_source_preservation_and_whole_item_exclusions(tmp_path,
     output = tmp_path / "design.parquet"
 
     causal_cli.cmd_prepare(
-        argparse.Namespace(config="unused.yaml", splits="train,validation", output=str(output))
+        argparse.Namespace(
+            config="unused.yaml", splits="train,validation", output=str(output), option_audit=None
+        )
     )
 
     manifest = json.loads(output.with_name(output.name + ".manifest.json").read_text())
-    assert manifest["design_schema_version"] == 4
+    assert manifest["design_schema_version"] == 5
     assert manifest["scope"] == "source_prompt_counterfactual"
     assert manifest["source_items"] == 2
-    assert manifest["eligible_items"] == 1
-    assert manifest["excluded_items"] == 1
-    assert manifest["eligibility"]["by_split"]["train"]["source_items"] == 2
-    assert manifest["eligibility"]["by_correct_label"]["B"]["eligible_items"] == 1
-    exclusions = pd.read_parquet(output.with_name(output.stem + ".exclusions.parquet"))
-    assert exclusions.to_dict("records") == [
-        {
-            "item_id": "item-2",
-            "split": "train",
-            "subject": "math",
-            "correct_label": "B",
-            "wrapper_name": "protobuf_msg",
-            "reason": "option_labels_not_unambiguous",
-        }
-    ]
+    assert manifest["retained_items"] == 2
+    applicability = pd.read_parquet(output.with_name(output.stem + ".applicability.parquet"))
+    unresolved = applicability[
+        (applicability["item_id"] == "item-2")
+        & (applicability["wrapper_name"] == "protobuf_msg")
+    ].iloc[0]
+    assert not bool(unresolved["position_applicable"])
+    assert not bool(unresolved["label_applicable"])
 
 
 def test_causal_cli_runs_identity_bound_canary(
@@ -165,7 +158,7 @@ def test_causal_cli_runs_identity_bound_canary(
     assert manifest["status"] == "complete"
     assert manifest["model"]["id"] == "Qwen/Qwen2.5-1.5B-Instruct"
     assert manifest["design"]["completed_rows"] == len(design)
-    assert manifest["design"]["exclusions_sha256"]
+    assert manifest["design"]["applicability_sha256"]
     assert manifest["runtime"]["single_token_label_fast_path"]
     assert "torch" in manifest["runtime"]["dependencies"]
     root = manifests[0].parent

@@ -14,7 +14,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .causal_design import CONTROLLED_FORMATS, build_causal_design_with_exclusions
+from .causal_design import CONTROLLED_FORMATS, build_causal_design_v3
+from .causal_option_audit import load_causal_option_annotations
 from .causal_runner import run_causal_design, validate_causal_design
 from .experiment import prepare_dataset
 from .model_loader import load_model_and_tokenizer
@@ -27,9 +28,9 @@ from .utils import read_table, read_yaml, write_table_atomic
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DESIGN = Path(
-    "artifacts/causal_followup/v2_source_preserving/design_train_validation.parquet"
+    "artifacts/causal_followup/v3_source_preserving/design_train_validation.parquet"
 )
-DESIGN_SCHEMA_VERSION = 4
+DESIGN_SCHEMA_VERSION = 5
 DESIGN_SCOPE = "source_prompt_counterfactual"
 
 
@@ -82,40 +83,47 @@ def cmd_prepare(args) -> None:
     splits = tuple(part.strip() for part in args.splits.split(",") if part.strip())
     if not splits or set(splits) - {"train", "validation", "test"}:
         raise ValueError("--splits must contain train, validation, and/or test")
-    design, exclusions = build_causal_design_with_exclusions(frame, splits=splits)
+    option_maps = (
+        load_causal_option_annotations(args.option_audit)
+        if getattr(args, "option_audit", None)
+        else None
+    )
+    design, applicability = build_causal_design_v3(
+        frame, splits=splits, option_maps=option_maps
+    )
     source_items = int(frame[frame["split"].astype(str).isin(splits)]["item_id"].nunique())
     validate_causal_design(design)
     items = int(design["item_id"].nunique())
-    if len(design) != items * len(CONTROLLED_FORMATS) * 8:
-        raise RuntimeError("Causal design row count violates the 9 formats x 8 rows contract")
+    if items != source_items or len(applicability) != items * len(CONTROLLED_FORMATS):
+        raise RuntimeError("Causal v3 design did not retain every source item-format block")
     output = Path(args.output)
     write_table_atomic(design, output)
-    exclusions_path = output.with_name(output.stem + ".exclusions.parquet")
-    write_table_atomic(exclusions, exclusions_path)
-    eligibility = _eligibility_summary(frame, design, splits)
+    applicability_path = output.with_name(output.stem + ".applicability.parquet")
+    write_table_atomic(applicability, applicability_path)
     _atomic_json(
         {
             "design_schema_version": DESIGN_SCHEMA_VERSION,
             "sha256": sha256_file(output),
             "rows": len(design),
             "source_items": source_items,
-            "eligible_items": items,
-            "excluded_items": source_items - items,
-            "exclusions": {
-                "path_name": exclusions_path.name,
-                "sha256": sha256_file(exclusions_path),
-                "rows": len(exclusions),
+            "retained_items": items,
+            "applicability": {
+                "path_name": applicability_path.name,
+                "sha256": sha256_file(applicability_path),
+                "rows": len(applicability),
+                "position_applicable": int(applicability["position_applicable"].sum()),
+                "label_applicable": int(applicability["label_applicable"].sum()),
             },
-            "eligibility": eligibility,
             "splits": list(splits),
             "formats": list(CONTROLLED_FORMATS),
-            "rows_per_item_format": 8,
+            "rows_per_item_format": "2 + 3*position_applicable + 3*label_applicable",
             "letter_rows": {
                 "controlled_baseline": 1,
                 "position_only": 3,
                 "label_only": 3,
             },
             "answer_text_rows": 1,
+            "option_audit": str(args.option_audit) if getattr(args, "option_audit", None) else None,
             "scope": DESIGN_SCOPE,
         },
         output.with_name(output.name + ".manifest.json"),
@@ -132,25 +140,32 @@ def _load_design(path: Path) -> pd.DataFrame:
         manifest.get("design_schema_version") != DESIGN_SCHEMA_VERSION
         or manifest.get("scope") != DESIGN_SCOPE
     ):
-        raise RuntimeError("Causal run requires a schema-v4 source-preserving design")
+        raise RuntimeError("Causal run requires a schema-v5 source-preserving design")
     if sha256_file(path) != manifest.get("sha256"):
         raise RuntimeError("Causal design checksum mismatch")
-    exclusions_meta = manifest.get("exclusions")
-    expected_exclusions_name = path.stem + ".exclusions.parquet"
-    if not isinstance(exclusions_meta, dict) or exclusions_meta.get("path_name") != expected_exclusions_name:
-        raise RuntimeError("Causal design exclusion ledger metadata is missing or invalid")
-    exclusions_path = path.with_name(expected_exclusions_name)
-    if not exclusions_path.exists():
-        raise RuntimeError("Causal design exclusion ledger is missing")
-    if sha256_file(exclusions_path) != exclusions_meta.get("sha256"):
-        raise RuntimeError("Causal design exclusion ledger checksum mismatch")
-    exclusions = read_table(exclusions_path)
-    if len(exclusions) != int(exclusions_meta.get("rows", -1)):
-        raise RuntimeError("Causal design exclusion ledger row count mismatch")
+    applicability_meta = manifest.get("applicability")
+    expected_applicability_name = path.stem + ".applicability.parquet"
+    if not isinstance(applicability_meta, dict) or applicability_meta.get("path_name") != expected_applicability_name:
+        raise RuntimeError("Causal design applicability ledger metadata is missing or invalid")
+    applicability_path = path.with_name(expected_applicability_name)
+    if not applicability_path.exists():
+        raise RuntimeError("Causal design applicability ledger is missing")
+    if sha256_file(applicability_path) != applicability_meta.get("sha256"):
+        raise RuntimeError("Causal design applicability ledger checksum mismatch")
+    applicability = read_table(applicability_path)
+    if len(applicability) != int(applicability_meta.get("rows", -1)):
+        raise RuntimeError("Causal design applicability ledger row count mismatch")
     design = read_table(path)
     if len(design) != int(manifest.get("rows", -1)):
         raise RuntimeError("Causal design row count does not match its manifest")
     validate_causal_design(design)
+    observed = design.groupby(["item_id", "wrapper_name", "manipulation"]).size()
+    for row in applicability.to_dict("records"):
+        key = (row["item_id"], row["wrapper_name"])
+        if observed.get((*key, "position_only"), 0) != (3 if row["position_applicable"] else 0):
+            raise RuntimeError(f"Position applicability disagrees with design rows: {key}")
+        if observed.get((*key, "label_only"), 0) != (3 if row["label_applicable"] else 0):
+            raise RuntimeError(f"Label applicability disagrees with design rows: {key}")
     return design
 
 
@@ -224,7 +239,7 @@ def cmd_run(args) -> None:
     design_manifest = json.loads(
         design_path.with_name(design_path.name + ".manifest.json").read_text(encoding="utf-8")
     )
-    exclusions_meta = design_manifest["exclusions"]
+    applicability_meta = design_manifest["applicability"]
     profile = get_model_profile(args.profile)
     source = design
     if args.canary:
@@ -266,7 +281,7 @@ def cmd_run(args) -> None:
             "max_batch_tokens": args.max_batch_tokens,
         },
         "selected_work_sha256": _selected_work_sha(source),
-        "design_exclusions_sha256": exclusions_meta["sha256"],
+        "design_applicability_sha256": applicability_meta["sha256"],
         "runtime_contract": {
             "python": sys.version.split()[0],
             "torch": dependencies["torch"],
@@ -312,9 +327,9 @@ def cmd_run(args) -> None:
             "source_rows": len(design),
             "run_rows": len(source),
             "selected_work_sha256": _selected_work_sha(source),
-            "exclusions_path_name": exclusions_meta["path_name"],
-            "exclusions_sha256": exclusions_meta["sha256"],
-            "exclusion_rows": exclusions_meta["rows"],
+            "applicability_path_name": applicability_meta["path_name"],
+            "applicability_sha256": applicability_meta["sha256"],
+            "applicability_rows": applicability_meta["rows"],
         },
         "runtime": {
             "device": str(device),
@@ -397,6 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--config", default="configs/default.yaml")
     prepare.add_argument("--splits", default="train,validation")
     prepare.add_argument("--output", default=str(DEFAULT_DESIGN))
+    prepare.add_argument("--option-audit")
     prepare.set_defaults(func=cmd_prepare)
 
     run = sub.add_parser("run")

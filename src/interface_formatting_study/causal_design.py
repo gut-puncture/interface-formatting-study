@@ -522,7 +522,7 @@ def _v3_rows_for_item_format(
         and parsed_calibration is not None
         and parsed_calibration.separable
     )
-    transform_provenance = "deterministic"
+    transform_provenance = parsed_source.provenance if parsed_source is not None else "unresolved"
     legacy_prompts: dict[int, tuple[str, str]] = {}
     if parsed_source is not None and not parsed_source.separable:
         parse_reason = parsed_source.not_applicable_reason
@@ -646,7 +646,7 @@ def _v3_rows_for_item_format(
         "text_applicable": True,
         "position_applicable": separable,
         "label_applicable": separable,
-        "parse_provenance": transform_provenance if separable else "unresolved",
+        "parse_provenance": transform_provenance,
         "not_applicable_reason": "" if separable else parse_reason,
     }
     return rows, applicability

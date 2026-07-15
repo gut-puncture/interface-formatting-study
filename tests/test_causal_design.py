@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pandas as pd
 import pytest
 
@@ -12,6 +14,7 @@ from interface_formatting_study.causal_design import (
     build_causal_design_with_exclusions,
 )
 from interface_formatting_study.vanilla import build_vanilla_prompt
+from interface_formatting_study.causal_option_maps import parse_prompt_options
 
 
 QUESTION = "What is 2+2?"
@@ -305,3 +308,20 @@ def test_v3_preserves_shapes_already_supported_by_the_legacy_transformer():
     assert bool(status["position_applicable"])
     assert bool(status["label_applicable"])
     assert status["parse_provenance"] == "legacy_deterministic"
+
+
+def test_v3_records_supplied_option_map_provenance():
+    source = _source_frame()
+    prompt = _source_prompts()["key_equals"]
+    parsed = replace(
+        parse_prompt_options(prompt, "key_equals", CHOICES),
+        provenance="gpt-5.6-luna:xhigh:thread-1",
+    )
+
+    _, applicability = build_causal_design_v3(
+        source,
+        option_maps={("item-1", "key_equals"): parsed},
+    )
+
+    status = applicability.set_index("wrapper_name").loc["key_equals"]
+    assert status["parse_provenance"] == "gpt-5.6-luna:xhigh:thread-1"

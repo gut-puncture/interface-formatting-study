@@ -234,3 +234,29 @@ def test_wrong_source_bytes_are_rejected_before_transformation():
         assert "source prompt checksum mismatch" in str(exc)
     else:
         raise AssertionError("changed source prompt was accepted")
+
+
+def test_source_redacted_calibration_shapes_remain_transformable():
+    placeholders = [f"OPTION_{label}_PLACEHOLDER" for label in "ABCD"]
+    prompts = {
+        "graphql_query": (
+            "query { options { A: OPTION_A_PLACEHOLDER B: OPTION_B_PLACEHOLDER "
+            "C: OPTION_C_PLACEHOLDER D: OPTION_D_PLACEHOLDER } }" + SUFFIX
+        ),
+        "protobuf_msg": (
+            "message X { // Options: A) OPTION_A_PLACEHOLDER, B) OPTION_B_PLACEHOLDER, "
+            "C) OPTION_C_PLACEHOLDER, D) OPTION_D_PLACEHOLDER\n}" + SUFFIX
+        ),
+        "html_form": (
+            "<form>\n<input value='A'> A) OPTION_A_PLACEHOLDER <br>\n"
+            "<input value='B'> B) OPTION_B_PLACEHOLDER <br>\n"
+            "<input value='C'> C) OPTION_C_PLACEHOLDER <br>\n"
+            "<input value='D'> D) OPTION_D_PLACEHOLDER <br>\n</form>" + SUFFIX
+        ),
+    }
+
+    for wrapper, prompt in prompts.items():
+        parsed = parse_prompt_options(prompt, wrapper, placeholders)
+        transformed = transform_with_option_map(parsed, prompt, position_shift=1, label_shift=0)
+        assert transformed != prompt
+        assert transformed.count("OPTION_A_PLACEHOLDER") == 1

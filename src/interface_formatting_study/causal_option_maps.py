@@ -59,6 +59,8 @@ def validate_option_map(parsed: ParsedPrompt, source: str) -> None:
     digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
     if parsed.source_sha256 != digest:
         raise ValueError("source prompt checksum mismatch")
+    if not parsed.representations and not parsed.separable:
+        return
     if not parsed.representations:
         raise ValueError("option map has no representations")
     for representation in parsed.representations:
@@ -458,6 +460,49 @@ def _parse_ini(source: str) -> ParsedPrompt:
     return _parse_labelled_lines(source, "ini_file")
 
 
+def _parse_redacted_placeholders(source: str, wrapper_name: str) -> ParsedPrompt:
+    payloads: list[SourceSpan] = []
+    for label in LETTERS:
+        token = f"OPTION_{label}_PLACEHOLDER"
+        matches = list(re.finditer(re.escape(token), source))
+        if len(matches) != 1:
+            raise ValueError("redacted_placeholder_not_unique")
+        payloads.append(_span(matches[0]))
+    slots: list[OptionSlot] = []
+    previous_end = 0
+    for index, (label, payload) in enumerate(zip(LETTERS, payloads, strict=True)):
+        prefix_start = max(previous_end, payload.start - 120)
+        prefix = source[prefix_start : payload.start]
+        label_spans: set[SourceSpan] = set()
+        for pattern in (
+            rf'''(?i)\bvalue\s*=\s*["'](?P<label>{label})["']''',
+            rf"(?i)(?<![A-Za-z0-9_])(?P<label>{label})\s*[:)=]",
+        ):
+            for match in re.finditer(pattern, prefix):
+                label_spans.add(
+                    SourceSpan(
+                        prefix_start + match.start("label"),
+                        prefix_start + match.end("label"),
+                    )
+                )
+        if not label_spans:
+            raise ValueError("redacted_placeholder_label_not_resolved")
+        slots.append(
+            OptionSlot(
+                index,
+                tuple(sorted(label_spans, key=lambda span: span.start)),
+                (payload,),
+            )
+        )
+        previous_end = payload.end
+    return _make_parsed(
+        source,
+        wrapper_name,
+        (OptionRepresentation(tuple(slots)),),
+        separable=True,
+    )
+
+
 def parse_prompt_options(
     source: str,
     wrapper_name: str,
@@ -465,6 +510,13 @@ def parse_prompt_options(
 ) -> ParsedPrompt:
     if len(canonical_choices) != 4:
         raise ValueError("option parsing requires four canonical choices")
+    if tuple(map(str, canonical_choices)) == tuple(
+        f"OPTION_{label}_PLACEHOLDER" for label in LETTERS
+    ):
+        try:
+            return _parse_redacted_placeholders(source, wrapper_name)
+        except ValueError:
+            pass
     if wrapper_name == "csv_inline":
         return _parse_csv(source, canonical_choices)
     if wrapper_name == "graphql_query":
