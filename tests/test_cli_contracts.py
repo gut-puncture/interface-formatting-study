@@ -187,3 +187,12 @@ def test_gpu_script_default_pipeline_skips_vector_stages():
     assert "content-free-control" not in script
     package_section = script.split("tar -czf", maxsplit=1)[1]
     assert "results/tables/table3_semantic_patching.csv" not in package_section
+
+
+def test_causal_fetch_and_control_scripts_cover_canaries_and_persist_mode():
+    fetch = open("scripts/fetch_causal_followup_artifacts.sh", encoding="utf-8").read()
+    control = open("scripts/control_causal_followup_gpu.sh", encoding="utf-8").read()
+
+    assert 'RUN_SUFFIX="/canaries/${CANARY_NAME}"' in fetch
+    assert "MODE_FILE" in control
+    assert 'echo "$MODE" > "$MODE_FILE"' in control

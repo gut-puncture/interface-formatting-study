@@ -53,6 +53,7 @@ PAYLOAD_BYTES="$(du -sk \
   "${ROOT_DIR}/src" \
   "${ROOT_DIR}/configs" \
   "${ROOT_DIR}/pyproject.toml" \
+  "${ROOT_DIR}/requirements-gpu.lock" \
   "${ROOT_DIR}/README.md" \
   "${ACTIVE_DATASET_PATH}" | awk '{total += $1} END {print total * 1024}')"
 echo "Thin payload bytes: ${PAYLOAD_BYTES}"
@@ -64,10 +65,12 @@ rsync -az --delete \
   --include '/configs/' \
   --include '/configs/***' \
   --include '/pyproject.toml' \
+  --include '/requirements-gpu.lock' \
   --include '/README.md' \
   --include '/scripts/' \
   --include '/scripts/bootstrap_causal_followup_gpu.sh' \
   --include '/scripts/run_causal_followup_gpu.sh' \
+  --include '/scripts/control_causal_followup_gpu.sh' \
   --include '/scripts/cache_causal_models.py' \
   --exclude '*' \
   -e "${RSYNC_RSH[*]}" \

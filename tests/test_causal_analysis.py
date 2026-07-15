@@ -67,6 +67,7 @@ def _run_fixture(root: Path) -> None:
                 "canary": False,
                 "model": {"id": "model-one", "revision": "revision-one"},
                 "semantic_identity": {"semantic_run_id": "semantic-one"},
+                "design": {"run_rows": len(design)},
             }
         )
     )

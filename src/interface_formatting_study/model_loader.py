@@ -49,7 +49,7 @@ def load_model_and_tokenizer(
         tokenizer.pad_token = tokenizer.eos_token
 
     model_kwargs = {
-        "dtype": dtype,
+        "torch_dtype": dtype,
         "revision": revision,
         "local_files_only": local_files_only,
         "trust_remote_code": trust_remote_code,

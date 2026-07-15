@@ -5,7 +5,8 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/run_causal_followup_gpu.sh <profile> <functional|profiling|full> [design]
 
-Runs one pinned model through the resumable causal follow-up. Environment knobs:
+Runs one pinned model through the resumable controlled causal follow-up. Start it
+through control_causal_followup_gpu.sh on paid hardware. Environment knobs:
 BATCH_SIZE (32), MAX_BATCH_TOKENS (40000), CHECKPOINT_SIZE (256), CANARY_ITEMS (8 or 32).
 USAGE
 }

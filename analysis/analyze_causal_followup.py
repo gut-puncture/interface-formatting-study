@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 
 from interface_formatting_study.run_identity import sha256_file
+from interface_formatting_study.causal_runner import validate_causal_design
 from interface_formatting_study.statistics import clustered_bootstrap_paired_diff
 from interface_formatting_study.utils import EPSILON
 
@@ -45,6 +46,10 @@ def load_run(spec: str, *, allow_canary: bool = False) -> tuple[CausalRun, pd.Da
     frame = pd.read_parquet(raw_path)
     if len(frame) != int(raw_manifest.get("row_count", -1)):
         raise ValueError(f"Causal artifact row-count mismatch: {raw_path}")
+    expected_rows = int(manifest.get("design", {}).get("run_rows", -1))
+    if len(frame) != expected_rows or frame["work_key"].duplicated().any():
+        raise ValueError(f"Complete causal artifact violates its work-row contract: {raw_path}")
+    validate_causal_design(frame)
     for column, expected in (
         ("semantic_run_id", identity["semantic_run_id"]),
         ("model_id", manifest["model"]["id"]),

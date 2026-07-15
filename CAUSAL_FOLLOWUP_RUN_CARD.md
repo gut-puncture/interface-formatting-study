@@ -6,23 +6,29 @@ This is an exploratory causal follow-up on the fixed train and validation
 partitions. The 599 internal-test items remain untouched until the explanation
 and analysis are frozen.
 
-- Active design: 2,401 items, eight wrappers, 96,040 scored rows per model.
-- Letter arm: four randomized-block assignments per item/wrapper. Every answer
-  text appears once in every physical position and once under every answer
-  letter. Position and letter schedules are randomized independently from a
-  stable item/wrapper hash. Variant 0 is the unchanged identity assignment.
-- Text arm: one identity-assignment prompt per item/wrapper scored against the
-  four exact answer texts. Total sequence log-likelihood is primary; mean token
-  log-likelihood is a declared length-sensitivity analysis.
+- Active design: 2,401 items, eight fixed wrapper templates plus one matched
+  plain MCQ, 172,872 durable rows per model.
+- Letter arm: one controlled baseline, three position-only rotations (the
+  displayed letters stay attached to their answer texts), and three
+  letter-only rotations (physical order stays fixed) per item/format. The two
+  causes are never changed together. Raw and content-free-calibrated outcomes
+  are both saved; calibrated accuracy is primary because it matches the paper.
+- Text arm: one controlled-baseline prompt per item/format. Deterministic
+  generated exact-answer match is primary. Total and mean candidate
+  log-likelihood are explicitly secondary length-sensitive diagnostics.
+- This is a controlled causal experiment, not a byte-level mutation of the old
+  generated prompts. The old runs establish the phenomenon; fixed canonical
+  templates and the matched plain control test whether format amplifies
+  position or displayed-letter sensitivity without uncontrolled wording drift.
 - Models: pinned Qwen2.5-1.5B, Phi-3.5-mini, and Mistral-7B-v0.3 profiles.
 - Active design SHA-256:
-  `435d9662f9c1f06e3bf4e7f5334f12fc86f287b6d7ab6794ae02c1dd4fe4f8f7`.
+  `f30d1056a131a9d62257a5d1028defaf7e6100c558d65ce3ea19c10d0c1bc336`.
   The launch operator must re-read the committed manifest rather than trust
   this copied value if the design is regenerated.
 
-The older wrapper audit is outcome-blind. Its first pass covered all 24,000
-rows exactly; an independent second pass adjudicated all 134 initially
-questionable rows. Final labels are 22,081 formatting-only, 1,808
+The older model-assisted wrapper audit is outcome-blind. Its first pass covered
+all 24,000 rows exactly; a separate second-pass context adjudicated all 134
+initially questionable rows. Final labels are 22,081 formatting-only, 1,808
 meaning-preserving rewrites, 107 content changes, and four ambiguous rows. The
 causal design does not reuse those generated prompt strings: it renders directly
 from the canonical question and four canonical choices. This is deliberate so
@@ -34,11 +40,12 @@ uncertain old rows.
 Before rental, all of the following must be green:
 
 1. Full local tests from the project root.
-2. Causal design checksum and 96,040-row/2,401-item contract.
+2. Causal design checksum and 172,872-row/2,401-item contract.
 3. Functional fake-model run, interruption/resume equality, shard conflict
    rejection, verified fetch, and local analysis consumer tests.
-4. Thin payload inventory: `src/`, `configs/`, three causal operator scripts,
-   packaging metadata, README, and the 13 MB active design plus manifest only.
+4. Thin payload inventory: `src/`, `configs/`, causal operator scripts, pinned
+   non-Torch environment, packaging metadata, README, and the 24 MB active
+   design plus manifest only.
 5. Independent review wave reconciled; no unresolved correctness blocker.
 6. No unexpected live Prime pod. Never terminate another project's pod.
 
@@ -102,32 +109,45 @@ ssh -i <key> -p <port> ubuntu@<host> \
 Run functional then profiling canaries for Mistral, Phi, and Qwen. Mistral is
 first because it is the slowest and highest-memory checkpoint.
 
+All starts below run on the rented host under a durable PID, log, and exclusive
+per-model lock. Replace `<ssh>` with `ssh -i <key> -p <port> ubuntu@<host>`.
+
 ```bash
-scripts/run_causal_followup_gpu.sh mistral functional
-scripts/run_causal_followup_gpu.sh phi functional
-scripts/run_causal_followup_gpu.sh qwen functional
-scripts/run_causal_followup_gpu.sh mistral profiling
-scripts/run_causal_followup_gpu.sh phi profiling
-scripts/run_causal_followup_gpu.sh qwen profiling
+<ssh> 'cd /home/ubuntu/interface_formatting_study && scripts/control_causal_followup_gpu.sh start mistral functional'
+<ssh> 'cd /home/ubuntu/interface_formatting_study && scripts/control_causal_followup_gpu.sh status mistral'
+<ssh> 'cd /home/ubuntu/interface_formatting_study && scripts/control_causal_followup_gpu.sh tail mistral functional'
+# Repeat start/status/tail for phi, then qwen, then profiling in the same order.
 ```
 
-The profiling canary is 32 items = 1,280 durable rows. For each model record
-wall time, forward time, forward calls, peak VRAM, padding ratio, completed
-rows/second, and input preparation time. Forecast each full run as measured
-seconds per durable row times 96,040, then apply a 1.25 P90 multiplier and add
-measured setup time. Start full scale only if combined P90 cost fits below
-$6.00. Otherwise perform at most one batch/token-budget optimization canary;
-accept it only with exact categorical parity and at least 10% end-to-end gain.
+The profiling canary is 32 items = 2,304 durable rows. For each model record
+model-load seconds separately from scoring seconds, forward time/calls, peak
+VRAM, padding ratio, completed rows/second, and input-preparation time. Forecast
+each full run as `one model load + scoring_seconds / completed_rows * 172872`,
+then apply a 1.25 P90 multiplier and add measured setup time. Start full scale
+only if combined P90 cost fits below $6.00. Otherwise perform at most one
+batch/token-budget optimization canary; accept only if categorical outputs are
+identical, selected scores remain within tolerance, and end-to-end scoring
+throughput improves at least 10%.
+
+Before full scale, prove stop/resume on one profiling canary: issue `stop`, time
+until `status` says stopped, fetch in partial mode, restart the identical
+command, and verify the final complete artifact. Record the maximum measured
+flush+fetch+termination duration as `shutdown_seconds`.
+
+Canary fetches pass the canary name as the final argument:
+
+```bash
+scripts/fetch_causal_followup_artifacts.sh \
+  ubuntu@<host> <model-slug> <semantic-run-id> \
+  /home/ubuntu/interface_formatting_study gpu_artifacts/causal_followup \
+  <key> <port> partial profiling
+```
 
 Full order:
 
 ```bash
-scripts/run_causal_followup_gpu.sh mistral full
-# fetch and verify Mistral
-scripts/run_causal_followup_gpu.sh phi full
-# fetch and verify Phi
-scripts/run_causal_followup_gpu.sh qwen full
-# fetch and verify Qwen
+<ssh> 'cd /home/ubuntu/interface_formatting_study && scripts/control_causal_followup_gpu.sh start mistral full'
+# status, monitor, fetch and verify Mistral; then repeat for Phi and Qwen.
 ```
 
 SIGINT/SIGTERM finishes the current shard and records progress. Repeating the
@@ -140,8 +160,12 @@ or token budget after a full semantic run begins.
   minutes; check every minute after $5.50.
 - At $6.00, continue only if less than 10% of canary-weighted GPU work remains
   and its P90 cost plus shutdown fits below $6.75.
-- At $6.75 or if monitoring fails: send SIGTERM, wait for shard flush, fetch in
-  partial mode, and terminate the Keyhole pod.
+- Compute the normal wind-down trigger as
+  `$6.75 - hourly_rate * shutdown_seconds / 3600`. At that trigger send SIGTERM,
+  wait only the measured reserve, fetch partial, and terminate.
+- At $6.75 or if monitoring fails: terminate the Keyhole pod immediately even
+  if flush or fetch has not finished. The last already-atomic shard remains the
+  recovery boundary.
 - Never terminate the unrelated TWC pod.
 
 Fetch command per model:
@@ -151,6 +175,23 @@ scripts/fetch_causal_followup_artifacts.sh \
   ubuntu@<host> <model-slug> <semantic-run-id> \
   /home/ubuntu/interface_formatting_study gpu_artifacts/causal_followup \
   <key> <port> complete
+```
+
+Remote stop and emergency kill commands are concrete:
+
+```bash
+<ssh> 'cd /home/ubuntu/interface_formatting_study && scripts/control_causal_followup_gpu.sh stop <profile>'
+<ssh> 'cd /home/ubuntu/interface_formatting_study && scripts/control_causal_followup_gpu.sh status <profile>'
+<ssh> 'cd /home/ubuntu/interface_formatting_study && scripts/control_causal_followup_gpu.sh kill <profile>'
+```
+
+During every paid run, collect utilization next to progress and cost checks:
+
+```bash
+<ssh> 'nvidia-smi --query-gpu=timestamp,name,memory.used,memory.total,utilization.gpu --format=csv,noheader'
+<ssh> 'cd /home/ubuntu/interface_formatting_study && find results/causal_runs -name progress.json -print -exec tail -n +1 {} \;'
+prime --plain wallet --output json
+prime --plain pods list --output json
 ```
 
 Only after all required model fetches validate:

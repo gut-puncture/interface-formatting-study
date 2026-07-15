@@ -28,6 +28,7 @@ def verify(root: Path, semantic_run_id: str, model_slug: str, mode: str) -> dict
     revision = identity["model"]["revision"]
     shard_root = root / "shards" / "causal_behavior"
     keys: set[str] = set()
+    exact_seen: set[tuple[str, tuple[str, ...]]] = set()
     shard_rows = 0
     for shard in sorted(shard_root.glob("shard-*")):
         shard_manifest = json.loads((shard / "manifest.json").read_text(encoding="utf-8"))
@@ -41,22 +42,34 @@ def verify(root: Path, semantic_run_id: str, model_slug: str, mode: str) -> dict
         if sha256_file(data) != shard_manifest.get("data_sha256"):
             raise ValueError(f"shard checksum mismatch: {shard.name}")
         shard_keys = [str(value) for value in shard_manifest.get("work_keys", [])]
+        frame = pd.read_parquet(data)
+        data_keys = [str(value) for value in frame.get("work_key", pd.Series(dtype=str))]
+        if len(data_keys) != len(frame) or set(data_keys) != set(shard_keys):
+            raise ValueError(f"causal shard data/work-key mismatch: {shard.name}")
+        exact_key = (str(shard_manifest.get("data_sha256")), tuple(shard_keys))
+        if exact_key in exact_seen:
+            continue
         overlap = keys.intersection(shard_keys)
         if overlap:
             raise ValueError(f"duplicate causal work keys across shards: {sorted(overlap)[:3]}")
         if len(shard_keys) != int(shard_manifest.get("row_count", -1)):
             raise ValueError(f"causal shard work-key/row mismatch: {shard.name}")
+        exact_seen.add(exact_key)
         keys.update(shard_keys)
-        shard_rows += len(pd.read_parquet(data))
+        shard_rows += len(frame)
 
     artifact = root / "raw" / "causal_behavior.parquet"
-    artifact_manifest = json.loads(artifact.with_name(artifact.name + ".manifest.json").read_text(encoding="utf-8"))
-    if artifact_manifest.get("semantic_run_id") != semantic_run_id or sha256_file(artifact) != artifact_manifest.get("sha256"):
-        raise ValueError("merged causal artifact identity or checksum mismatch")
-    merged = pd.read_parquet(artifact)
-    if len(merged) != len(keys) or len(merged) != shard_rows or set(merged["work_key"].astype(str)) != keys:
-        raise ValueError("merged causal artifact does not reconcile with shards")
     expected = int(manifest["design"]["run_rows"])
+    if artifact.exists():
+        artifact_manifest_path = artifact.with_name(artifact.name + ".manifest.json")
+        artifact_manifest = json.loads(artifact_manifest_path.read_text(encoding="utf-8"))
+        if artifact_manifest.get("semantic_run_id") != semantic_run_id or sha256_file(artifact) != artifact_manifest.get("sha256"):
+            raise ValueError("merged causal artifact identity or checksum mismatch")
+        merged = pd.read_parquet(artifact)
+        if len(merged) != len(keys) or len(merged) != shard_rows or set(merged["work_key"].astype(str)) != keys:
+            raise ValueError("merged causal artifact does not reconcile with shards")
+    elif mode == "complete":
+        raise ValueError("complete causal fetch is missing merged artifact")
     if mode == "complete" and (manifest.get("status") != "complete" or len(keys) != expected):
         raise ValueError(f"complete causal fetch expected {expected} work keys; found {len(keys)}")
     return {"status": manifest.get("status"), "work_keys": len(keys), "expected_work_keys": expected}

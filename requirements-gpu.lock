@@ -1,0 +1,9 @@
+# CUDA-matched Torch comes from the Prime image and is deliberately not installed here.
+numpy==2.2.6
+pandas==2.3.1
+PyYAML==6.0.2
+transformers==4.53.2
+pyarrow==20.0.0
+huggingface-hub==0.33.4
+safetensors==0.5.3
+tokenizers==0.21.2
