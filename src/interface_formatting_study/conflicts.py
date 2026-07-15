@@ -33,6 +33,79 @@ SCORE_CONFLICT_COLUMNS = [
 CONFLICT_PAIR_COLUMNS = BASE_CONFLICT_COLUMNS + SCORE_CONFLICT_COLUMNS
 
 
+def item_conflict_outcomes(
+    df: pd.DataFrame,
+    *,
+    correct_col: str = "cal_correct",
+    calibration_kind: str | None = None,
+    expected_wrappers: int | None = None,
+) -> pd.DataFrame:
+    """Return one denominator-safe conflict row per eligible item."""
+
+    required = {"item_id", "wrapper_name", correct_col}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Conflict population is missing columns: {sorted(missing)}")
+    source = df
+    if calibration_kind is not None:
+        if "content_free_calibration_kind" not in source:
+            raise ValueError("Calibration-eligible conflicts require calibration provenance")
+        source = source[source["content_free_calibration_kind"] == calibration_kind]
+    if source.empty:
+        return pd.DataFrame(columns=["item_id", "observed_wrappers", "correct_wrappers", "is_conflict"])
+
+    if source[correct_col].isna().any():
+        raise ValueError(f"Conflict population contains missing {correct_col} values")
+    invalid_outcomes = ~source[correct_col].isin([True, False])
+    if invalid_outcomes.any():
+        sample = source.loc[invalid_outcomes, correct_col].head(5).tolist()
+        raise ValueError(f"Conflict population requires boolean {correct_col} values; found {sample}")
+
+    duplicate = source.duplicated(["item_id", "wrapper_name"], keep=False)
+    if duplicate.any():
+        sample = source.loc[duplicate, ["item_id", "wrapper_name"]].head(5).to_dict("records")
+        raise ValueError(f"Conflict population contains duplicate item-wrapper rows: {sample}")
+
+    grouped = source.groupby("item_id", sort=True)
+    observed = grouped["wrapper_name"].size()
+    if expected_wrappers is not None:
+        bad = observed[observed != int(expected_wrappers)]
+        if not bad.empty:
+            raise ValueError(
+                f"Full conflict population expected {expected_wrappers} wrappers per item; "
+                f"found {bad.head().to_dict()}"
+            )
+    correct = grouped[correct_col].sum().astype(int)
+    outcomes = pd.DataFrame(
+        {
+            "item_id": observed.index.astype(str),
+            "observed_wrappers": observed.to_numpy(dtype=int),
+            "correct_wrappers": correct.to_numpy(dtype=int),
+        }
+    )
+    outcomes["is_conflict"] = (
+        (outcomes["correct_wrappers"] > 0)
+        & (outcomes["correct_wrappers"] < outcomes["observed_wrappers"])
+    )
+    return outcomes
+
+
+def conflict_population_summary(outcomes: pd.DataFrame, *, population: str) -> dict[str, object]:
+    required = {"item_id", "is_conflict"}
+    missing = required - set(outcomes.columns)
+    if missing:
+        raise ValueError(f"Item outcomes are missing columns: {sorted(missing)}")
+    denominator = int(len(outcomes))
+    conflicts = int(outcomes["is_conflict"].astype(bool).sum())
+    return {
+        "population": str(population),
+        "eligible_items": denominator,
+        "conflict_items": conflicts,
+        "denominator": denominator,
+        "conflict_rate": 0.0 if denominator == 0 else conflicts / denominator,
+    }
+
+
 def construct_conflict_pairs(
     df: pd.DataFrame,
     *,
