@@ -16,6 +16,12 @@ from interface_formatting_study.causal_design import (
 )
 from interface_formatting_study.vanilla import build_vanilla_prompt
 from interface_formatting_study.causal_option_maps import parse_prompt_options
+from interface_formatting_study.causal_option_maps import (
+    OptionRepresentation,
+    OptionSlot,
+    ParsedPrompt,
+    SourceSpan,
+)
 
 
 QUESTION = "What is 2+2?"
@@ -204,6 +210,50 @@ def test_v3_scores_multicolumn_csv_rows_as_the_displayed_answer_text():
         "3,points", "4,points", "5,points", "6,points"
     ]
     assert answer_text["correct_text"] == "4,points"
+
+
+def test_v3_does_not_join_duplicate_protobuf_representations():
+    source = _source_frame()
+    values = ["SOPHOMORE", "SENIOR", "FRESHMAN", "JUNIOR"]
+    source["choices"] = [values] * len(source)
+    prompt = (
+        "enum AnswerOption {\n"
+        "SOPHOMORE = 0; // A\nSENIOR = 1; // B\n"
+        "FRESHMAN = 2; // C\nJUNIOR = 3; // D\n}\n"
+        "repeated AnswerOption options = 2 [\n"
+        "SOPHOMORE,\nSENIOR,\nFRESHMAN,\nJUNIOR\n];" + SUFFIX
+    )
+    source.loc[source["wrapper_name"] == "protobuf_msg", "wrapped_prompt"] = prompt
+    slots = []
+    for content_id, (label, value) in enumerate(zip("ABCD", values, strict=True)):
+        first = prompt.index(value)
+        second = prompt.index(value, first + len(value))
+        label_start = prompt.index(f"// {label}") + 3
+        slots.append(
+            OptionSlot(
+                content_id,
+                (SourceSpan(label_start, label_start + 1),),
+                (SourceSpan(first, first + len(value)), SourceSpan(second, second + len(value))),
+            )
+        )
+    parsed = ParsedPrompt(
+        wrapper_name="protobuf_msg",
+        source_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        representations=(OptionRepresentation(tuple(slots)),),
+        separable=True,
+        not_applicable_reason="",
+        provenance="gpt-5.6-luna:xhigh:test",
+    )
+
+    design, _ = build_causal_design_v3(
+        source, option_maps={("item-1", "protobuf_msg"): parsed}
+    )
+    answer_text = design[
+        (design["wrapper_name"] == "protobuf_msg") & (design["arm"] == "answer_text")
+    ].iloc[0]
+
+    assert answer_text["candidate_texts"] == values
+    assert answer_text["correct_text"] == "SENIOR"
 
 
 def test_source_counterfactuals_support_real_wide_csv_and_graphql_record_shapes():

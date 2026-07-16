@@ -526,13 +526,22 @@ def _v3_rows_for_item_format(
     if choice_override is None and parsed_source is not None and parsed_source.representations:
         displayed: dict[int, str] = {}
         for representation in parsed_source.representations:
-            for slot in representation.slots:
-                payloads = [span.text(source_prompt) for span in slot.payload_spans]
+            payloads_by_slot = [
+                [span.text(source_prompt) for span in slot.payload_spans]
+                for slot in representation.slots
+            ]
+            duplicate_representation = all(
+                len(payloads) > 1 and len(set(payloads)) == 1
+                for payloads in payloads_by_slot
+            )
+            for slot, payloads in zip(
+                representation.slots, payloads_by_slot, strict=True
+            ):
                 if not payloads:
                     displayed = {}
                     break
                 separator = "," if format_name == "csv_inline" else " "
-                value = separator.join(payloads)
+                value = payloads[0] if duplicate_representation else separator.join(payloads)
                 if slot.content_id in displayed and displayed[slot.content_id] != value:
                     displayed = {}
                     break
