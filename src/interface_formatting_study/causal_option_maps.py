@@ -148,7 +148,9 @@ def _parse_csv(source: str, choices: Sequence[str]) -> ParsedPrompt:
         except (csv.Error, ValueError):
             fields = []
         label_fields = [(value.strip().upper(), span) for value, span in fields if value.strip().upper() in LETTERS]
-        if len(label_fields) == 1:
+        if len(label_fields) == 1 and (
+            len(fields) == 2 or fields[0][0].strip().upper() not in LETTERS
+        ):
             label, label_span = label_fields[0]
             choice = str(choices[LETTERS.index(label)])
             exact = [(value, span) for value, span in fields if value == choice and span != label_span]
@@ -158,6 +160,7 @@ def _parse_csv(source: str, choices: Sequence[str]) -> ParsedPrompt:
         # Some source prompts intentionally use human-readable, unquoted CSV.
         # In those rows commas inside an option are payload bytes, not delimiters.
         edge_label = re.match(r"^\s*(?P<label>[A-D])\s*,", line)
+        label_at_start = edge_label is not None
         if edge_label is None:
             edge_label = re.search(r",\s*(?P<label>[A-D])\s*$", line)
         if edge_label is None:
@@ -165,7 +168,21 @@ def _parse_csv(source: str, choices: Sequence[str]) -> ParsedPrompt:
         label = edge_label.group("label")
         choice = str(choices[LETTERS.index(label)])
         occurrences = list(re.finditer(re.escape(choice), line))
-        if len(occurrences) == 1:
+        if label_at_start and len(fields) > 2:
+            payload_start = edge_label.end()
+            payload_end = len(line)
+            while payload_start < payload_end and line[payload_start].isspace():
+                payload_start += 1
+            while payload_end > payload_start and line[payload_end - 1].isspace():
+                payload_end -= 1
+            if payload_start < payload_end:
+                candidates[label].append(
+                    (
+                        SourceSpan(start + edge_label.start("label"), start + edge_label.end("label")),
+                        SourceSpan(start + payload_start, start + payload_end),
+                    )
+                )
+        elif len(occurrences) == 1:
             choice_match = occurrences[0]
             candidates[label].append(
                 (
@@ -173,6 +190,20 @@ def _parse_csv(source: str, choices: Sequence[str]) -> ParsedPrompt:
                     SourceSpan(start + choice_match.start(), start + choice_match.end()),
                 )
             )
+        elif label_at_start:
+            payload_start = edge_label.end()
+            payload_end = len(line)
+            while payload_start < payload_end and line[payload_start].isspace():
+                payload_start += 1
+            while payload_end > payload_start and line[payload_end - 1].isspace():
+                payload_end -= 1
+            if payload_start < payload_end:
+                candidates[label].append(
+                    (
+                        SourceSpan(start + edge_label.start("label"), start + edge_label.end("label")),
+                        SourceSpan(start + payload_start, start + payload_end),
+                    )
+                )
     records: dict[str, tuple[SourceSpan, SourceSpan]] = {}
     for label, found in candidates.items():
         unique = list(dict.fromkeys(found))

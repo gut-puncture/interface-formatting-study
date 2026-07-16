@@ -523,6 +523,25 @@ def _v3_rows_for_item_format(
             parsed_source = parse_prompt_options(source_prompt, format_name, choices)
         except ValueError as exc:
             parse_reason = str(exc)
+    if choice_override is None and parsed_source is not None and parsed_source.representations:
+        displayed: dict[int, str] = {}
+        for representation in parsed_source.representations:
+            for slot in representation.slots:
+                payloads = [span.text(source_prompt) for span in slot.payload_spans]
+                if not payloads:
+                    displayed = {}
+                    break
+                separator = "," if format_name == "csv_inline" else " "
+                value = separator.join(payloads)
+                if slot.content_id in displayed and displayed[slot.content_id] != value:
+                    displayed = {}
+                    break
+                displayed[slot.content_id] = value
+            if not displayed:
+                break
+        if set(displayed) == set(range(4)) and all(displayed.values()):
+            choices = [displayed[index] for index in range(4)]
+            choice_provenance = f"{parsed_source.provenance}:payload"
     parsed_calibration = None
     if parsed_source is not None and parsed_source.separable:
         try:

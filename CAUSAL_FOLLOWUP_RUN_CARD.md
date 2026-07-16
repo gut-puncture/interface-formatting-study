@@ -26,7 +26,7 @@ and analysis are frozen.
   position/label rows are absent; no item or baseline is excluded.
 - Models: pinned Qwen2.5-1.5B, Phi-3.5-mini, and Mistral-7B-v0.3 profiles.
 - Active design SHA-256:
-  `2a48fa95dd7e22d354e4597212accf0a9f5774107a386a082a0aee5a8b80d4dd`.
+  `8e7a0305c724396661902a93dc3a209bed0ec2a5c18d8f7b85eef7df969b6a7e`.
   The launch operator must re-read the committed manifest rather than trust
   this copied value if the design is regenerated.
 

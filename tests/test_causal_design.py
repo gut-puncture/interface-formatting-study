@@ -175,6 +175,37 @@ def test_v3_uses_displayed_choice_override_for_reordered_source_prompt():
     assert block.loc[("letter_intervention", 4), "correct_label"] == "D"
 
 
+def test_v3_scores_the_answer_text_displayed_in_the_stored_prompt():
+    source = _source_frame()
+    prompt = "QUESTION=What is 2+2?\nA=3\nB=4 points\nC=5\nD=6" + SUFFIX
+    source.loc[source["wrapper_name"] == "key_equals", "wrapped_prompt"] = prompt
+
+    design, _ = build_causal_design_v3(source)
+    answer_text = design[
+        (design["wrapper_name"] == "key_equals") & (design["arm"] == "answer_text")
+    ].iloc[0]
+
+    assert answer_text["candidate_texts"] == ["3", "4 points", "5", "6"]
+    assert answer_text["correct_text"] == "4 points"
+
+
+def test_v3_scores_multicolumn_csv_rows_as_the_displayed_answer_text():
+    source = _source_frame()
+    source.loc[source["wrapper_name"] == "csv_inline", "wrapped_prompt"] = (
+        "Option,Value,Unit\nA,3,points\nB,4,points\nC,5,points\nD,6,points" + SUFFIX
+    )
+
+    design, _ = build_causal_design_v3(source)
+    answer_text = design[
+        (design["wrapper_name"] == "csv_inline") & (design["arm"] == "answer_text")
+    ].iloc[0]
+
+    assert answer_text["candidate_texts"] == [
+        "3,points", "4,points", "5,points", "6,points"
+    ]
+    assert answer_text["correct_text"] == "4,points"
+
+
 def test_source_counterfactuals_support_real_wide_csv_and_graphql_record_shapes():
     prompts = _source_prompts()
     prompts["csv_inline"] = (
