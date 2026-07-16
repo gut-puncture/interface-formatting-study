@@ -12,14 +12,19 @@ from interface_formatting_study.causal_design import balanced_assignments
 from interface_formatting_study.decision_binding import (
     CheckpointIndices,
     ProbeBank,
+    build_patch_vectors,
     capture_layer_readouts,
     evaluate_probe_bank,
     fit_probe_bank,
     load_probe_bank,
+    patch_target_labels,
     prepare_readout_ledger,
+    probe_subspace_basis,
+    projected_replacement,
     resolve_readout_checkpoints,
     save_probe_bank,
     select_readout_layers,
+    target_margin,
     winner_coordinates,
 )
 
@@ -439,3 +444,86 @@ def test_layer_selection_marks_decodable_but_weak_probes_unusable():
 
     assert frozen["content"]["usable"] is False
     assert frozen["label"]["usable"] is False
+
+
+def test_probe_subspace_is_class_centered_orthonormal_and_rank_at_most_three():
+    weights = np.zeros((2, 2, 4, 6), dtype=np.float64)
+    weights[1, 0, :, :4] = np.eye(4)
+    weights[1, 0] += 9.0  # A shared offset is not a discriminating direction.
+    bank = ProbeBank(
+        weights=weights,
+        intercepts=np.zeros((2, 2, 4)),
+        means=np.zeros((2, 2, 6)),
+        classes=np.arange(4),
+        c=1e-2,
+    )
+
+    basis = probe_subspace_basis(bank, layer=1, checkpoint="format_end")
+
+    assert basis.shape == (6, 3)
+    assert np.allclose(basis.T @ basis, np.eye(3), atol=1e-12)
+    assert np.allclose(basis.T @ np.ones(6), np.zeros(3), atol=1e-12)
+    assert np.array_equal(basis, probe_subspace_basis(bank, layer=1, checkpoint=0))
+
+
+def test_projected_and_random_controls_have_the_prespecified_geometry():
+    receiver = torch.tensor([1.0, -2.0, 0.5, 3.0, -1.0, 2.0])
+    donor = torch.tensor([4.0, 1.0, -0.5, 2.0, 5.0, -3.0])
+    basis = np.eye(6, dtype=np.float64)[:, :2]
+
+    projected = projected_replacement(receiver, donor, basis)
+    vectors = build_patch_vectors(receiver, donor, basis, seed="pair|layer|checkpoint")
+    repeated = build_patch_vectors(receiver, donor, basis, seed="pair|layer|checkpoint")
+
+    delta = donor - receiver
+    projected_delta = projected - receiver
+    random_delta = vectors.random - receiver
+    assert torch.allclose(projected[:2], donor[:2])
+    assert torch.allclose(projected[2:], receiver[2:])
+    assert torch.allclose(vectors.probe, projected)
+    assert torch.allclose(vectors.full, donor)
+    assert torch.allclose(vectors.identity, receiver)
+    assert torch.allclose(vectors.random, repeated.random)
+    assert torch.allclose(random_delta[:2], torch.zeros(2), atol=1e-6)
+    assert torch.allclose(random_delta.norm(), projected_delta.norm(), atol=1e-6)
+    assert torch.allclose(projected_replacement(receiver, receiver, basis), receiver)
+    assert not torch.allclose(delta, projected_delta)
+
+
+def test_patch_targets_map_donor_content_into_receiver_without_string_matching():
+    donor = {
+        "raw_predicted_label": "B",
+        "labels_by_position": ["D", "B", "A", "C"],
+        "content_ids_by_position": [2, 3, 1, 0],
+        "candidate_texts": ["same", "same", "other", "OTHER"],
+    }
+    receiver = {
+        "labels_by_position": ["C", "A", "D", "B"],
+        "content_ids_by_position": [3, 0, 2, 1],
+        "candidate_texts": ["different", "values", "do", "not matter"],
+    }
+
+    targets = patch_target_labels(donor, receiver)
+
+    assert targets.donor_content_id == 3
+    assert targets.receiver_content_label == "C"
+    assert targets.donor_symbol_label == "B"
+
+
+def test_patch_targets_and_target_margin_fail_closed_on_invalid_inputs():
+    valid = {
+        "raw_predicted_label": "A",
+        "labels_by_position": ["A", "B", "C", "D"],
+        "content_ids_by_position": [0, 1, 2, 3],
+    }
+    broken = {**valid, "content_ids_by_position": [0, 1, 2, 2]}
+    with pytest.raises(ValueError, match="content_ids_by_position"):
+        patch_target_labels(valid, broken)
+    with pytest.raises(ValueError, match="scores for exactly A, B, C, D"):
+        target_margin({"A": 1.0, "B": 0.0}, "A")
+    with pytest.raises(ValueError, match="Unknown target label"):
+        target_margin({label: float(index) for index, label in enumerate("ABCD")}, "E")
+
+    scores = {"A": 0.0, "B": 3.0, "C": 1.0, "D": -1.0}
+    assert target_margin(scores, "B") == pytest.approx(2.0)
+    assert target_margin(scores, "A") == pytest.approx(-3.0)

@@ -508,6 +508,179 @@ class ProbeBank:
         return logits - np.log(np.exp(logits).sum(axis=-1, keepdims=True))
 
 
+@dataclass(frozen=True)
+class PatchVectors:
+    probe: torch.Tensor
+    full: torch.Tensor
+    random: torch.Tensor
+    identity: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PatchTargets:
+    donor_content_id: int
+    receiver_content_label: str
+    donor_symbol_label: str
+
+
+_CHECKPOINT_INDEX = {"format_end": 0, "answer_prefix_end": 1}
+
+
+def probe_subspace_basis(
+    bank: ProbeBank,
+    *,
+    layer: int,
+    checkpoint: int | Literal["format_end", "answer_prefix_end"],
+) -> np.ndarray:
+    checkpoint_index = _CHECKPOINT_INDEX.get(checkpoint, checkpoint)
+    if not isinstance(checkpoint_index, (int, np.integer)):
+        raise ValueError(f"Unknown checkpoint: {checkpoint!r}")
+    if not 0 <= int(layer) < bank.weights.shape[0]:
+        raise ValueError(f"Layer is outside the probe bank: {layer}")
+    if not 0 <= int(checkpoint_index) < bank.weights.shape[1]:
+        raise ValueError(f"Checkpoint is outside the probe bank: {checkpoint!r}")
+    weights = np.asarray(bank.weights[int(layer), int(checkpoint_index)], dtype=np.float64)
+    if weights.ndim != 2 or weights.shape[0] != 4 or not np.isfinite(weights).all():
+        raise ValueError("Probe weights must contain four finite class vectors")
+    centered = weights - weights.mean(axis=0, keepdims=True)
+    _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+    if not singular_values.size or singular_values[0] == 0:
+        raise ValueError("Probe class contrasts have rank zero")
+    tolerance = np.finfo(np.float64).eps * max(centered.shape) * singular_values[0]
+    rank = min(3, int(np.count_nonzero(singular_values > tolerance)))
+    if rank == 0:
+        raise ValueError("Probe class contrasts have rank zero")
+    basis = vh[:rank].T.copy()
+    # SVD vector signs are arbitrary. Fix them so persisted controls are reproducible.
+    for column in range(rank):
+        pivot = int(np.argmax(np.abs(basis[:, column])))
+        if basis[pivot, column] < 0:
+            basis[:, column] *= -1
+    return basis
+
+
+def _validated_basis(basis: np.ndarray, hidden: int) -> np.ndarray:
+    value = np.asarray(basis, dtype=np.float64)
+    if value.ndim != 2 or value.shape[0] != hidden or not 1 <= value.shape[1] <= 3:
+        raise ValueError("Probe basis must have shape [hidden, rank] with rank 1-3")
+    if not np.isfinite(value).all() or not np.allclose(
+        value.T @ value, np.eye(value.shape[1]), atol=1e-10, rtol=1e-10
+    ):
+        raise ValueError("Probe basis must be finite and orthonormal")
+    return value
+
+
+def projected_replacement(
+    receiver: torch.Tensor,
+    donor: torch.Tensor,
+    basis: np.ndarray,
+) -> torch.Tensor:
+    if receiver.ndim != 1 or donor.shape != receiver.shape:
+        raise ValueError("Receiver and donor must be same-shaped one-dimensional residuals")
+    value = _validated_basis(basis, receiver.numel())
+    receiver64 = receiver.detach().to(dtype=torch.float64, device="cpu")
+    delta = donor.detach().to(dtype=torch.float64, device="cpu") - receiver64
+    basis_tensor = torch.from_numpy(value)
+    projected = basis_tensor @ (basis_tensor.T @ delta)
+    return (receiver64 + projected).to(device=receiver.device, dtype=receiver.dtype)
+
+
+def build_patch_vectors(
+    receiver: torch.Tensor,
+    donor: torch.Tensor,
+    probe_basis: np.ndarray,
+    *,
+    seed: str,
+) -> PatchVectors:
+    if receiver.ndim != 1 or donor.shape != receiver.shape:
+        raise ValueError("Receiver and donor must be same-shaped one-dimensional residuals")
+    basis = _validated_basis(probe_basis, receiver.numel())
+    hidden, rank = basis.shape
+    if hidden - rank < rank:
+        raise ValueError("Hidden size is too small for a rank-matched orthogonal control")
+    receiver64 = receiver.detach().to(dtype=torch.float64, device="cpu")
+    donor64 = donor.detach().to(dtype=torch.float64, device="cpu")
+    basis_tensor = torch.from_numpy(basis)
+    probe_delta = basis_tensor @ (basis_tensor.T @ (donor64 - receiver64))
+    probe_norm = float(torch.linalg.vector_norm(probe_delta))
+
+    digest = hashlib.sha256(str(seed).encode("utf-8")).digest()
+    rng = np.random.default_rng(int.from_bytes(digest[:8], "big", signed=False))
+    random_basis = None
+    for _ in range(4):
+        candidate = rng.standard_normal((hidden, rank))
+        candidate -= basis @ (basis.T @ candidate)
+        q, r = np.linalg.qr(candidate, mode="reduced")
+        if np.min(np.abs(np.diag(r))) > 1e-10:
+            random_basis = q
+            break
+    if random_basis is None:
+        raise RuntimeError("Could not construct the deterministic orthogonal control basis")
+    random_basis_tensor = torch.from_numpy(random_basis)
+    random_delta = random_basis_tensor @ (random_basis_tensor.T @ (donor64 - receiver64))
+    random_norm = float(torch.linalg.vector_norm(random_delta))
+    if probe_norm == 0:
+        random_delta.zero_()
+    elif random_norm > 0:
+        random_delta *= probe_norm / random_norm
+    else:
+        random_delta = random_basis_tensor[:, 0] * probe_norm
+
+    def restore(value: torch.Tensor) -> torch.Tensor:
+        return value.to(device=receiver.device, dtype=receiver.dtype)
+
+    return PatchVectors(
+        probe=restore(receiver64 + probe_delta),
+        full=donor.detach().to(device=receiver.device, dtype=receiver.dtype).clone(),
+        random=restore(receiver64 + random_delta),
+        identity=receiver.detach().clone(),
+    )
+
+
+def patch_target_labels(donor: object, receiver: object) -> PatchTargets:
+    donor_label = str(donor["raw_predicted_label"])
+    donor_coordinates = winner_coordinates(
+        label=donor_label,
+        labels_by_position=donor["labels_by_position"],
+        content_ids_by_position=donor["content_ids_by_position"],
+    )
+    receiver_labels = [
+        str(value)
+        for value in _sequence(receiver["labels_by_position"], name="labels_by_position")
+    ]
+    receiver_contents = [
+        int(value)
+        for value in _sequence(
+            receiver["content_ids_by_position"], name="content_ids_by_position"
+        )
+    ]
+    # Reuse the coordinate validator instead of trusting separately stored mappings.
+    winner_coordinates(
+        label="A",
+        labels_by_position=receiver_labels,
+        content_ids_by_position=receiver_contents,
+    )
+    receiver_position = receiver_contents.index(donor_coordinates.content_id)
+    return PatchTargets(
+        donor_content_id=donor_coordinates.content_id,
+        receiver_content_label=receiver_labels[receiver_position],
+        donor_symbol_label=donor_label,
+    )
+
+
+def target_margin(scores: dict[str, float], target_label: str) -> float:
+    if set(scores) != set(LABELS):
+        raise ValueError("Expected scores for exactly A, B, C, D")
+    if target_label not in LABELS:
+        raise ValueError(f"Unknown target label: {target_label!r}")
+    values = {label: float(scores[label]) for label in LABELS}
+    if any(not math.isfinite(value) for value in values.values()):
+        raise ValueError("Target-margin scores must be finite")
+    return values[target_label] - max(
+        value for label, value in values.items() if label != target_label
+    )
+
+
 def fit_probe_bank(
     activations: np.ndarray | torch.Tensor,
     targets: Sequence[int],
