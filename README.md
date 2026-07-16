@@ -107,6 +107,34 @@ and design-identity bound, atomically sharded, signal-safe, resumable, and local
 checksum-verified before teardown. The paid-run gates and commands are in
 `CAUSAL_FOLLOWUP_RUN_CARD.md`.
 
+### Decision-binding mechanism (locally prepared; GPU proof pending)
+
+The next experiment asks where the model represents the winning answer content
+and where it binds that content to the displayed A-D label. It trains linear
+readouts on all layers, freezes layer choices on validation data, and tests
+probe-subspace and residual-stream patches against identity and norm-matched
+random controls. Content, physical position, and displayed label remain separate
+coordinates throughout; test data cannot select layers or tune the mechanism.
+
+Authenticated discovery bundles for all three models are under
+`artifacts/decision_binding/discovery/`. A run refuses altered causal scores,
+mixed model identities, legacy bundles without scored-source attestation, and a
+limited canary presented as a complete discovery run. The first paid step is an
+eight-item functional run per model; it deliberately includes the longest
+selected tokenized prompt and must be fetched and verified before any full run.
+
+```bash
+scripts/control_decision_binding_gpu.sh start mistral functional \
+  artifacts/decision_binding/discovery/mistral-7b-instruct-v0.3
+scripts/control_decision_binding_gpu.sh status mistral
+scripts/control_decision_binding_gpu.sh stop mistral
+```
+
+The exact prepare, discovery, confirmation, resume, fetch, verification, and
+teardown contract is in `DECISION_BINDING_RUN_CARD.md`. Confirmation is prepared
+only after discovery is complete and frozen, and then uses all 599 held-out test
+items without changing the frozen layer/mechanism specification.
+
 ### Legacy Qwen run
 
 On a GPU host, run the focused paper pipeline:
