@@ -18,10 +18,12 @@ from interface_formatting_study.decision_binding import (
     fit_probe_bank,
     load_probe_bank,
     patch_target_labels,
+    prepare_patch_pair_ledger,
     prepare_readout_ledger,
     probe_subspace_basis,
     projected_replacement,
     resolve_readout_checkpoints,
+    run_patch_pair,
     save_probe_bank,
     select_readout_layers,
     target_margin,
@@ -527,3 +529,149 @@ def test_patch_targets_and_target_margin_fail_closed_on_invalid_inputs():
     scores = {"A": 0.0, "B": 3.0, "C": 1.0, "D": -1.0}
     assert target_margin(scores, "B") == pytest.approx(2.0)
     assert target_margin(scores, "A") == pytest.approx(-3.0)
+
+
+def _set_variant_winner_content(frame: pd.DataFrame, variant: int, content_id: int) -> None:
+    index = frame.index[frame["variant"] == variant].item()
+    contents = list(frame.at[index, "content_ids_by_position"])
+    labels = list(frame.at[index, "labels_by_position"])
+    position = contents.index(content_id)
+    label = labels[position]
+    frame.at[index, "raw_predicted_label"] = label
+    frame.at[index, "raw_predicted_position"] = position
+    frame.at[index, "raw_predicted_content_id"] = content_id
+
+
+def test_patch_pair_ledger_keeps_every_candidate_and_selects_conflicts_and_controls():
+    scored, applicability = _scored_block(
+        item_id="validation-1", split="validation", wrapper="json_object"
+    )
+    _set_variant_winner_content(scored, variant=1, content_id=1)  # stable position control
+    _set_variant_winner_content(scored, variant=4, content_id=1)  # content-stable label remap
+    readout = prepare_readout_ledger(scored, applicability, stage="discovery")
+
+    pairs = prepare_patch_pair_ledger(
+        readout,
+        split="validation",
+        stable_control_count=1,
+        label_binding_control_count=1,
+        seed="fixed",
+    )
+
+    assert len(pairs) == 6
+    assert pairs["pair_work_key"].is_unique
+    assert (pairs["donor_work_key"] == "letter|validation-1|json_object|0").all()
+    assert set(pairs.loc[pairs["selected_for_patching"], "pair_kind"]) == {
+        "answer_conflict",
+        "stable_control",
+        "label_binding_control",
+    }
+    assert len(pairs[(pairs["pair_kind"] == "answer_conflict") & pairs["selected_for_patching"]]) == 2
+    stable = pairs[pairs["pair_kind"] == "stable_control"].iloc[0]
+    assert stable["manipulation"] == "position_only"
+    binding = pairs[pairs["pair_kind"] == "label_binding_control"].iloc[0]
+    assert binding["receiver_content_target_label"] == binding["receiver_raw_predicted_label"]
+    assert binding["receiver_content_target_label"] != binding["donor_symbol_target_label"]
+
+
+def test_patch_pair_ledger_marks_ties_and_unselected_rows_instead_of_dropping_them():
+    scored, applicability = _scored_block(item_id="validation-1", split="validation")
+    scored.loc[scored["variant"] == 2, "raw_tie"] = True
+    _set_variant_winner_content(scored, variant=1, content_id=1)
+    _set_variant_winner_content(scored, variant=3, content_id=1)
+    readout = prepare_readout_ledger(scored, applicability, stage="discovery")
+
+    pairs = prepare_patch_pair_ledger(
+        readout,
+        split="validation",
+        stable_control_count=1,
+        label_binding_control_count=0,
+    )
+
+    assert len(pairs) == 6
+    tied = pairs[pairs["receiver_work_key"].str.endswith("|2")].iloc[0]
+    assert tied["pair_kind"] == "not_applicable_raw_tie"
+    assert not bool(tied["selected_for_patching"])
+    assert (pairs["pair_kind"] == "not_selected_stable").any()
+
+    duplicate = pd.concat([readout, readout.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match="duplicate readout work keys"):
+        prepare_patch_pair_ledger(duplicate, split="validation")
+
+
+def test_patch_pair_runs_all_prespecified_conditions_and_identity_matches_unpatched(
+    tiny_hook_model,
+):
+    tokenizer = CharacterOffsetTokenizer()
+    donor_prompt = "A)a B)b C)c D)d" + _SUFFIX
+    receiver_prompt = "C)d A)a D)c B)b" + _SUFFIX
+    pair = {
+        "pair_work_key": "pair|donor|receiver",
+        "item_id": "validation-1",
+        "subject": "toy",
+        "split": "validation",
+        "wrapper_name": "plain",
+        "manipulation": "label_only",
+        "variant": 4,
+        "pair_kind": "answer_conflict",
+        "selected_for_patching": True,
+        "donor_work_key": "donor",
+        "receiver_work_key": "receiver",
+        "donor_prompt": donor_prompt,
+        "receiver_prompt": receiver_prompt,
+        "donor_prompt_sha256": hashlib.sha256(donor_prompt.encode()).hexdigest(),
+        "receiver_prompt_sha256": hashlib.sha256(receiver_prompt.encode()).hexdigest(),
+        "donor_labels_by_position": ["A", "B", "C", "D"],
+        "receiver_labels_by_position": ["C", "A", "D", "B"],
+        "donor_content_ids_by_position": [0, 1, 2, 3],
+        "receiver_content_ids_by_position": [3, 0, 2, 1],
+        "donor_raw_predicted_label": "B",
+        "receiver_raw_predicted_label": "D",
+        "donor_raw_predicted_content_id": 1,
+        "receiver_raw_predicted_content_id": 2,
+        "correct_content_id": 1,
+        "receiver_content_target_label": "B",
+        "donor_symbol_target_label": "B",
+        "raw_tie": False,
+        **{f"receiver_bias_score_{label}": 0.0 for label in "ABCD"},
+    }
+    weights = np.zeros((2, 2, 4, 3), dtype=np.float64)
+    weights[:, :, :, :] = np.asarray(
+        [[-1.0, 0.0, 0.0], [-0.3, 0.0, 0.0], [0.3, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    )
+    bank = ProbeBank(
+        weights=weights,
+        intercepts=np.zeros((2, 2, 4)),
+        means=np.zeros((2, 2, 3)),
+        classes=np.arange(4),
+        c=1e-2,
+    )
+    frozen = {
+        "content": {
+            "usable": True,
+            "checkpoint": "format_end",
+            "patch_layers": [0],
+        },
+        "label": {
+            "usable": True,
+            "checkpoint": "answer_prefix_end",
+            "patch_layers": [1],
+        },
+    }
+
+    rows = run_patch_pair(tiny_hook_model, tokenizer, pair, bank, frozen)
+
+    assert len(rows) == 10
+    assert set(rows["mechanism"]) == {"content", "label"}
+    assert set(rows["condition"]) == {"unpatched", "identity", "probe", "full", "random"}
+    for _, group in rows.groupby("mechanism"):
+        unpatched = group[group["condition"] == "unpatched"].iloc[0]
+        identity = group[group["condition"] == "identity"].iloc[0]
+        for label in "ABCD":
+            assert identity[f"raw_score_{label}"] == pytest.approx(unpatched[f"raw_score_{label}"])
+        assert identity["intervention_norm"] == pytest.approx(0.0)
+        assert group[group["condition"] == "probe"]["intervention_norm"].iloc[0] == pytest.approx(
+            group[group["condition"] == "random"]["intervention_norm"].iloc[0]
+        )
+    assert rows["content_target_margin"].notna().all()
+    assert rows["symbol_target_margin"].notna().all()

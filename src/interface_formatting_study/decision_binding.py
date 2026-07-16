@@ -6,13 +6,15 @@ import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 import torch
 
 from .hooks import find_transformer_blocks
+from .interventions import score_prompt_with_optional_edit
+from .patching import score_layers_with_position_replacements
 from .scoring import single_token_label_ids, tokenize_text
 
 
@@ -679,6 +681,303 @@ def target_margin(scores: dict[str, float], target_label: str) -> float:
     return values[target_label] - max(
         value for label, value in values.items() if label != target_label
     )
+
+
+def prepare_patch_pair_ledger(
+    readout_ledger: pd.DataFrame,
+    *,
+    split: Literal["validation", "test"],
+    stable_control_count: int = 96,
+    label_binding_control_count: int = 96,
+    seed: str = "decision-binding-v1",
+) -> pd.DataFrame:
+    if split not in {"validation", "test"}:
+        raise ValueError("Patch-pair split must be validation or test")
+    if stable_control_count < 0 or label_binding_control_count < 0:
+        raise ValueError("Control counts must be non-negative")
+    required = {
+        "readout_work_key",
+        "work_key",
+        "item_id",
+        "subject",
+        "split",
+        "wrapper_name",
+        "manipulation",
+        "variant",
+        "prompt",
+        "prompt_sha256",
+        "labels_by_position",
+        "content_ids_by_position",
+        "correct_content_id",
+        "raw_predicted_label",
+        "winner_content_id",
+        "raw_tie",
+        *_SCORE_COLUMNS,
+    }
+    missing = required - set(readout_ledger.columns)
+    if missing:
+        raise ValueError(f"Readout ledger is missing patch columns: {sorted(missing)}")
+    if readout_ledger["readout_work_key"].duplicated().any():
+        raise ValueError("Readout ledger contains duplicate readout work keys")
+    source = readout_ledger[readout_ledger["split"].astype(str) == split].copy()
+    if source.empty:
+        raise ValueError(f"Readout ledger has no {split} rows")
+
+    records: list[dict[str, object]] = []
+    block_columns = ["item_id", "wrapper_name", "split"]
+    for block_key, block in source.groupby(block_columns, sort=False):
+        baseline = block[block["manipulation"] == "controlled_baseline"]
+        if len(baseline) != 1:
+            raise ValueError(f"Patch block {block_key} requires exactly one baseline")
+        donor = baseline.iloc[0]
+        variants = block[block["manipulation"].isin(["position_only", "label_only"])]
+        for _, receiver in variants.iterrows():
+            targets = patch_target_labels(donor, receiver)
+            raw_tie = bool(donor["raw_tie"]) or bool(receiver["raw_tie"])
+            content_stable = int(donor["winner_content_id"]) == int(
+                receiver["winner_content_id"]
+            )
+            label_remapped = str(donor["raw_predicted_label"]) != str(
+                receiver["raw_predicted_label"]
+            )
+            if raw_tie:
+                candidate_kind = "not_applicable_raw_tie"
+            elif not content_stable:
+                candidate_kind = "answer_conflict"
+            elif str(receiver["manipulation"]) == "label_only" and label_remapped:
+                candidate_kind = "label_binding_candidate"
+            else:
+                candidate_kind = "stable_candidate"
+            record: dict[str, object] = {
+                "pair_work_key": f"pair|{donor['work_key']}|{receiver['work_key']}",
+                "item_id": donor["item_id"],
+                "subject": donor["subject"],
+                "split": split,
+                "wrapper_name": donor["wrapper_name"],
+                "manipulation": receiver["manipulation"],
+                "variant": int(receiver["variant"]),
+                "pair_kind": candidate_kind,
+                "selected_for_patching": candidate_kind == "answer_conflict",
+                "donor_work_key": donor["work_key"],
+                "receiver_work_key": receiver["work_key"],
+                "donor_prompt": donor["prompt"],
+                "receiver_prompt": receiver["prompt"],
+                "donor_prompt_sha256": donor["prompt_sha256"],
+                "receiver_prompt_sha256": receiver["prompt_sha256"],
+                "donor_labels_by_position": donor["labels_by_position"],
+                "receiver_labels_by_position": receiver["labels_by_position"],
+                "donor_content_ids_by_position": donor["content_ids_by_position"],
+                "receiver_content_ids_by_position": receiver["content_ids_by_position"],
+                "donor_raw_predicted_label": donor["raw_predicted_label"],
+                "receiver_raw_predicted_label": receiver["raw_predicted_label"],
+                "donor_raw_predicted_content_id": int(donor["winner_content_id"]),
+                "receiver_raw_predicted_content_id": int(receiver["winner_content_id"]),
+                "correct_content_id": int(donor["correct_content_id"]),
+                "receiver_content_target_label": targets.receiver_content_label,
+                "donor_symbol_target_label": targets.donor_symbol_label,
+                "raw_tie": raw_tie,
+            }
+            for score_column in _SCORE_COLUMNS:
+                record[f"donor_{score_column}"] = float(donor[score_column])
+                record[f"receiver_{score_column}"] = float(receiver[score_column])
+            records.append(record)
+    pairs = pd.DataFrame(records)
+    if pairs.empty:
+        raise ValueError(f"Readout ledger has no patchable variants for {split}")
+    if pairs["pair_work_key"].duplicated().any():
+        raise ValueError("Patch-pair ledger produced duplicate work keys")
+
+    def choose(candidate_kind: str, selected_kind: str, count: int) -> None:
+        candidates = pairs.index[pairs["pair_kind"] == candidate_kind].tolist()
+        ranked = sorted(
+            candidates,
+            key=lambda index: _stable_digest(seed, pairs.at[index, "pair_work_key"]),
+        )
+        chosen = set(ranked[:count])
+        for index in candidates:
+            if index in chosen:
+                pairs.at[index, "pair_kind"] = selected_kind
+                pairs.at[index, "selected_for_patching"] = True
+            else:
+                pairs.at[index, "pair_kind"] = f"not_selected_{selected_kind.removesuffix('_control')}"
+
+    choose("label_binding_candidate", "label_binding_control", label_binding_control_count)
+    choose("stable_candidate", "stable_control", stable_control_count)
+    return pairs.sort_values("pair_work_key", kind="mergesort").reset_index(drop=True)
+
+
+def run_patch_pair(
+    model,
+    tokenizer,
+    pair: Mapping[str, object],
+    bank: ProbeBank,
+    frozen_selection: Mapping[str, Mapping[str, object]],
+    *,
+    device=None,
+) -> pd.DataFrame:
+    if not bool(pair.get("selected_for_patching")):
+        raise ValueError("Patch pair is not selected for patching")
+    donor_prompt = str(pair["donor_prompt"])
+    receiver_prompt = str(pair["receiver_prompt"])
+    for prefix, prompt in (("donor", donor_prompt), ("receiver", receiver_prompt)):
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if str(pair[f"{prefix}_prompt_sha256"]) != digest:
+            raise ValueError(f"{prefix} prompt checksum mismatch")
+    donor = {
+        "raw_predicted_label": pair["donor_raw_predicted_label"],
+        "labels_by_position": pair["donor_labels_by_position"],
+        "content_ids_by_position": pair["donor_content_ids_by_position"],
+    }
+    receiver = {
+        "labels_by_position": pair["receiver_labels_by_position"],
+        "content_ids_by_position": pair["receiver_content_ids_by_position"],
+    }
+    targets = patch_target_labels(donor, receiver)
+    if (
+        targets.receiver_content_label != str(pair["receiver_content_target_label"])
+        or targets.donor_symbol_label != str(pair["donor_symbol_target_label"])
+    ):
+        raise ValueError("Stored patch targets disagree with the structured coordinate mapping")
+    bias_scores = {
+        label: float(pair[f"receiver_bias_score_{label}"])
+        for label in LABELS
+    }
+    captured = capture_layer_readouts(
+        model,
+        tokenizer,
+        [donor_prompt, receiver_prompt],
+        batch_size=2,
+        device=device,
+    )
+    if captured.activations.shape[1] != bank.weights.shape[0]:
+        raise ValueError("Captured model layers do not match the frozen probe bank")
+    unpatched = score_prompt_with_optional_edit(
+        model,
+        tokenizer,
+        receiver_prompt,
+        correct_label=targets.receiver_content_label,
+        bias_scores=bias_scores,
+        device=device,
+    )
+    receiver_checkpoints = resolve_readout_checkpoints(tokenizer, receiver_prompt)
+    checkpoint_positions = {
+        "format_end": receiver_checkpoints.format_end,
+        "answer_prefix_end": receiver_checkpoints.answer_prefix_end,
+    }
+    rows: list[dict[str, object]] = []
+
+    def result_row(
+        *,
+        mechanism: str,
+        checkpoint: str,
+        layer: int,
+        condition: str,
+        scored: Mapping[str, object],
+        intervention_norm: float,
+        probe_rank: int,
+    ) -> dict[str, object]:
+        raw_scores = {label: float(scored[f"raw_score_{label}"]) for label in LABELS}
+        cal_scores = {label: float(scored[f"cal_score_{label}"]) for label in LABELS}
+        record: dict[str, object] = {
+            "pair_work_key": pair["pair_work_key"],
+            "item_id": pair["item_id"],
+            "subject": pair["subject"],
+            "split": pair["split"],
+            "wrapper_name": pair["wrapper_name"],
+            "manipulation": pair["manipulation"],
+            "variant": int(pair["variant"]),
+            "pair_kind": pair["pair_kind"],
+            "donor_work_key": pair["donor_work_key"],
+            "receiver_work_key": pair["receiver_work_key"],
+            "mechanism": mechanism,
+            "checkpoint": checkpoint,
+            "layer": int(layer),
+            "condition": condition,
+            "probe_rank": int(probe_rank),
+            "intervention_norm": float(intervention_norm),
+            "content_target_label": targets.receiver_content_label,
+            "symbol_target_label": targets.donor_symbol_label,
+            "content_target_margin": target_margin(raw_scores, targets.receiver_content_label),
+            "symbol_target_margin": target_margin(raw_scores, targets.donor_symbol_label),
+            "cal_content_target_margin": target_margin(cal_scores, targets.receiver_content_label),
+            "cal_symbol_target_margin": target_margin(cal_scores, targets.donor_symbol_label),
+            "raw_predicted_label": scored["raw_pred_label"],
+            "cal_predicted_label": scored["cal_pred_label"],
+        }
+        for label in LABELS:
+            record[f"raw_score_{label}"] = raw_scores[label]
+            record[f"cal_score_{label}"] = cal_scores[label]
+        return record
+
+    for mechanism in ("content", "label"):
+        if mechanism not in frozen_selection:
+            raise ValueError(f"Frozen selection is missing {mechanism}")
+        specification = frozen_selection[mechanism]
+        if not bool(specification.get("usable")):
+            raise ValueError(f"Frozen {mechanism} readout is not usable for causal patching")
+        checkpoint = str(specification["checkpoint"])
+        if checkpoint not in checkpoint_positions:
+            raise ValueError(f"Unknown frozen checkpoint: {checkpoint!r}")
+        layers = sorted({int(layer) for layer in specification["patch_layers"]})
+        if not layers or min(layers) < 0 or max(layers) >= captured.activations.shape[1]:
+            raise ValueError(f"Frozen {mechanism} patch layers are outside the model")
+        replacements: dict[str, dict[int, dict[int, torch.Tensor]]] = {
+            condition: {} for condition in ("probe", "full", "random", "identity")
+        }
+        norms: dict[tuple[int, str], float] = {}
+        ranks: dict[int, int] = {}
+        checkpoint_index = _CHECKPOINT_INDEX[checkpoint]
+        for layer in layers:
+            basis = probe_subspace_basis(bank, layer=layer, checkpoint=checkpoint)
+            ranks[layer] = basis.shape[1]
+            receiver_vector = captured.activations[1, layer, checkpoint_index]
+            donor_vector = captured.activations[0, layer, checkpoint_index]
+            vectors = build_patch_vectors(
+                receiver_vector,
+                donor_vector,
+                basis,
+                seed=f"{pair['pair_work_key']}|{mechanism}|{layer}|{checkpoint}",
+            )
+            for condition in replacements:
+                vector = getattr(vectors, condition)
+                replacements[condition][layer] = {checkpoint_positions[checkpoint]: vector}
+                norms[(layer, condition)] = float(torch.linalg.vector_norm(vector - receiver_vector))
+            rows.append(
+                result_row(
+                    mechanism=mechanism,
+                    checkpoint=checkpoint,
+                    layer=layer,
+                    condition="unpatched",
+                    scored=unpatched,
+                    intervention_norm=0.0,
+                    probe_rank=ranks[layer],
+                )
+            )
+        for condition, replacements_by_layer in replacements.items():
+            scored_layers = score_layers_with_position_replacements(
+                model,
+                tokenizer,
+                receiver_prompt,
+                correct_label=targets.receiver_content_label,
+                bias_scores=bias_scores,
+                replacements_by_layer=replacements_by_layer,
+                device=device,
+            )
+            for layer in layers:
+                rows.append(
+                    result_row(
+                        mechanism=mechanism,
+                        checkpoint=checkpoint,
+                        layer=layer,
+                        condition=condition,
+                        scored=scored_layers[layer],
+                        intervention_norm=norms[(layer, condition)],
+                        probe_rank=ranks[layer],
+                    )
+                )
+    return pd.DataFrame(rows).sort_values(
+        ["mechanism", "layer", "condition"], kind="mergesort"
+    ).reset_index(drop=True)
 
 
 def fit_probe_bank(
