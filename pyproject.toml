@@ -7,7 +7,7 @@ name = "interface-formatting-study"
 version = "0.1.0"
 description = "Diagnostics for interface-formatting effects in multiple-choice language-model evaluation."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.24",
   "pandas>=2.0",

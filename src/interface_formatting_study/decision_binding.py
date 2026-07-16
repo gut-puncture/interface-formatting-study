@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,6 +180,115 @@ _REQUIRED_APPLICABILITY_COLUMNS = {
     "label_applicable",
     "not_applicable_reason",
 }
+
+_CANONICAL_SEMANTIC_COLUMNS = (
+    "item_id",
+    "subject",
+    "split",
+    "wrapper_name",
+    "arm",
+    "variant",
+    "manipulation",
+    "position_shift",
+    "label_shift",
+    "template_scope",
+    "source_prompt_sha256",
+    "prompt",
+    "prompt_sha256",
+    "content_ids_by_position",
+    "labels_by_position",
+    "candidate_texts",
+    "correct_content_id",
+    "correct_position",
+    "correct_label",
+)
+
+
+def _canonical_cell(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        return [_canonical_cell(child) for child in value.tolist()]
+    if isinstance(value, (list, tuple)):
+        return [_canonical_cell(child) for child in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def validate_canonical_sources(
+    scored: pd.DataFrame,
+    applicability: pd.DataFrame,
+    canonical_design: pd.DataFrame,
+    *,
+    stage: Literal["discovery", "confirmation"],
+    expected_items: Mapping[str, int],
+) -> dict[str, int]:
+    """Fail closed unless scored rows exactly preserve the canonical design semantics."""
+    allowed_splits = ("train", "validation") if stage == "discovery" else ("test",)
+    if set(expected_items) != set(allowed_splits):
+        raise ValueError("Expected item denominators do not match the experiment stage")
+    canonical = canonical_design[
+        (canonical_design["arm"] == "letter_intervention")
+        & canonical_design["split"].astype(str).isin(allowed_splits)
+    ].copy()
+    observed = scored[
+        (scored["arm"] == "letter_intervention")
+        & scored["split"].astype(str).isin(allowed_splits)
+    ].copy()
+    for name, frame in (("canonical", canonical), ("scored", observed)):
+        missing = {"work_key", *_CANONICAL_SEMANTIC_COLUMNS} - set(frame.columns)
+        if missing:
+            raise ValueError(f"{name} rows are missing canonical columns: {sorted(missing)}")
+        if frame["work_key"].duplicated().any():
+            raise ValueError(f"{name} rows contain duplicate work keys")
+
+    expected_keys = set(canonical["work_key"].astype(str))
+    observed_keys = set(observed["work_key"].astype(str))
+    if observed_keys != expected_keys:
+        raise ValueError(
+            "Scored rows do not match canonical work keys; "
+            f"missing={sorted(expected_keys - observed_keys)[:3]} "
+            f"extra={sorted(observed_keys - expected_keys)[:3]}"
+        )
+    left = observed.set_index("work_key").loc[sorted(expected_keys)]
+    right = canonical.set_index("work_key").loc[sorted(expected_keys)]
+    mismatches: list[str] = []
+    for column in _CANONICAL_SEMANTIC_COLUMNS:
+        unequal = [
+            key
+            for key, observed_value, canonical_value in zip(
+                left.index,
+                left[column],
+                right[column],
+                strict=True,
+            )
+            if _canonical_cell(observed_value) != _canonical_cell(canonical_value)
+        ]
+        if unequal:
+            mismatches.append(f"{column}:{unequal[0]}")
+    if mismatches:
+        raise ValueError(f"Scored rows differ in canonical semantic columns: {mismatches[:3]}")
+
+    counts = {
+        split: int(canonical.loc[canonical["split"].astype(str) == split, "item_id"].nunique())
+        for split in allowed_splits
+    }
+    if counts != {str(key): int(value) for key, value in expected_items.items()}:
+        raise ValueError(f"Canonical split denominators differ: observed={counts} expected={expected_items}")
+    expected_blocks = {
+        tuple(str(value) for value in row)
+        for row in canonical[["item_id", "wrapper_name", "split"]].drop_duplicates().itertuples(
+            index=False, name=None
+        )
+    }
+    observed_blocks = {
+        tuple(str(value) for value in row)
+        for row in applicability[
+            applicability["split"].astype(str).isin(allowed_splits)
+        ][["item_id", "wrapper_name", "split"]].itertuples(index=False, name=None)
+    }
+    if observed_blocks != expected_blocks:
+        raise ValueError("Applicability rows do not match canonical item/format blocks")
+    return counts
 
 
 def _validate_block(
@@ -390,6 +500,8 @@ class CapturedReadouts:
     batches: int
     actual_tokens: int
     padded_tokens: int
+    input_preparation_seconds: float = 0.0
+    forward_seconds: float = 0.0
 
 
 def capture_layer_readouts(
@@ -401,6 +513,7 @@ def capture_layer_readouts(
     max_batch_tokens: int | None = None,
     device=None,
 ) -> CapturedReadouts:
+    preparation_started = time.monotonic()
     if not prompts or batch_size <= 0:
         raise ValueError("prompts must be non-empty and batch_size must be positive")
     label_ids = single_token_label_ids(tokenizer)
@@ -427,6 +540,7 @@ def capture_layer_readouts(
         current_max = max(current_max, length)
     if current:
         groups.append(current)
+    input_preparation_seconds = time.monotonic() - preparation_started
 
     blocks = find_transformer_blocks(model)
     output_activations: list[torch.Tensor | None] = [None] * len(prompts)
@@ -434,7 +548,9 @@ def capture_layer_readouts(
     device_obj = device or next(model.parameters()).device
     pad_id = int(getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", 0) or 0)
     padded_tokens = 0
+    forward_seconds = 0.0
     for indices in groups:
+        preparation_started = time.monotonic()
         max_len = max(len(encoded[index]) for index in indices)
         input_ids = torch.full((len(indices), max_len), pad_id, dtype=torch.long, device=device_obj)
         attention_mask = torch.zeros_like(input_ids)
@@ -462,8 +578,15 @@ def capture_layer_readouts(
         try:
             for layer, block in enumerate(blocks):
                 handles.append(block.register_forward_hook(make_hook(layer)))
+            input_preparation_seconds += time.monotonic() - preparation_started
+            if device_obj.type == "cuda":
+                torch.cuda.synchronize(device_obj)
+            forward_started = time.monotonic()
             with torch.inference_mode():
                 logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            if device_obj.type == "cuda":
+                torch.cuda.synchronize(device_obj)
+            forward_seconds += time.monotonic() - forward_started
         finally:
             for handle in handles:
                 handle.remove()
@@ -489,6 +612,8 @@ def capture_layer_readouts(
         batches=len(groups),
         actual_tokens=sum(map(len, encoded)),
         padded_tokens=padded_tokens,
+        input_preparation_seconds=input_preparation_seconds,
+        forward_seconds=forward_seconds,
     )
 
 
@@ -711,6 +836,7 @@ def prepare_patch_pair_ledger(
         "correct_content_id",
         "raw_predicted_label",
         "winner_content_id",
+        "text_identity_ambiguous",
         "raw_tie",
         *_SCORE_COLUMNS,
     }
@@ -732,7 +858,10 @@ def prepare_patch_pair_ledger(
         donor = baseline.iloc[0]
         variants = block[block["manipulation"].isin(["position_only", "label_only"])]
         for _, receiver in variants.iterrows():
-            targets = patch_target_labels(donor, receiver)
+            ambiguous_content = bool(donor["text_identity_ambiguous"]) or bool(
+                receiver["text_identity_ambiguous"]
+            )
+            targets = None if ambiguous_content else patch_target_labels(donor, receiver)
             raw_tie = bool(donor["raw_tie"]) or bool(receiver["raw_tie"])
             content_stable = int(donor["winner_content_id"]) == int(
                 receiver["winner_content_id"]
@@ -740,7 +869,9 @@ def prepare_patch_pair_ledger(
             label_remapped = str(donor["raw_predicted_label"]) != str(
                 receiver["raw_predicted_label"]
             )
-            if raw_tie:
+            if ambiguous_content:
+                candidate_kind = "not_applicable_ambiguous_content"
+            elif raw_tie:
                 candidate_kind = "not_applicable_raw_tie"
             elif not content_stable:
                 candidate_kind = "answer_conflict"
@@ -773,8 +904,11 @@ def prepare_patch_pair_ledger(
                 "donor_raw_predicted_content_id": int(donor["winner_content_id"]),
                 "receiver_raw_predicted_content_id": int(receiver["winner_content_id"]),
                 "correct_content_id": int(donor["correct_content_id"]),
-                "receiver_content_target_label": targets.receiver_content_label,
-                "donor_symbol_target_label": targets.donor_symbol_label,
+                "receiver_content_target_label": None
+                if targets is None
+                else targets.receiver_content_label,
+                "donor_symbol_target_label": None if targets is None else targets.donor_symbol_label,
+                "content_identity_evaluable": not ambiguous_content,
                 "raw_tie": raw_tie,
             }
             for score_column in _SCORE_COLUMNS:
@@ -1063,6 +1197,8 @@ def evaluate_probe_bank(
         if column in ledger.columns
     ]
     compact_ledger = ledger.reset_index(drop=True)[compact_columns].copy()
+    if "text_identity_ambiguous" not in compact_ledger:
+        compact_ledger["text_identity_ambiguous"] = False
     frames: list[pd.DataFrame] = []
     checkpoint_names = ("format_end", "answer_prefix_end")
     for layer in range(log_probs.shape[1]):
@@ -1071,7 +1207,14 @@ def evaluate_probe_bank(
             scores = log_probs[:, layer, checkpoint]
             frame["layer"] = layer
             frame["checkpoint"] = checkpoint_name
-            frame["probe_pred_class"] = scores.argmax(axis=1)
+            raw_probe_prediction = scores.argmax(axis=1)
+            evaluable = (
+                frame["winner_unique"].astype(bool)
+                & ~frame["text_identity_ambiguous"].astype(bool)
+            )
+            frame["probe_pred_class"] = pd.array(
+                np.where(evaluable, raw_probe_prediction, np.nan), dtype="Int64"
+            )
             for class_id in range(4):
                 frame[f"probe_log_prob_{class_id}"] = scores[:, class_id]
             targets = {
@@ -1080,8 +1223,11 @@ def evaluate_probe_bank(
                 "label": frame["winner_label_index"].to_numpy(dtype=int),
             }
             for coordinate, target in targets.items():
-                frame[f"{coordinate}_log_prob"] = scores[np.arange(len(frame)), target]
-                frame[f"{coordinate}_correct"] = frame["probe_pred_class"].to_numpy() == target
+                values = scores[np.arange(len(frame)), target]
+                correct = raw_probe_prediction == target
+                frame[f"{coordinate}_evaluable"] = evaluable
+                frame[f"{coordinate}_log_prob"] = np.where(evaluable, values, np.nan)
+                frame[f"{coordinate}_correct"] = np.where(evaluable, correct, np.nan)
             frames.append(frame)
     return pd.concat(frames, ignore_index=True)
 
@@ -1113,7 +1259,15 @@ def _selection_gate(
     with np.errstate(divide="ignore", invalid="ignore"):
         per_item_class = np.where(counts > 0, np.diagonal(prediction_counts, axis1=1, axis2=2) / counts, np.nan)
     draws = rng.integers(0, n_items, size=(bootstrap_samples, n_items))
-    boot = np.nanmean(np.nanmean(per_item_class[draws], axis=1), axis=1)
+    sampled = per_item_class[draws]
+    class_counts = np.sum(~np.isnan(sampled), axis=1)
+    class_means = np.divide(
+        np.nansum(sampled, axis=1),
+        class_counts,
+        out=np.full(class_counts.shape, np.nan, dtype=float),
+        where=class_counts > 0,
+    )
+    boot = np.nanmean(class_means, axis=1)
     null: list[float] = []
     for start in range(0, permutation_samples, 100):
         size = min(100, permutation_samples - start)
@@ -1144,12 +1298,15 @@ def select_readout_layers(
     required = {
         "item_id", "layer", "checkpoint", "probe_pred_class", "winner_content_id",
         "winner_position", "winner_label_index", "content_log_prob", "position_log_prob",
-        "label_log_prob", "winner_unique",
+        "label_log_prob", "winner_unique", "text_identity_ambiguous",
     }
     missing = required - set(evaluated.columns)
     if missing or bootstrap_samples <= 0 or permutation_samples <= 0:
         raise ValueError(f"Invalid layer-selection input; missing={sorted(missing)}")
-    candidates = evaluated[evaluated["winner_unique"].astype(bool)].copy()
+    candidates = evaluated[
+        evaluated["winner_unique"].astype(bool)
+        & ~evaluated["text_identity_ambiguous"].astype(bool)
+    ].copy()
     if "manipulation" in candidates:
         candidates = candidates[candidates["manipulation"] != "controlled_baseline"]
     rng = np.random.default_rng(seed)
@@ -1161,17 +1318,35 @@ def select_readout_layers(
         subset = candidates[candidates["checkpoint"] == checkpoint]
         rows = []
         for layer, group in subset.groupby("layer", sort=True):
+            per_item = group.groupby("item_id", sort=False)[
+                [f"{coordinate}_log_prob" for coordinate in ("content", "position", "label")]
+            ].mean()
             scores = {
-                coordinate: float(group.groupby("item_id", sort=False)[f"{coordinate}_log_prob"].mean().mean())
+                coordinate: float(per_item[f"{coordinate}_log_prob"].mean())
                 for coordinate in ("content", "position", "label")
             }
-            selectivity = scores[name] - max(value for key, value in scores.items() if key != name)
-            rows.append((selectivity, int(layer), scores))
+            nuisance_columns = [
+                f"{coordinate}_log_prob" for coordinate in ("content", "position", "label")
+                if coordinate != name
+            ]
+            item_selectivity = (
+                per_item[f"{name}_log_prob"] - per_item[nuisance_columns].max(axis=1)
+            ).to_numpy(float)
+            selectivity = float(item_selectivity.mean())
+            selectivity_draws = rng.choice(
+                item_selectivity,
+                size=(bootstrap_samples, len(item_selectivity)),
+                replace=True,
+            ).mean(axis=1)
+            selectivity_lower = float(np.quantile(selectivity_draws, 0.025))
+            rows.append((selectivity, selectivity_lower, int(layer), scores))
         if not rows:
             raise ValueError(f"No usable {checkpoint} rows for layer selection")
-        _, selected_layer, scores = max(rows, key=lambda row: (row[0], -row[1]))
+        selectivity, selectivity_lower, selected_layer, scores = max(
+            rows, key=lambda row: (row[0], -row[2])
+        )
         selected = subset[subset["layer"].astype(int) == selected_layer]
-        observed, lower, null_99, usable = _selection_gate(
+        observed, lower, null_99, accuracy_usable = _selection_gate(
             selected,
             target=target,
             bootstrap_samples=bootstrap_samples,
@@ -1184,11 +1359,12 @@ def select_readout_layers(
             "selected_layer": selected_layer,
             "checkpoint": checkpoint,
             "patch_layers": patch_layers,
-            "selectivity": float(max(rows, key=lambda row: (row[0], -row[1]))[0]),
+            "selectivity": selectivity,
+            "selectivity_bootstrap_lower_95": selectivity_lower,
             "coordinate_scores": scores,
             "macro_accuracy": observed,
             "bootstrap_lower_95": lower,
             "permutation_99": null_99,
-            "usable": usable,
+            "usable": bool(accuracy_usable and selectivity_lower > 0.0),
         }
     return result

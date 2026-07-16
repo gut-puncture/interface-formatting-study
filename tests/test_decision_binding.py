@@ -27,6 +27,7 @@ from interface_formatting_study.decision_binding import (
     save_probe_bank,
     select_readout_layers,
     target_margin,
+    validate_canonical_sources,
     winner_coordinates,
 )
 
@@ -143,6 +144,7 @@ def _scored_block(
                 "manipulation": assignment.manipulation,
                 "position_shift": assignment.position_shift,
                 "label_shift": assignment.label_shift,
+                "template_scope": "source_prompt_counterfactual",
                 "source_prompt_sha256": "",
                 "prompt": prompt,
                 "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
@@ -150,6 +152,10 @@ def _scored_block(
                 "labels_by_position": list(assignment.labels_by_position),
                 "candidate_texts": candidates,
                 "correct_content_id": 0,
+                "correct_position": list(assignment.content_ids_by_position).index(0),
+                "correct_label": assignment.labels_by_position[
+                    list(assignment.content_ids_by_position).index(0)
+                ],
                 "raw_predicted_label": predicted_label,
                 "raw_predicted_position": predicted_position,
                 "raw_predicted_content_id": predicted_content,
@@ -329,6 +335,43 @@ def test_ledger_rejects_missing_or_extra_interventions_instead_of_silently_dropp
         prepare_readout_ledger(extra, baseline_app, stage="discovery")
 
 
+def test_canonical_source_validation_rejects_missing_items_and_mapping_drift():
+    train, train_app = _scored_block(item_id="train-1", split="train")
+    validation, validation_app = _scored_block(item_id="validation-1", split="validation")
+    canonical = pd.concat([train, validation], ignore_index=True)
+    scored = canonical.copy()
+    applicability = pd.concat([train_app, validation_app], ignore_index=True)
+
+    validate_canonical_sources(
+        scored,
+        applicability,
+        canonical,
+        stage="discovery",
+        expected_items={"train": 1, "validation": 1},
+    )
+
+    with pytest.raises(ValueError, match="canonical work keys"):
+        validate_canonical_sources(
+            scored[scored["item_id"] != "validation-1"],
+            applicability[applicability["item_id"] != "validation-1"],
+            canonical,
+            stage="discovery",
+            expected_items={"train": 1, "validation": 1},
+        )
+
+    changed = scored.copy()
+    index = changed.index[changed["variant"] == 1][0]
+    changed.at[index, "content_ids_by_position"] = [0, 1, 2, 3]
+    with pytest.raises(ValueError, match="canonical semantic columns"):
+        validate_canonical_sources(
+            changed,
+            applicability,
+            canonical,
+            stage="discovery",
+            expected_items={"train": 1, "validation": 1},
+        )
+
+
 def test_batched_capture_matches_transformer_block_outputs_at_both_checkpoints(tiny_hook_model):
     tokenizer = CharacterOffsetTokenizer()
     prompts = ["A) one B) two" + _SUFFIX, "A) red B) blue C) green" + _SUFFIX]
@@ -343,6 +386,8 @@ def test_batched_capture_matches_transformer_block_outputs_at_both_checkpoints(t
 
     assert captured.activations.shape == (2, 2, 2, 3)
     assert captured.raw_log_probs.shape == (2, 4)
+    assert captured.input_preparation_seconds >= 0
+    assert captured.forward_seconds >= 0
     for row, prompt in enumerate(prompts):
         ids = torch.tensor([tokenizer.encode(prompt)])
         outputs = tiny_hook_model(input_ids=ids, output_hidden_states=True)
@@ -450,6 +495,62 @@ def test_layer_selection_marks_decodable_but_weak_probes_unusable():
 
     assert frozen["content"]["usable"] is False
     assert frozen["label"]["usable"] is False
+
+
+def test_layer_selection_requires_target_selectivity_not_only_decodability():
+    rows = []
+    for item in range(32):
+        content = item % 4
+        label = content if item % 2 == 0 else (content + 1) % 4
+        for checkpoint in ("format_end", "answer_prefix_end"):
+            rows.append(
+                {
+                    "item_id": f"item-{item}",
+                    "layer": 0,
+                    "checkpoint": checkpoint,
+                    "probe_pred_class": label,
+                    "winner_content_id": content,
+                    "winner_position": (content + 2) % 4,
+                    "winner_label_index": label,
+                    "content_log_prob": -4.0,
+                    "position_log_prob": -3.0,
+                    "label_log_prob": 0.0,
+                    "winner_unique": True,
+                    "text_identity_ambiguous": False,
+                    "manipulation": "label_only" if item % 2 else "position_only",
+                }
+            )
+    frozen = select_readout_layers(
+        pd.DataFrame(rows), bootstrap_samples=200, permutation_samples=200, seed=3
+    )
+
+    assert frozen["content"]["macro_accuracy"] == pytest.approx(0.5)
+    assert frozen["content"]["selectivity"] < 0
+    assert frozen["content"]["usable"] is False
+    assert frozen["label"]["usable"] is True
+
+
+def test_duplicate_answer_text_is_retained_but_never_forced_into_content_inference():
+    _, _, validation, ledger = _probe_fixture()
+    ledger["text_identity_ambiguous"] = False
+    ledger.loc[0, "text_identity_ambiguous"] = True
+    bank = ProbeBank(
+        weights=np.zeros((3, 2, 4, 6)),
+        intercepts=np.zeros((3, 2, 4)),
+        means=np.zeros((3, 2, 6)),
+        classes=np.arange(4),
+        c=1e-2,
+    )
+
+    evaluated = evaluate_probe_bank(bank, validation, ledger)
+    ambiguous = evaluated[evaluated["readout_work_key"] == "validation|0"]
+
+    assert len(ambiguous) == 6
+    assert not ambiguous["content_evaluable"].any()
+    assert ambiguous["probe_pred_class"].isna().all()
+    assert ambiguous["content_log_prob"].isna().all()
+    assert ambiguous["content_correct"].isna().all()
+    assert ambiguous["position_log_prob"].isna().all()
 
 
 def test_probe_subspace_is_class_centered_orthonormal_and_rank_at_most_three():
@@ -601,6 +702,20 @@ def test_patch_pair_ledger_marks_ties_and_unselected_rows_instead_of_dropping_th
     duplicate = pd.concat([readout, readout.iloc[[0]]], ignore_index=True)
     with pytest.raises(ValueError, match="duplicate readout work keys"):
         prepare_patch_pair_ledger(duplicate, split="validation")
+
+
+def test_patch_pair_ledger_retains_ambiguous_text_items_but_never_selects_them():
+    scored, applicability = _scored_block(
+        item_id="validation-duplicate", split="validation", duplicate_text=True
+    )
+    _set_variant_winner_content(scored, variant=1, content_id=1)
+    ledger = prepare_readout_ledger(scored, applicability, stage="discovery")
+
+    pairs = prepare_patch_pair_ledger(ledger, split="validation")
+
+    assert len(pairs) == 6
+    assert not pairs["selected_for_patching"].any()
+    assert set(pairs["pair_kind"]) == {"not_applicable_ambiguous_content"}
 
 
 def test_patch_pair_runs_all_prespecified_conditions_and_identity_matches_unpatched(

@@ -19,6 +19,7 @@ MODE_FILE="$STATE_DIR/${PROFILE}.mode"
 ARGS_FILE="$STATE_DIR/${PROFILE}.args"
 if [[ -z "$MODE" && -f "$MODE_FILE" ]]; then MODE="$(cat "$MODE_FILE")"; fi
 MODE="${MODE:-full}"
+[[ "$MODE" =~ ^(functional|full)$ ]] || { echo "invalid mode" >&2; exit 2; }
 LOG_FILE="$STATE_DIR/${PROFILE}-${MODE}.log"
 LOCK_FILE="$STATE_DIR/${PROFILE}.lock"
 
@@ -26,7 +27,24 @@ running_pid() {
   [[ -f "$PID_FILE" ]] || return 1
   local pid
   pid="$(cat "$PID_FILE")"
-  kill -0 "$pid" 2>/dev/null || return 1
+  if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PID_FILE"
+    return 1
+  fi
+  local command
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  local expected_bundle=""
+  [[ ! -f "$ARGS_FILE" ]] || expected_bundle="$(sed -n '1p' "$ARGS_FILE")"
+  local owned=false
+  if [[ "$command" == *"run_decision_binding_gpu.sh"* && "$command" == *"$PROFILE $MODE $expected_bundle"* ]]; then
+    owned=true
+  elif [[ "$command" == *"decision_binding_cli"* && "$command" == *"--profile $PROFILE"* && "$command" == *"--bundle $expected_bundle"* ]]; then
+    owned=true
+  fi
+  if [[ "$owned" != true ]]; then
+    rm -f "$PID_FILE"
+    return 1
+  fi
   printf '%s' "$pid"
 }
 

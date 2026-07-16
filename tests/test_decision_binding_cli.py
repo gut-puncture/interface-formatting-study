@@ -23,6 +23,8 @@ def test_parser_exposes_only_the_three_focused_commands():
             "scores.parquet",
             "--applicability",
             "app.parquet",
+            "--design",
+            "design.parquet",
             "--stage",
             "discovery",
             "--output-dir",
@@ -42,8 +44,10 @@ def test_parser_exposes_only_the_three_focused_commands():
 def test_prepare_writes_checksum_bound_compact_bundle(tmp_path, monkeypatch):
     scored_path = tmp_path / "scored.parquet"
     applicability_path = tmp_path / "app.parquet"
+    design_path = tmp_path / "design.parquet"
     pd.DataFrame({"source": [1]}).to_parquet(scored_path, index=False)
     pd.DataFrame({"source": [2]}).to_parquet(applicability_path, index=False)
+    pd.DataFrame({"source": [3]}).to_parquet(design_path, index=False)
     readout = pd.DataFrame(
         {
             "readout_work_key": ["discovery|baseline", "discovery|variant"],
@@ -61,10 +65,12 @@ def test_prepare_writes_checksum_bound_compact_bundle(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(decision_binding_cli, "prepare_readout_ledger", lambda *_a, **_k: readout)
     monkeypatch.setattr(decision_binding_cli, "prepare_patch_pair_ledger", lambda *_a, **_k: pairs)
+    monkeypatch.setattr(decision_binding_cli, "_validate_prepare_sources", lambda *_a, **_k: {})
     output = tmp_path / "bundle"
     args = SimpleNamespace(
         scored=str(scored_path),
         applicability=str(applicability_path),
+        design=str(design_path),
         stage="discovery",
         output_dir=str(output),
         seed="fixed",
@@ -76,16 +82,41 @@ def test_prepare_writes_checksum_bound_compact_bundle(tmp_path, monkeypatch):
 
     manifest = json.loads((output / "bundle_manifest.json").read_text())
     assert manifest["stage"] == "discovery"
+    assert manifest["bundle_schema_version"] == 2
     assert manifest["source_scored_sha256"] == sha256_file(scored_path)
+    assert manifest["source_design_sha256"] == sha256_file(design_path)
     assert manifest["readout"]["rows"] == 2
     assert manifest["readout"]["sha256"] == sha256_file(output / "readout_ledger.parquet")
     assert manifest["pairs"]["selected_rows"] == 1
     assert manifest["pairs"]["sha256"] == sha256_file(output / "patch_pair_ledger.parquet")
 
 
+def test_run_refuses_a_legacy_bundle_without_canonical_source_attestation(tmp_path):
+    root = tmp_path / "bundle"
+    root.mkdir()
+    readout = root / "readout_ledger.parquet"
+    pairs = root / "patch_pair_ledger.parquet"
+    pd.DataFrame({"readout_work_key": ["x"]}).to_parquet(readout, index=False)
+    pd.DataFrame({"pair_work_key": ["p"]}).to_parquet(pairs, index=False)
+    (root / "bundle_manifest.json").write_text(json.dumps({
+        "bundle_schema_version": 1,
+        "stage": "discovery",
+        "readout": {"rows": 1, "sha256": sha256_file(readout)},
+        "pairs": {"rows": 1, "sha256": sha256_file(pairs)},
+    }))
+
+    with pytest.raises(RuntimeError, match="canonical source attestation"):
+        decision_binding_cli._load_bundle(root)
+
+
 def test_analysis_uses_within_pair_differences_not_unpaired_means(tmp_path):
     run_root = tmp_path / "run"
     run_root.mkdir()
+    identity = {"semantic_run_id": "run", "model": {"slug": "toy-model"}}
+    (run_root / "semantic_identity.json").write_text(json.dumps(identity))
+    (run_root / "run_manifest.json").write_text(json.dumps({
+        "status": "complete", "stage": "discovery", "semantic_identity": identity
+    }))
     rows = []
     for item, pair, baseline, effect in (
         ("item-1", "p1", 100.0, 2.0),
@@ -96,6 +127,7 @@ def test_analysis_uses_within_pair_differences_not_unpaired_means(tmp_path):
             rows.append(
                 {
                     "item_id": item,
+                    "split": "validation",
                     "pair_work_key": pair,
                     "mechanism": "content",
                     "layer": 3,
@@ -116,6 +148,93 @@ def test_analysis_uses_within_pair_differences_not_unpaired_means(tmp_path):
     assert probe["mean_content_margin_change"] == 6.5
     assert probe["pairs"] == 3
     assert probe["items"] == 2
+
+
+def test_analysis_keeps_discovery_and_confirmation_separate_and_reports_frozen_test_readout(
+    tmp_path,
+):
+    roots = []
+    for stage, split in (("discovery", "validation"), ("confirmation", "test")):
+        root = tmp_path / "qwen2.5-1.5b-instruct" / f"{stage}-run"
+        root.mkdir(parents=True)
+        identity = {"semantic_run_id": f"{stage}-run", "model": {"slug": "qwen2.5-1.5b-instruct"}}
+        (root / "semantic_identity.json").write_text(json.dumps(identity))
+        (root / "run_manifest.json").write_text(json.dumps({
+            "status": "complete", "stage": stage, "semantic_identity": identity
+        }))
+        pd.DataFrame([
+            {
+                "item_id": "item-1", "split": split, "pair_work_key": "pair-1",
+                "mechanism": "content", "layer": 1, "pair_kind": "answer_conflict",
+                "condition": condition, "content_target_margin": value,
+                "symbol_target_margin": value,
+            }
+            for condition, value in (("unpatched", 0.0), ("probe", 1.0))
+        ]).to_parquet(root / "patch_results.parquet", index=False)
+        pd.DataFrame([
+            {
+                "readout_work_key": "row-1", "item_id": "item-1", "split": split,
+                "layer": 1, "checkpoint": checkpoint, "probe_pred_class": 0,
+                "winner_content_id": 0, "winner_position": 1, "winner_label_index": 2,
+                "winner_unique": True, "text_identity_ambiguous": False,
+                "content_log_prob": -0.1, "position_log_prob": -2.0, "label_log_prob": -3.0,
+            }
+            for checkpoint in ("format_end", "answer_prefix_end")
+        ]).to_parquet(root / "readout_scores.parquet", index=False)
+        (root / "frozen_selection.json").write_text(json.dumps({
+            "selection": {
+                "content": {"selected_layer": 1, "checkpoint": "format_end"},
+                "label": {"selected_layer": 1, "checkpoint": "answer_prefix_end"},
+            }
+        }))
+        roots.append(str(root))
+    output = tmp_path / "analysis"
+
+    decision_binding_cli.cmd_analyze(SimpleNamespace(
+        run=roots, output_dir=str(output), bootstrap_samples=50, seed=4
+    ))
+
+    patch = pd.read_csv(output / "patch_effects.csv")
+    assert set(patch["stage"]) == {"discovery", "confirmation"}
+    assert len(patch[patch["condition"] == "probe"]) == 2
+    readout = pd.read_csv(output / "readout_confirmation.csv")
+    assert set(readout["stage"]) == {"confirmation"}
+    assert readout.iloc[0]["split"] == "test"
+
+
+def test_canary_selection_uses_eight_distinct_items_and_is_deterministic():
+    pairs = pd.DataFrame(
+        {
+            "item_id": [f"item-{index}" for index in range(12) for _ in range(2)],
+            "subject": [f"subject-{index % 3}" for index in range(12) for _ in range(2)],
+            "wrapper_name": [f"wrapper-{index % 4}" for index in range(12) for _ in range(2)],
+            "selected_for_patching": True,
+        }
+    )
+
+    first = decision_binding_cli._select_canary_items(pairs, 8, seed=7)
+    second = decision_binding_cli._select_canary_items(pairs, 8, seed=7)
+
+    assert len(first) == 8
+    assert len(set(first)) == 8
+    assert first == second
+
+
+def test_confirmation_macro_accuracy_is_item_equal_before_class_averaging():
+    frame = pd.DataFrame(
+        [
+            *(
+                {"item_id": "item-1", "target": 0, "probe_pred_class": 1}
+                for _ in range(10)
+            ),
+            {"item_id": "item-2", "target": 0, "probe_pred_class": 0},
+            {"item_id": "item-3", "target": 1, "probe_pred_class": 1},
+        ]
+    )
+
+    assert decision_binding_cli._item_clustered_macro_accuracy(frame, "target") == pytest.approx(
+        0.75
+    )
 
 
 def test_run_model_records_loader_failure_in_the_identity_bound_run_root(tmp_path, monkeypatch):
@@ -139,6 +258,15 @@ def test_run_model_records_loader_failure_in_the_identity_bound_run_root(tmp_pat
         decision_binding_cli,
         "load_model_and_tokenizer",
         lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("synthetic load failure")),
+    )
+    monkeypatch.setattr(
+        decision_binding_cli,
+        "_load_bundle",
+        lambda _root: (
+            json.loads((bundle / "bundle_manifest.json").read_text()),
+            pd.read_parquet(readout_path),
+            pd.read_parquet(pairs_path),
+        ),
     )
     output = tmp_path / "runs"
     args = SimpleNamespace(
@@ -169,6 +297,76 @@ def test_run_model_records_loader_failure_in_the_identity_bound_run_root(tmp_pat
     manifest = json.loads(manifests[0].read_text())
     assert manifest["status"] == "failed"
     assert manifest["failure"]["type"] == "RuntimeError"
+    assert manifest["semantic_identity"] == json.loads(
+        (manifests[0].parent / "semantic_identity.json").read_text()
+    )
+
+
+def test_seed_and_readout_chunking_are_bound_to_resume_identity(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    readout_path = bundle / "readout_ledger.parquet"
+    pairs_path = bundle / "patch_pair_ledger.parquet"
+    pd.DataFrame({"readout_work_key": ["x"]}).to_parquet(readout_path, index=False)
+    pd.DataFrame({"pair_work_key": ["p"]}).to_parquet(pairs_path, index=False)
+    (bundle / "bundle_manifest.json").write_text(json.dumps({
+        "stage": "discovery", "model": {"id": None, "revision": None},
+        "readout": {"rows": 1, "sha256": sha256_file(readout_path)},
+        "pairs": {"rows": 1, "sha256": sha256_file(pairs_path)},
+    }))
+    monkeypatch.setattr(
+        decision_binding_cli,
+        "load_model_and_tokenizer",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("stop after identity")),
+    )
+    monkeypatch.setattr(
+        decision_binding_cli,
+        "_load_bundle",
+        lambda _root: (
+            json.loads((bundle / "bundle_manifest.json").read_text()),
+            pd.read_parquet(readout_path),
+            pd.read_parquet(pairs_path),
+        ),
+    )
+    base = dict(
+        bundle=str(bundle), profile="qwen", frozen_run=None, output_base=str(tmp_path / "runs"),
+        bootstrap_samples=10, permutation_samples=10, stable_controls=96,
+        label_binding_controls=96, max_readout_rows=None, max_pairs=None, canary_items=None,
+        local_files_only=True, allow_cpu=True, batch_size=2, max_batch_tokens=200,
+        patch_shard_size=1,
+    )
+    for seed, chunk in ((0, 1), (1, 1), (0, 2)):
+        with pytest.raises(RuntimeError, match="stop after identity"):
+            decision_binding_cli.cmd_run_model(
+                SimpleNamespace(**base, seed=seed, readout_chunk_size=chunk)
+            )
+
+    assert len(list((tmp_path / "runs" / "qwen2.5-1.5b-instruct").iterdir())) == 3
+
+
+def test_frozen_mechanism_requires_a_complete_discovery_run(tmp_path):
+    root = tmp_path / "discovery"
+    root.mkdir()
+    profile = decision_binding_cli.get_model_profile("qwen")
+    identity = {
+        "model": {"id": profile.model_id, "revision": profile.revision},
+        "semantic_run_id": "frozen-id",
+    }
+    (root / "semantic_identity.json").write_text(json.dumps(identity))
+    bank = ProbeBank(
+        weights=np.zeros((1, 2, 4, 2)), intercepts=np.zeros((1, 2, 4)),
+        means=np.zeros((1, 2, 2)), classes=np.arange(4), c=1e-2,
+    )
+    save_probe_bank(root / "probe_bank.npz", bank)
+    (root / "frozen_selection.json").write_text(json.dumps({
+        "probe_bank_sha256": sha256_file(root / "probe_bank.npz"), "selection": {}
+    }))
+    (root / "run_manifest.json").write_text(json.dumps({
+        "status": "interrupted", "stage": "discovery", "semantic_identity": identity
+    }))
+
+    with pytest.raises(RuntimeError, match="complete discovery"):
+        decision_binding_cli._load_frozen(root, "qwen")
 
 
 def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path, monkeypatch):
@@ -210,6 +408,15 @@ def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path
         decision_binding_cli,
         "load_model_and_tokenizer",
         lambda *_a, **_k: (dummy_model, object(), torch.device("cpu")),
+    )
+    monkeypatch.setattr(
+        decision_binding_cli,
+        "_load_bundle",
+        lambda _root: (
+            json.loads((bundle / "bundle_manifest.json").read_text()),
+            pd.read_parquet(readout_path),
+            pd.read_parquet(pairs_path),
+        ),
     )
     bank = ProbeBank(
         weights=np.zeros((1, 2, 4, 2)),
@@ -274,6 +481,8 @@ def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path
     assert manifest["artifacts"]["patch_results_sha256"] == sha256_file(
         root / "patch_results.parquet"
     )
+    assert manifest["telemetry"]["readout"]["padding_ratio"] == pytest.approx(1.0)
+    assert manifest["telemetry"]["patches"]["completed_pairs_per_second"] > 0
     progress = json.loads((root / "progress.json").read_text())
     assert progress["phase"] == "patches"
     assert progress["completed"] == 2

@@ -4,10 +4,10 @@
 
 - Existing path reused: the causal-follow-up model profiles, exact prompt artifacts, token-aware scorer, residual hooks/patcher, semantic identity, atomic shards, and GPU operators.
 - New production code: one focused decision-binding domain module and one thin CLI are necessary because the repository has no all-layer readout, linear-probe, or probe-subspace patch path.
-- Expected scope: after measuring the complete ledger, readout, and causal-patch core, about 1,400-1,650 net production lines plus 650-850 focused test lines; one experiment domain module, one CLI, and narrow operator/analysis additions; 10-14 focused implementation hours. Scientific scope is unchanged; the increase is validation and explicit audit-ledger code, not new features.
+- Expected scope: after the first review exposed missing canonical-source attestation, frozen-test analysis, and artifact completeness proof, about 2,100-2,250 net production lines plus focused tests; still one experiment domain module, one CLI, and narrow operator/analysis additions. Scientific scope is unchanged; the measured increase is fail-closed validation and proof for already approved behavior, not new features.
 - Review: exactly two independent reviewers, one for scientific/data semantics and one for runtime/resume/operator behavior; maximum two review rounds.
 - Final validation: one full local suite after review closes, expected under five minutes; first real GPU proof is one eight-item canary per model after local acceptance and explicit rental approval.
-- Deviation gate: stop and recheck the design before exceeding 1,750 net production lines, fourteen implementation hours, two review rounds, or adding generalized orchestration, persistent hidden-state storage, head/MLP hooks, or new prompt/audit infrastructure.
+- Deviation gate: the first 1,750-line gate triggered and the design was rechecked after review; stop again before exceeding 2,300 net production lines, fourteen implementation hours, two review rounds, or adding generalized orchestration, persistent hidden-state storage, head/MLP hooks, or new prompt/audit infrastructure.
 
 ## Source Truth Read
 

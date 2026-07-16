@@ -8,3 +8,6 @@ huggingface-hub==0.33.4
 safetensors==0.5.3
 tokenizers==0.21.2
 scikit-learn==1.8.0
+scipy==1.17.0
+joblib==1.5.3
+threadpoolctl==3.6.0

@@ -210,14 +210,19 @@ def test_decision_binding_operator_is_thin_resumable_and_fetch_verified():
     control = open("scripts/control_decision_binding_gpu.sh", encoding="utf-8").read()
     fetch = open("scripts/fetch_decision_binding_artifacts.sh", encoding="utf-8").read()
     sync = open("scripts/sync_interface_formatting_study_to_gpu.sh", encoding="utf-8").read()
+    bootstrap = open("scripts/bootstrap_causal_followup_gpu.sh", encoding="utf-8").read()
 
     assert "interface_formatting_study.decision_binding_cli" in run
-    assert 'COMMON+=(--max-pairs "${CANARY_PAIRS:-2}")' in run
+    assert 'COMMON+=(--canary-items "${CANARY_ITEMS:-8}")' in run
     assert "MODE_FILE" in control and 'echo "$MODE" > "$MODE_FILE"' in control
+    assert '[[ "$MODE" =~ ^(functional|full)$ ]]' in control
+    assert 'ps -p "$pid" -o command=' in control
+    assert "expected_bundle" in control and '"--profile $PROFILE"' in control
     assert "stop)" in control and "kill)" in control and "status)" in control
     assert "results/decision_binding_runs" in fetch
     assert "verify_decision_binding_artifacts.py" in fetch
     assert "run_decision_binding_gpu.sh" in sync
+    assert '(3, 11) <= sys.version_info[:2]' in bootstrap
     assert "control_decision_binding_gpu.sh" in sync
     assert 'DECISION_PAIR_PATH="$(dirname "$ACTIVE_DATASET_PATH")/patch_pair_ledger.parquet"' in sync
     assert 'DECISION_MANIFEST_PATH="$(dirname "$ACTIVE_DATASET_PATH")/bundle_manifest.json"' in sync

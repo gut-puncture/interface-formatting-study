@@ -36,7 +36,7 @@ if [[ -n "$FROZEN_RUN" ]]; then
   COMMON+=(--frozen-run "$FROZEN_RUN")
 fi
 if [[ "$MODE" == "functional" ]]; then
-  COMMON+=(--max-pairs "${CANARY_PAIRS:-2}")
+  COMMON+=(--canary-items "${CANARY_ITEMS:-8}")
 fi
 
 exec python -m interface_formatting_study.decision_binding_cli "${COMMON[@]}"

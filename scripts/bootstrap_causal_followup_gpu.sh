@@ -6,7 +6,7 @@ import sys, torch
 assert torch.cuda.is_available(), "Prime image does not expose a CUDA GPU"
 assert torch.cuda.is_bf16_supported(), "GPU does not support BF16"
 assert tuple(map(int, torch.__version__.split("+")[0].split(".")[:2])) == (2, 7), torch.__version__
-assert (3, 10) <= sys.version_info[:2] < (3, 13), sys.version
+assert (3, 11) <= sys.version_info[:2] < (3, 13), sys.version
 print({"torch": torch.__version__, "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(0)})
 PY
 
