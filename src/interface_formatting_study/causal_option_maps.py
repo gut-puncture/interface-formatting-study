@@ -71,9 +71,12 @@ def validate_option_map(parsed: ParsedPrompt, source: str) -> None:
         if sorted(content_ids) != [0, 1, 2, 3]:
             raise ValueError("option representation content IDs are not a permutation")
         spans: list[SourceSpan] = []
-        for slot in representation.slots:
+        for position, slot in enumerate(representation.slots):
             if parsed.separable and not slot.label_spans:
                 raise ValueError("separable option slot has no label span")
+            expected_label = LETTERS[position]
+            if any(span.text(source).upper() != expected_label for span in slot.label_spans):
+                raise ValueError(f"option label span does not contain {expected_label}")
             for candidate in (*slot.label_spans, *slot.payload_spans):
                 _validate_span(source, candidate)
                 spans.append(candidate)

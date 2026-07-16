@@ -7,7 +7,9 @@ import pandas as pd
 import pytest
 
 from interface_formatting_study.causal_option_audit import (
+    build_causal_choice_packets,
     build_causal_option_packets,
+    load_causal_choice_overrides,
     load_causal_option_annotations,
 )
 from interface_formatting_study.causal_option_maps import transform_with_option_map
@@ -54,6 +56,34 @@ def test_packets_are_outcome_blind_bounded_and_source_bound(tmp_path):
     assert row["canonical_choices"] == ["one", "two", "three", "four"]
     assert "correct" not in json.dumps(packet).lower()
     assert "prediction" not in json.dumps(packet).lower()
+
+
+def test_displayed_choice_override_is_source_bound_and_complete(tmp_path):
+    source = _frame().assign(correct_index=1)
+    selected = pd.DataFrame([{"item_id": "item-1", "wrapper_name": "key_equals"}])
+    build_causal_choice_packets(source, selected, tmp_path)
+    prompt = source.iloc[0]["wrapped_prompt"]
+    labels = tmp_path / "labels"
+    labels.mkdir()
+    labels.joinpath("packet-0000.jsonl").write_text(json.dumps({
+        "annotation_id": "item-1::key_equals",
+        "source_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "candidate_texts": ["one", "two", "three", "four"],
+        "correct_position": 1,
+        "confidence": "high",
+        "reason": "The displayed B option is the canonical correct answer.",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
+        "thread_id": "thread-choice",
+    }) + "\n")
+
+    overrides = load_causal_choice_overrides(tmp_path)
+
+    assert overrides[("item-1", "key_equals")]["candidate_texts"] == [
+        "one", "two", "three", "four"
+    ]
+    assert overrides[("item-1", "key_equals")]["correct_position"] == 1
+    assert overrides[("item-1", "key_equals")]["provenance"].endswith("thread-choice")
 
 
 def test_valid_luna_span_map_loads_and_transforms_exact_source(tmp_path):
@@ -105,6 +135,35 @@ def test_annotation_rejects_changed_source_and_fabricated_model_metadata(tmp_pat
     }) + "\n")
 
     with pytest.raises(ValueError, match="source prompt checksum"):
+        load_causal_option_annotations(tmp_path)
+
+
+def test_annotation_rejects_label_spans_that_do_not_slice_the_slot_letter(tmp_path):
+    build_causal_option_packets(_frame(), _applicability(), tmp_path)
+    prompt = _frame().iloc[0]["wrapped_prompt"]
+    slots = []
+    for content_id, (label, payload) in enumerate(zip("ABCD", ("one", "two", "three", "four"))):
+        payload_start = prompt.index(payload)
+        slots.append({
+            "content_id": content_id,
+            "label_spans": [[payload_start - 1, payload_start]],
+            "payload_spans": [[payload_start, payload_start + len(payload)]],
+        })
+    labels = tmp_path / "labels"
+    labels.mkdir()
+    labels.joinpath("bad.jsonl").write_text(json.dumps({
+        "annotation_id": "item-1::key_equals",
+        "source_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "mode": "span_map",
+        "confidence": "high",
+        "reason": "Geometrically valid but semantically wrong spans.",
+        "representations": [{"slots": slots}],
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
+        "thread_id": "thread-bad",
+    }) + "\n")
+
+    with pytest.raises(ValueError, match="label span"):
         load_causal_option_annotations(tmp_path)
 
 

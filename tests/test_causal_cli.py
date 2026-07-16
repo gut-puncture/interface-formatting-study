@@ -86,6 +86,21 @@ def test_load_design_requires_the_checksum_bound_applicability_ledger(tmp_path):
         causal_cli._load_design(path)
 
 
+def test_load_design_rejects_duplicate_applicability_keys(tmp_path):
+    path, _ = _write_design(tmp_path)
+    applicability_path = path.with_name(path.stem + ".applicability.parquet")
+    applicability = pd.read_parquet(applicability_path)
+    applicability.iloc[1] = applicability.iloc[0]
+    applicability.to_parquet(applicability_path, index=False)
+    manifest_path = path.with_name(path.name + ".manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    manifest["applicability"]["sha256"] = sha256_file(applicability_path)
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="unique item-wrapper"):
+        causal_cli._load_design(path)
+
+
 def test_prepare_keeps_all_items_and_records_arm_applicability(tmp_path, monkeypatch):
     source = source_prompt_frame()
     excluded = source.copy()
@@ -103,6 +118,11 @@ def test_prepare_keeps_all_items_and_records_arm_applicability(tmp_path, monkeyp
     (audit / "manifest.json").write_text('{"schema_version":1}\n')
     (audit / "labels" / "annotations.jsonl").write_text('{"annotation_id":"x"}\n')
     monkeypatch.setattr(causal_cli, "load_causal_option_annotations", lambda _path: {})
+    choice_audit = tmp_path / "choice-audit"
+    (choice_audit / "labels").mkdir(parents=True)
+    (choice_audit / "manifest.json").write_text('{"schema_version":1}\n')
+    (choice_audit / "labels" / "choices.jsonl").write_text('{"annotation_id":"y"}\n')
+    monkeypatch.setattr(causal_cli, "load_causal_choice_overrides", lambda _path: {})
 
     causal_cli.cmd_prepare(
         argparse.Namespace(
@@ -110,6 +130,7 @@ def test_prepare_keeps_all_items_and_records_arm_applicability(tmp_path, monkeyp
             splits="train,validation",
             output=str(output),
             option_audit=str(audit),
+            choice_audit=str(choice_audit),
         )
     )
 
@@ -123,6 +144,13 @@ def test_prepare_keeps_all_items_and_records_arm_applicability(tmp_path, monkeyp
         "manifest_sha256": sha256_file(audit / "manifest.json"),
         "label_hashes": {
             "annotations.jsonl": sha256_file(audit / "labels" / "annotations.jsonl")
+        },
+    }
+    assert manifest["choice_audit"] == {
+        "path": str(choice_audit),
+        "manifest_sha256": sha256_file(choice_audit / "manifest.json"),
+        "label_hashes": {
+            "choices.jsonl": sha256_file(choice_audit / "labels" / "choices.jsonl")
         },
     }
     applicability = pd.read_parquet(output.with_name(output.stem + ".applicability.parquet"))
@@ -184,6 +212,18 @@ def test_causal_cli_runs_identity_bound_canary(
         "complete",
     )
     assert result["work_keys"] == len(design)
+
+    manifest["design"]["selected_work_sha256"] = "0" * 64
+    manifests[0].write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="selected work-key"):
+        VERIFY.verify(
+            root,
+            manifest["semantic_identity"]["semantic_run_id"],
+            manifest["model"]["slug"],
+            "complete",
+        )
+    manifest["design"]["selected_work_sha256"] = causal_cli._selected_work_sha(design)
+    manifests[0].write_text(json.dumps(manifest))
 
     shard_data = next((root / "shards" / "causal_behavior").glob("shard-*/data.parquet"))
     shard_data.write_bytes(shard_data.read_bytes() + b"corruption")

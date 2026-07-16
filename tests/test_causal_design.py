@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 
 import pandas as pd
@@ -146,6 +147,32 @@ def test_source_counterfactuals_change_only_the_requested_key_equals_feature():
         "Return only the exact answer text, not its letter.",
     )
     assert block.loc[("answer_text", 0), "correct_text"] == "4"
+
+
+def test_v3_uses_displayed_choice_override_for_reordered_source_prompt():
+    source = _source_frame()
+    prompt = "QUESTION=What is 2+2?\nA=6\nB=3\nC=4\nD=5" + SUFFIX
+    source.loc[source["wrapper_name"] == "key_equals", "wrapped_prompt"] = prompt
+
+    design, _ = build_causal_design_v3(
+        source,
+        choice_overrides={
+            ("item-1", "key_equals"): {
+                "source_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                "candidate_texts": ["6", "3", "4", "5"],
+                "correct_position": 2,
+                "provenance": "gpt-5.6-luna:xhigh:thread-1",
+            }
+        },
+    )
+    block = design[design["wrapper_name"] == "key_equals"].set_index(["arm", "variant"])
+
+    assert block.loc[("letter_intervention", 0), "correct_label"] == "C"
+    assert block.loc[("answer_text", 0), "correct_text"] == "4"
+    assert block.loc[("answer_text", 0), "candidate_texts"] == ["6", "3", "4", "5"]
+    assert block.loc[("letter_intervention", 1), "correct_label"] == "C"
+    assert block.loc[("letter_intervention", 1), "correct_position"] == 3
+    assert block.loc[("letter_intervention", 4), "correct_label"] == "D"
 
 
 def test_source_counterfactuals_support_real_wide_csv_and_graphql_record_shapes():

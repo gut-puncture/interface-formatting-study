@@ -36,6 +36,17 @@ Every object must include annotation_id, source_prompt_sha256, mode, confidence,
 model, reasoning_effort, and thread_id. Do not include chain-of-thought.
 """
 
+CHOICE_INSTRUCTIONS = """Map the exact four displayed answer texts in every source prompt.
+Return exactly one JSON object per row as JSONL. Do not solve the question from knowledge.
+Use the supplied canonical choices and canonical_correct_index only to identify which displayed
+option is the known correct content. candidate_texts must contain only the four answer texts in
+physical A/B/C/D order, with wrapper syntax removed but displayed wording preserved exactly.
+correct_position is 0/1/2/3. If the wrapper is defective, map the closest semantically equivalent
+displayed option and explain the defect briefly. Use gpt-5.6-luna with xhigh reasoning only.
+Every object must include annotation_id, source_prompt_sha256, candidate_texts, correct_position,
+confidence, reason, model, reasoning_effort, and thread_id. Do not include chain-of-thought.
+"""
+
 
 def _canonical_bytes(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -255,3 +266,136 @@ def load_causal_option_annotations(
             raise ValueError(f"Unsupported annotation mode for {annotation_id}: {row.get('mode')}")
         result[(str(source["item_id"]), str(source["wrapper_name"]))] = parsed
     return result
+
+
+def build_causal_choice_packets(
+    frame: pd.DataFrame,
+    selected: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    max_rows: int = 15,
+) -> dict[str, object]:
+    """Build checksum-bound Luna packets for the small defective-prompt subset."""
+
+    if max_rows < 1:
+        raise ValueError("max_rows must be positive")
+    required = {
+        "item_id", "wrapper_name", "question", "choices", "correct_index", "wrapped_prompt"
+    }
+    if missing := required - set(frame.columns):
+        raise ValueError(f"Displayed-choice input is missing columns: {sorted(missing)}")
+    if missing := {"item_id", "wrapper_name"} - set(selected.columns):
+        raise ValueError(f"Displayed-choice selection is missing columns: {sorted(missing)}")
+    source = frame.drop_duplicates(["item_id", "wrapper_name"])
+    joined = selected[["item_id", "wrapper_name"]].drop_duplicates().merge(
+        source, on=["item_id", "wrapper_name"], how="left", validate="one_to_one"
+    )
+    if joined["wrapped_prompt"].isna().any():
+        raise ValueError("Displayed-choice selection contains an unknown item-wrapper key")
+    rows = []
+    for row in joined.to_dict("records"):
+        prompt = str(row["wrapped_prompt"])
+        rows.append({
+            "annotation_id": _annotation_id(row["item_id"], row["wrapper_name"]),
+            "item_id": str(row["item_id"]),
+            "wrapper_name": str(row["wrapper_name"]),
+            "question": str(row["question"]),
+            "canonical_choices": [str(choice) for choice in row["choices"]],
+            "canonical_correct_index": int(row["correct_index"]),
+            "source_prompt": prompt,
+            "source_prompt_sha256": _sha256(prompt.encode()),
+        })
+    rows.sort(key=lambda row: _sha256(str(row["annotation_id"]).encode()))
+    root = Path(output_dir)
+    packets_dir = root / "packets"
+    packets_dir.mkdir(parents=True, exist_ok=True)
+    packet_hashes = {}
+    for index in range(0, len(rows), max_rows):
+        name = f"packet-{index // max_rows:04d}.json"
+        encoded = _canonical_bytes({
+            "schema_version": SCHEMA_VERSION,
+            "audit_kind": "displayed_choices",
+            "instructions": CHOICE_INSTRUCTIONS,
+            "rows": rows[index : index + max_rows],
+        }) + b"\n"
+        packets_dir.joinpath(name).write_bytes(encoded)
+        packet_hashes[name] = _sha256(encoded)
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "audit_kind": "displayed_choices",
+        "row_count": len(rows),
+        "packet_count": len(packet_hashes),
+        "max_rows": max_rows,
+        "model": MODEL,
+        "reasoning_effort": REASONING_EFFORT,
+        "instructions_sha256": _sha256(CHOICE_INSTRUCTIONS.encode()),
+        "packet_hashes": packet_hashes,
+    }
+    root.joinpath("manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
+def load_causal_choice_overrides(
+    output_dir: str | Path,
+) -> dict[tuple[str, str], dict[str, object]]:
+    root = Path(output_dir)
+    manifest = json.loads(root.joinpath("manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("audit_kind") != "displayed_choices":
+        raise ValueError("Unsupported displayed-choice audit schema")
+    expected: dict[str, dict[str, object]] = {}
+    packet_hashes = manifest.get("packet_hashes", {})
+    packets = sorted(root.joinpath("packets").glob("packet-*.json"))
+    if {path.name for path in packets} != set(packet_hashes):
+        raise ValueError("Displayed-choice packet set does not match manifest")
+    for path in packets:
+        if _sha256(path.read_bytes()) != packet_hashes[path.name]:
+            raise ValueError(f"Displayed-choice packet checksum mismatch: {path.name}")
+        for row in json.loads(path.read_text(encoding="utf-8"))["rows"]:
+            expected[str(row["annotation_id"])] = row
+    if len(expected) != int(manifest.get("row_count", -1)):
+        raise ValueError("Displayed-choice packet row count mismatch")
+
+    observed: dict[str, dict[str, object]] = {}
+    for path in sorted(root.joinpath("labels").glob("*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            annotation_id = str(row.get("annotation_id", ""))
+            if annotation_id not in expected:
+                raise ValueError(f"Unexpected displayed-choice annotation: {annotation_id}")
+            source = expected[annotation_id]
+            if row.get("source_prompt_sha256") != source["source_prompt_sha256"]:
+                raise ValueError(f"Displayed-choice source checksum mismatch: {annotation_id}")
+            if row.get("model") != MODEL or row.get("reasoning_effort") != REASONING_EFFORT:
+                raise ValueError(f"Displayed-choice model metadata mismatch: {annotation_id}")
+            choices = row.get("candidate_texts")
+            correct_position = row.get("correct_position")
+            if (
+                not isinstance(choices, list)
+                or len(choices) != 4
+                or any(not isinstance(choice, str) or not choice for choice in choices)
+                or not isinstance(correct_position, int)
+                or correct_position not in range(4)
+                or row.get("confidence") not in {"high", "medium", "low"}
+                or not str(row.get("reason", "")).strip()
+                or not str(row.get("thread_id", "")).strip()
+            ):
+                raise ValueError(f"Invalid displayed-choice annotation: {annotation_id}")
+            if annotation_id in observed and observed[annotation_id] != row:
+                raise ValueError(f"Conflicting displayed-choice annotation: {annotation_id}")
+            observed[annotation_id] = row
+    missing = sorted(set(expected) - set(observed))
+    if missing:
+        raise ValueError(f"Displayed-choice annotations incomplete: {len(missing)} missing")
+    return {
+        (str(expected[key]["item_id"]), str(expected[key]["wrapper_name"])): {
+            "source_prompt_sha256": row["source_prompt_sha256"],
+            "candidate_texts": list(row["candidate_texts"]),
+            "correct_position": int(row["correct_position"]),
+            "provenance": f"{MODEL}:{REASONING_EFFORT}:{row['thread_id']}",
+        }
+        for key, row in observed.items()
+    }

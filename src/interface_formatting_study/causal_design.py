@@ -498,12 +498,23 @@ def _v3_rows_for_item_format(
     item: dict[str, object],
     format_name: str,
     parsed_source: ParsedPrompt | None,
+    choice_override: dict[str, object] | None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     item_id = str(item["item_id"])
-    choices = [str(choice) for choice in item["choices"]]
-    correct_content_id = int(item["correct_index"])
+    canonical_choices = [str(choice) for choice in item["choices"]]
     source_prompt, calibration, calibration_wrapper = _format_sources(item, format_name)
     source_prompt_sha = hashlib.sha256(source_prompt.encode("utf-8")).hexdigest()
+    choices = canonical_choices
+    correct_content_id = int(item["correct_index"])
+    choice_provenance = "canonical"
+    if choice_override is not None:
+        if choice_override.get("source_prompt_sha256") != source_prompt_sha:
+            raise ValueError(f"Displayed-choice override source mismatch: {item_id}::{format_name}")
+        choices = [str(choice) for choice in choice_override.get("candidate_texts", [])]
+        correct_content_id = int(choice_override.get("correct_position", -1))
+        if len(choices) != 4 or correct_content_id not in range(4) or any(not choice for choice in choices):
+            raise ValueError(f"Invalid displayed-choice override: {item_id}::{format_name}")
+        choice_provenance = str(choice_override.get("provenance", "displayed_choice_override"))
     source_calibration = str(calibration["content_free_prompt"])
     placeholders = [f"OPTION_{label}_PLACEHOLDER" for label in LETTERS]
     parse_reason = ""
@@ -528,7 +539,7 @@ def _v3_rows_for_item_format(
                         parsed_source,
                         source_prompt,
                         question=str(item["question"]),
-                        choices=choices,
+                        choices=canonical_choices,
                         redacted=source_calibration,
                     )
                 except ValueError:
@@ -604,6 +615,7 @@ def _v3_rows_for_item_format(
                 "correct_position": correct_position,
                 "correct_label": correct_label,
                 "correct_text": choices[correct_content_id],
+                "choice_provenance": choice_provenance,
             }
         )
 
@@ -657,6 +669,7 @@ def _v3_rows_for_item_format(
             "correct_position": correct_content_id,
             "correct_label": LETTERS[correct_content_id],
             "correct_text": choices[correct_content_id],
+            "choice_provenance": choice_provenance,
         }
     )
     applicability = {
@@ -672,6 +685,7 @@ def _v3_rows_for_item_format(
         "label_applicable": separable,
         "parse_provenance": transform_provenance,
         "not_applicable_reason": "" if separable else parse_reason,
+        "choice_provenance": choice_provenance,
     }
     return rows, applicability
 
@@ -681,6 +695,7 @@ def build_causal_design_v3(
     *,
     splits: Sequence[str] | None = None,
     option_maps: dict[tuple[str, str], ParsedPrompt] | None = None,
+    choice_overrides: dict[tuple[str, str], dict[str, object]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build the full-population design without whole-item parser exclusions."""
 
@@ -688,6 +703,7 @@ def build_causal_design_v3(
     rows: list[dict[str, object]] = []
     applicability: list[dict[str, object]] = []
     supplied = option_maps or {}
+    supplied_choices = choice_overrides or {}
     for item in _canonical_items(frame):
         if allowed_splits is not None and str(item["split"]) not in allowed_splits:
             continue
@@ -696,6 +712,7 @@ def build_causal_design_v3(
                 item,
                 format_name,
                 supplied.get((str(item["item_id"]), format_name)),
+                supplied_choices.get((str(item["item_id"]), format_name)),
             )
             rows.extend(block)
             applicability.append(status)

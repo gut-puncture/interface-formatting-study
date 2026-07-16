@@ -15,7 +15,7 @@ import pandas as pd
 import torch
 
 from .causal_design import CONTROLLED_FORMATS, build_causal_design_v3
-from .causal_option_audit import load_causal_option_annotations
+from .causal_option_audit import load_causal_choice_overrides, load_causal_option_annotations
 from .causal_runner import run_causal_design, validate_causal_design
 from .experiment import prepare_dataset
 from .model_loader import load_model_and_tokenizer
@@ -88,8 +88,16 @@ def cmd_prepare(args) -> None:
         if getattr(args, "option_audit", None)
         else None
     )
+    choice_overrides = (
+        load_causal_choice_overrides(args.choice_audit)
+        if getattr(args, "choice_audit", None)
+        else None
+    )
     design, applicability = build_causal_design_v3(
-        frame, splits=splits, option_maps=option_maps
+        frame,
+        splits=splits,
+        option_maps=option_maps,
+        choice_overrides=choice_overrides,
     )
     source_items = int(frame[frame["split"].astype(str).isin(splits)]["item_id"].nunique())
     validate_causal_design(design)
@@ -100,10 +108,11 @@ def cmd_prepare(args) -> None:
     write_table_atomic(design, output)
     applicability_path = output.with_name(output.stem + ".applicability.parquet")
     write_table_atomic(applicability, applicability_path)
-    option_audit = None
-    if getattr(args, "option_audit", None):
-        audit_root = Path(args.option_audit)
-        option_audit = {
+    def audit_identity(value: str | None) -> dict[str, object] | None:
+        if not value:
+            return None
+        audit_root = Path(value)
+        return {
             "path": str(audit_root),
             "manifest_sha256": sha256_file(audit_root / "manifest.json"),
             "label_hashes": {
@@ -111,6 +120,9 @@ def cmd_prepare(args) -> None:
                 for path in sorted((audit_root / "labels").glob("*.jsonl"))
             },
         }
+
+    option_audit = audit_identity(getattr(args, "option_audit", None))
+    choice_audit = audit_identity(getattr(args, "choice_audit", None))
     _atomic_json(
         {
             "design_schema_version": DESIGN_SCHEMA_VERSION,
@@ -135,6 +147,7 @@ def cmd_prepare(args) -> None:
             },
             "answer_text_rows": 1,
             "option_audit": option_audit,
+            "choice_audit": choice_audit,
             "scope": DESIGN_SCOPE,
         },
         output.with_name(output.name + ".manifest.json"),
@@ -170,6 +183,15 @@ def _load_design(path: Path) -> pd.DataFrame:
     if len(design) != int(manifest.get("rows", -1)):
         raise RuntimeError("Causal design row count does not match its manifest")
     validate_causal_design(design)
+    ledger_keys = list(zip(applicability["item_id"], applicability["wrapper_name"], strict=True))
+    if len(ledger_keys) != len(set(ledger_keys)):
+        raise RuntimeError("Causal applicability ledger requires unique item-wrapper keys")
+    design_keys = set(zip(design["item_id"], design["wrapper_name"], strict=True))
+    if set(ledger_keys) != design_keys:
+        raise RuntimeError("Causal applicability ledger keys do not match the design")
+    for item_id, group in design.groupby("item_id", sort=False):
+        if set(group["wrapper_name"]) != set(CONTROLLED_FORMATS):
+            raise RuntimeError(f"Causal design is missing an expected format for item {item_id}")
     observed = design.groupby(["item_id", "wrapper_name", "manipulation"]).size()
     for row in applicability.to_dict("records"):
         key = (row["item_id"], row["wrapper_name"])
@@ -424,6 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--splits", default="train,validation")
     prepare.add_argument("--output", default=str(DEFAULT_DESIGN))
     prepare.add_argument("--option-audit")
+    prepare.add_argument("--choice-audit")
     prepare.set_defaults(func=cmd_prepare)
 
     run = sub.add_parser("run")

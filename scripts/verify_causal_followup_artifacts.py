@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
 import pandas as pd
 
 from interface_formatting_study.run_identity import sha256_file
+
+
+def _selected_work_sha(keys: set[str]) -> str:
+    encoded = ("\n".join(sorted(keys)) + "\n").encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def verify(root: Path, semantic_run_id: str, model_slug: str, mode: str) -> dict[str, object]:
@@ -72,6 +78,8 @@ def verify(root: Path, semantic_run_id: str, model_slug: str, mode: str) -> dict
         raise ValueError("complete causal fetch is missing merged artifact")
     if mode == "complete" and (manifest.get("status") != "complete" or len(keys) != expected):
         raise ValueError(f"complete causal fetch expected {expected} work keys; found {len(keys)}")
+    if mode == "complete" and _selected_work_sha(keys) != manifest["design"].get("selected_work_sha256"):
+        raise ValueError("complete causal fetch selected work-key checksum mismatch")
     return {"status": manifest.get("status"), "work_keys": len(keys), "expected_work_keys": expected}
 
 
