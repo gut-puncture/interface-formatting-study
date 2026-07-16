@@ -7,3 +7,4 @@ pyarrow==20.0.0
 huggingface-hub==0.33.4
 safetensors==0.5.3
 tokenizers==0.21.2
+scikit-learn==1.8.0

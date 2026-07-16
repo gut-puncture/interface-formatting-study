@@ -3,14 +3,23 @@ from __future__ import annotations
 import hashlib
 import re
 
+import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 from interface_formatting_study.causal_design import balanced_assignments
 from interface_formatting_study.decision_binding import (
     CheckpointIndices,
+    ProbeBank,
+    capture_layer_readouts,
+    evaluate_probe_bank,
+    fit_probe_bank,
+    load_probe_bank,
     prepare_readout_ledger,
     resolve_readout_checkpoints,
+    save_probe_bank,
+    select_readout_layers,
     winner_coordinates,
 )
 
@@ -54,6 +63,35 @@ class OffsetTokenizer:
         output = {"input_ids": ids}
         if return_offsets_mapping:
             output["offset_mapping"] = offsets
+        return output
+
+
+class CharacterOffsetTokenizer:
+    pad_token_id = 0
+    eos_token_id = 0
+    padding_side = "right"
+
+    def __init__(self):
+        self.vocab = {"<pad>": 0}
+
+    def _id(self, character: str) -> int:
+        if character not in self.vocab:
+            self.vocab[character] = len(self.vocab)
+        return self.vocab[character]
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        return [self._id(character) for character in text]
+
+    def __call__(
+        self,
+        text: str,
+        *,
+        add_special_tokens: bool = False,
+        return_offsets_mapping: bool = False,
+    ):
+        output = {"input_ids": self.encode(text, add_special_tokens=add_special_tokens)}
+        if return_offsets_mapping:
+            output["offset_mapping"] = [(index, index + 1) for index in range(len(text))]
         return output
 
 
@@ -282,3 +320,122 @@ def test_ledger_rejects_missing_or_extra_interventions_instead_of_silently_dropp
     extra = pd.concat([baseline_only, extra_row], ignore_index=True)
     with pytest.raises(ValueError, match="expected 0 position_only"):
         prepare_readout_ledger(extra, baseline_app, stage="discovery")
+
+
+def test_batched_capture_matches_transformer_block_outputs_at_both_checkpoints(tiny_hook_model):
+    tokenizer = CharacterOffsetTokenizer()
+    prompts = ["A) one B) two" + _SUFFIX, "A) red B) blue C) green" + _SUFFIX]
+
+    captured = capture_layer_readouts(
+        tiny_hook_model,
+        tokenizer,
+        prompts,
+        batch_size=2,
+        max_batch_tokens=512,
+    )
+
+    assert captured.activations.shape == (2, 2, 2, 3)
+    assert captured.raw_log_probs.shape == (2, 4)
+    for row, prompt in enumerate(prompts):
+        ids = torch.tensor([tokenizer.encode(prompt)])
+        outputs = tiny_hook_model(input_ids=ids, output_hidden_states=True)
+        checkpoints = resolve_readout_checkpoints(tokenizer, prompt)
+        for layer in range(2):
+            expected = outputs.hidden_states[layer + 1][0]
+            assert torch.allclose(
+                captured.activations[row, layer, 0], expected[checkpoints.format_end].float()
+            )
+            assert torch.allclose(
+                captured.activations[row, layer, 1], expected[checkpoints.answer_prefix_end].float()
+            )
+
+
+def _probe_fixture(seed: int = 7):
+    rng = np.random.default_rng(seed)
+    n_train = 160
+    y = np.arange(n_train) % 4
+    train = rng.normal(scale=0.05, size=(n_train, 3, 2, 6)).astype(np.float32)
+    for index, target in enumerate(y):
+        train[index, 1, 0, target] += 8.0
+        train[index, 2, 1, target] += 8.0
+
+    n_validation = 96
+    content = np.arange(n_validation) % 4
+    label = (content + 1) % 4
+    position = (content + 2) % 4
+    validation = rng.normal(scale=0.05, size=(n_validation, 3, 2, 6)).astype(np.float32)
+    for index in range(n_validation):
+        validation[index, 1, 0, content[index]] += 8.0
+        validation[index, 2, 1, label[index]] += 8.0
+    ledger = pd.DataFrame(
+        {
+            "readout_work_key": [f"validation|{index}" for index in range(n_validation)],
+            "item_id": [f"item-{index // 4}" for index in range(n_validation)],
+            "winner_content_id": content,
+            "winner_position": position,
+            "winner_label_index": label,
+            "winner_unique": True,
+        }
+    )
+    return train, y, validation, ledger
+
+
+def test_linear_probes_find_distinct_content_and_label_layers_without_item_leakage(tmp_path):
+    train, y, validation, ledger = _probe_fixture()
+
+    bank = fit_probe_bank(train, y, c=1e-2, max_iter=5000)
+    evaluated = evaluate_probe_bank(bank, validation, ledger)
+    frozen = select_readout_layers(
+        evaluated,
+        bootstrap_samples=200,
+        permutation_samples=200,
+        seed=11,
+    )
+
+    assert frozen["content"]["selected_layer"] == 1
+    assert frozen["content"]["checkpoint"] == "format_end"
+    assert frozen["content"]["usable"] is True
+    assert frozen["label"]["selected_layer"] == 2
+    assert frozen["label"]["checkpoint"] == "answer_prefix_end"
+    assert frozen["label"]["usable"] is True
+    assert set(frozen["content"]["patch_layers"]) == {0, 1, 2}
+
+    path = tmp_path / "probes.npz"
+    save_probe_bank(path, bank)
+    restored = load_probe_bank(path)
+    assert isinstance(restored, ProbeBank)
+    assert np.array_equal(restored.classes, bank.classes)
+    assert np.allclose(restored.weights, bank.weights)
+    assert np.allclose(restored.intercepts, bank.intercepts)
+    assert np.allclose(restored.means, bank.means)
+    assert np.allclose(restored.log_probabilities(validation), bank.log_probabilities(validation))
+
+
+def test_probe_fit_rejects_missing_classes_and_nonconvergence():
+    train, y, _, _ = _probe_fixture()
+    with pytest.raises(ValueError, match="all four raw winner classes"):
+        fit_probe_bank(train[y != 3], y[y != 3])
+    with pytest.raises(RuntimeError, match="did not converge"):
+        fit_probe_bank(train, y, max_iter=1)
+
+
+def test_layer_selection_marks_decodable_but_weak_probes_unusable():
+    _, _, validation, ledger = _probe_fixture()
+    weak = ProbeBank(
+        weights=np.zeros((3, 2, 4, 6)),
+        intercepts=np.zeros((3, 2, 4)),
+        means=np.zeros((3, 2, 6)),
+        classes=np.arange(4),
+        c=1e-2,
+    )
+
+    evaluated = evaluate_probe_bank(weak, validation, ledger)
+    frozen = select_readout_layers(
+        evaluated,
+        bootstrap_samples=100,
+        permutation_samples=100,
+        seed=13,
+    )
+
+    assert frozen["content"]["usable"] is False
+    assert frozen["label"]["usable"] is False

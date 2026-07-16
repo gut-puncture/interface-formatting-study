@@ -4,10 +4,10 @@
 
 - Existing path reused: the causal-follow-up model profiles, exact prompt artifacts, token-aware scorer, residual hooks/patcher, semantic identity, atomic shards, and GPU operators.
 - New production code: one focused decision-binding domain module and one thin CLI are necessary because the repository has no all-layer readout, linear-probe, or probe-subspace patch path.
-- Expected scope: about 350-500 net production lines plus 200-300 focused test lines; one experiment module, one CLI, narrow operator/analysis additions; 5-8 focused implementation hours.
+- Expected scope: after the first complete vertical slice corrected the estimate, about 850-1,050 net production lines plus 450-650 focused test lines; one experiment domain module, one CLI, and narrow operator/analysis additions; 8-12 focused implementation hours. Scientific scope is unchanged.
 - Review: exactly two independent reviewers, one for scientific/data semantics and one for runtime/resume/operator behavior; maximum two review rounds.
 - Final validation: one full local suite after review closes, expected under five minutes; first real GPU proof is one eight-item canary per model after local acceptance and explicit rental approval.
-- Deviation gate: stop and recheck the design before exceeding 650 net production lines, ten implementation hours, two review rounds, or adding generalized orchestration, persistent hidden-state storage, head/MLP hooks, or new prompt/audit infrastructure.
+- Deviation gate: stop and recheck the design before exceeding 1,150 net production lines, twelve implementation hours, two review rounds, or adding generalized orchestration, persistent hidden-state storage, head/MLP hooks, or new prompt/audit infrastructure.
 
 ## Source Truth Read
 
