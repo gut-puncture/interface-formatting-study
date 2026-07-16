@@ -82,15 +82,81 @@ def test_batched_layer_patching_matches_scalar_patching(tiny_hook_model, boundar
         1: {0: torch.tensor([-0.25, 0.75, 1.25]), 2: torch.tensor([1.0, -1.0, 0.5])},
     }
 
-    batched = score_layers_with_position_replacements(
-        tiny_hook_model,
-        boundary_tokenizer,
-        prompt,
-        correct_label="A",
-        bias_scores=bias_scores,
-        replacements_by_layer=replacements_by_layer,
-    )
+    batch_sizes = []
 
+    def record_batch_size(_module, _args, kwargs):
+        batch_sizes.append(int(kwargs["input_ids"].shape[0]))
+
+    handle = tiny_hook_model.register_forward_pre_hook(record_batch_size, with_kwargs=True)
+    try:
+        batched = score_layers_with_position_replacements(
+            tiny_hook_model,
+            boundary_tokenizer,
+            prompt,
+            correct_label="A",
+            bias_scores=bias_scores,
+            replacements_by_layer=replacements_by_layer,
+        )
+    finally:
+        handle.remove()
+
+    assert batch_sizes == [len(replacements_by_layer)]
+
+    for layer, replacements in replacements_by_layer.items():
+        scalar = score_prompt_with_position_replacements(
+            tiny_hook_model,
+            boundary_tokenizer,
+            prompt,
+            correct_label="A",
+            bias_scores=bias_scores,
+            layer=layer,
+            replacements=replacements,
+        )
+        for key, value in scalar.items():
+            if isinstance(value, float):
+                assert batched[layer][key] == pytest.approx(value)
+            else:
+                assert batched[layer][key] == value
+
+
+def test_batched_layer_patching_keeps_multi_token_label_fallback(
+    tiny_hook_model,
+    boundary_tokenizer,
+    monkeypatch,
+):
+    prompt = "Question A B C"
+    bias_scores = {label: 0.0 for label in "ABCD"}
+    replacements_by_layer = {
+        0: {0: torch.tensor([1.5, -0.5, 0.25])},
+        1: {0: torch.tensor([-0.25, 0.75, 1.25])},
+    }
+    original_encode = boundary_tokenizer.encode
+
+    def encode_with_multi_token_d(text, add_special_tokens=False):
+        if text == "D":
+            return original_encode("DD", add_special_tokens=add_special_tokens)
+        return original_encode(text, add_special_tokens=add_special_tokens)
+
+    monkeypatch.setattr(boundary_tokenizer, "encode", encode_with_multi_token_d)
+    batch_sizes = []
+
+    def record_batch_size(_module, _args, kwargs):
+        batch_sizes.append(int(kwargs["input_ids"].shape[0]))
+
+    handle = tiny_hook_model.register_forward_pre_hook(record_batch_size, with_kwargs=True)
+    try:
+        batched = score_layers_with_position_replacements(
+            tiny_hook_model,
+            boundary_tokenizer,
+            prompt,
+            correct_label="A",
+            bias_scores=bias_scores,
+            replacements_by_layer=replacements_by_layer,
+        )
+    finally:
+        handle.remove()
+
+    assert batch_sizes == [len(replacements_by_layer) * 4]
     for layer, replacements in replacements_by_layer.items():
         scalar = score_prompt_with_position_replacements(
             tiny_hook_model,

@@ -8,7 +8,13 @@ from .anchors import anchor_components, anchor_is_leaky, resolve_anchor, resolve
 from .calibration import calibrate_scores
 from .hooks import ResidualCapture, ResidualLayerRowMultiEdit, ResidualMultiEdit, find_transformer_blocks, replace_with
 from .interventions import bias_scores_from_row, score_prompt_with_optional_edit
-from .scoring import correct_answer_margin, label_variants, score_labels, tokenize_text
+from .scoring import (
+    correct_answer_margin,
+    label_variants,
+    score_labels,
+    single_token_label_ids,
+    tokenize_text,
+)
 from .utils import LABELS
 
 
@@ -218,6 +224,32 @@ def _pad_id(tokenizer) -> int:
     return 0
 
 
+def _scored_label_result(
+    raw_scores: dict[str, float],
+    bias_scores: dict[str, float],
+    correct_label: str,
+) -> dict[str, object]:
+    cal_scores = calibrate_scores(raw_scores, bias_scores)
+    raw_margin = correct_answer_margin(raw_scores, correct_label)
+    cal_margin = correct_answer_margin(cal_scores, correct_label)
+    scored: dict[str, object] = {}
+    for label in LABELS:
+        scored[f"raw_score_{label}"] = raw_scores[label]
+        scored[f"cal_score_{label}"] = cal_scores[label]
+    scored.update(
+        {
+            "raw_pred_label": raw_margin.pred_label,
+            "raw_correct": raw_margin.correct,
+            "raw_margin": raw_margin.margin,
+            "cal_pred_label": cal_margin.pred_label,
+            "cal_correct": cal_margin.correct,
+            "cal_margin": cal_margin.margin,
+            "cal_tie": cal_margin.is_tie,
+        }
+    )
+    return scored
+
+
 def score_layers_with_position_replacements(
     model,
     tokenizer,
@@ -238,6 +270,34 @@ def score_layers_with_position_replacements(
     prompt_ids = tokenize_text(tokenizer, prompt)
     if not prompt_ids:
         raise ValueError("Prompt must contain at least one token to score completions")
+    device_obj = device or next(model.parameters()).device
+    label_ids = single_token_label_ids(tokenizer)
+    if label_ids is not None:
+        layers = sorted(int(layer) for layer in replacements_by_layer)
+        input_ids = torch.tensor(
+            [prompt_ids for _ in layers], dtype=torch.long, device=device_obj
+        )
+        attention_mask = torch.ones_like(input_ids)
+        edits_by_layer = {
+            layer: {row: replacements_by_layer[layer]}
+            for row, layer in enumerate(layers)
+        }
+        with ResidualLayerRowMultiEdit(model, edits_by_layer=edits_by_layer):
+            with torch.inference_mode():
+                logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        log_probs = torch.log_softmax(logits[:, len(prompt_ids) - 1], dim=-1)
+        return {
+            layer: _scored_label_result(
+                {
+                    label: float(log_probs[row, label_ids[label]].detach().cpu())
+                    for label in LABELS
+                },
+                bias_scores,
+                correct_label,
+            )
+            for row, layer in enumerate(layers)
+        }
+
     completions: list[str] = []
     label_for_completion: list[str] = []
     for label in LABELS:
@@ -248,7 +308,6 @@ def score_layers_with_position_replacements(
     if any(len(ids) == 0 for ids in completion_ids):
         raise ValueError("Completion variants must contain at least one token")
 
-    device_obj = device or next(model.parameters()).device
     pad_token_id = _pad_id(tokenizer)
     entries = [
         (int(layer), completion_index)
@@ -269,7 +328,7 @@ def score_layers_with_position_replacements(
         edits_by_layer.setdefault(layer, {})[row_index] = replacements_by_layer[layer]
 
     with ResidualLayerRowMultiEdit(model, edits_by_layer=edits_by_layer):
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             log_probs = torch.log_softmax(outputs.logits, dim=-1)
 
@@ -291,25 +350,7 @@ def score_layers_with_position_replacements(
         for label in LABELS:
             values = torch.tensor(label_scores[label], dtype=torch.float64)
             raw_scores[label] = float(torch.logsumexp(values, dim=0) - torch.log(torch.tensor(float(len(values)))))
-        cal_scores = calibrate_scores(raw_scores, bias_scores)
-        raw_margin = correct_answer_margin(raw_scores, correct_label)
-        cal_margin = correct_answer_margin(cal_scores, correct_label)
-        scored: dict[str, object] = {}
-        for label in LABELS:
-            scored[f"raw_score_{label}"] = raw_scores[label]
-            scored[f"cal_score_{label}"] = cal_scores[label]
-        scored.update(
-            {
-                "raw_pred_label": raw_margin.pred_label,
-                "raw_correct": raw_margin.correct,
-                "raw_margin": raw_margin.margin,
-                "cal_pred_label": cal_margin.pred_label,
-                "cal_correct": cal_margin.correct,
-                "cal_margin": cal_margin.margin,
-                "cal_tie": cal_margin.is_tie,
-            }
-        )
-        out[layer] = scored
+        out[layer] = _scored_label_result(raw_scores, bias_scores, correct_label)
     return out
 
 

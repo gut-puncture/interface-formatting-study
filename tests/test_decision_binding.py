@@ -802,8 +802,18 @@ def test_patch_pair_runs_all_prespecified_conditions_and_identity_matches_unpatc
         },
     }
 
-    rows = run_patch_pair(tiny_hook_model, tokenizer, pair, bank, frozen)
+    batch_sizes = []
 
+    def record_batch_size(_module, _args, kwargs):
+        batch_sizes.append(int(kwargs["input_ids"].shape[0]))
+
+    handle = tiny_hook_model.register_forward_pre_hook(record_batch_size, with_kwargs=True)
+    try:
+        rows = run_patch_pair(tiny_hook_model, tokenizer, pair, bank, frozen)
+    finally:
+        handle.remove()
+
+    assert batch_sizes == [2, *([1] * 8)]
     assert len(rows) == 10
     assert set(rows["mechanism"]) == {"content", "label"}
     assert set(rows["condition"]) == {"unpatched", "identity", "probe", "full", "random"}

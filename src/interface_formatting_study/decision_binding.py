@@ -14,8 +14,7 @@ import pandas as pd
 import torch
 
 from .hooks import find_transformer_blocks
-from .interventions import score_prompt_with_optional_edit
-from .patching import score_layers_with_position_replacements
+from .patching import _scored_label_result, score_layers_with_position_replacements
 from .scoring import predict_from_scores, single_token_label_ids, tokenize_text
 
 
@@ -993,13 +992,13 @@ def run_patch_pair(
     )
     if captured.activations.shape[1] != bank.weights.shape[0]:
         raise ValueError("Captured model layers do not match the frozen probe bank")
-    unpatched = score_prompt_with_optional_edit(
-        model,
-        tokenizer,
-        receiver_prompt,
-        correct_label=targets.receiver_content_label,
-        bias_scores=bias_scores,
-        device=device,
+    unpatched = _scored_label_result(
+        {
+            label: float(captured.raw_log_probs[1, index])
+            for index, label in enumerate(LABELS)
+        },
+        bias_scores,
+        targets.receiver_content_label,
     )
     receiver_checkpoints = resolve_readout_checkpoints(tokenizer, receiver_prompt)
     checkpoint_positions = {
