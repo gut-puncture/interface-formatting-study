@@ -30,6 +30,7 @@ from .model_loader import load_model_and_tokenizer
 from .model_profiles import MODEL_PROFILES, get_model_profile
 from .model_runner import StopState
 from .run_identity import build_semantic_identity, default_semantic_source_paths, sha256_file
+from .scoring import tokenize_text
 from .shards import ShardStore, run_sharded_phase
 from .utils import read_table, write_table_atomic
 
@@ -49,6 +50,27 @@ def _load_bundle(root: Path) -> tuple[dict[str, object], pd.DataFrame, pd.DataFr
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("bundle_schema_version") != 2 or "source_validation" not in manifest:
         raise RuntimeError("Decision-binding bundle lacks canonical source attestation")
+    scored_attestation = manifest["source_validation"].get("scored_artifact", {})
+    required_attestation = {
+        "manifest_sha256",
+        "semantic_run_id",
+        "model_id",
+        "model_revision",
+        "rows",
+        "sha256",
+    }
+    if not required_attestation.issubset(scored_attestation):
+        raise RuntimeError("Decision-binding bundle lacks scored source attestation")
+    bundle_model = manifest.get("model", {})
+    if any(
+        str(bundle_model.get(bundle_key)) != str(scored_attestation[source_key])
+        for bundle_key, source_key in (
+            ("id", "model_id"),
+            ("revision", "model_revision"),
+            ("semantic_run_id", "semantic_run_id"),
+        )
+    ):
+        raise RuntimeError("Decision-binding scored source identity does not match bundle model")
     readout_path = root / "readout_ledger.parquet"
     pairs_path = root / "patch_pair_ledger.parquet"
     for key, path in (("readout", readout_path), ("pairs", pairs_path)):
@@ -135,6 +157,7 @@ def _validate_prepare_sources(
     applicability: pd.DataFrame,
     stage: str,
 ) -> dict[str, object]:
+    scored_attestation = _validate_scored_manifest(scored_path, scored)
     manifest_path = design_path.with_suffix(design_path.suffix + ".manifest.json")
     if not manifest_path.exists():
         raise ValueError(f"Canonical design manifest is missing: {manifest_path}")
@@ -169,6 +192,32 @@ def _validate_prepare_sources(
         "design_manifest_sha256": sha256_file(manifest_path),
         "split_items": counts,
         "scored_path_name": scored_path.name,
+        "scored_artifact": scored_attestation,
+    }
+
+
+def _validate_scored_manifest(scored_path: Path, scored: pd.DataFrame) -> dict[str, object]:
+    manifest_path = scored_path.with_name(scored_path.name + ".manifest.json")
+    if not manifest_path.exists():
+        raise ValueError(f"Causal scored artifact manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    required = ("semantic_run_id", "model_id", "model_revision")
+    if (
+        manifest.get("sha256") != sha256_file(scored_path)
+        or int(manifest.get("row_count", -1)) != len(scored)
+        or any(key not in manifest for key in required)
+    ):
+        raise ValueError("Causal scored artifact manifest does not match the scored parquet")
+    for column in required:
+        if column not in scored or not scored[column].astype(str).eq(str(manifest[column])).all():
+            raise ValueError("Scored rows contain mixed or unauthenticated model identity")
+    return {
+        "manifest_sha256": sha256_file(manifest_path),
+        "semantic_run_id": str(manifest["semantic_run_id"]),
+        "model_id": str(manifest["model_id"]),
+        "model_revision": str(manifest["model_revision"]),
+        "rows": int(manifest["row_count"]),
+        "sha256": str(manifest["sha256"]),
     }
 
 
@@ -198,6 +247,9 @@ def _load_frozen(run_root: Path, profile_name: str):
         raise RuntimeError("Frozen mechanism must come from a complete discovery run")
     if int(manifest.get("completed_pairs", -1)) != int(manifest.get("selected_pairs", -2)):
         raise RuntimeError("Frozen discovery run did not complete every selected patch pair")
+    limits = identity.get("experiment_config", {}).get("limits", {})
+    if any(value is not None for value in limits.values()):
+        raise RuntimeError("Frozen mechanism must come from an unrestricted full discovery run")
     selection_path = run_root / "frozen_selection.json"
     bank_path = run_root / "probe_bank.npz"
     readout_path = run_root / "readout_scores.parquet"
@@ -407,7 +459,9 @@ def cmd_run_model(args) -> None:
         evaluation = ledger[ledger["readout_role"].isin(["layer_select", "confirmation"])].copy()
         selected = pairs[pairs["selected_for_patching"].astype(bool)].copy()
         if canary_items is not None:
-            item_ids = _select_canary_items(selected, int(canary_items), seed=args.seed)
+            item_ids = _select_canary_items(
+                selected, int(canary_items), seed=args.seed, tokenizer=tokenizer
+            )
             evaluation = evaluation[evaluation["item_id"].astype(str).isin(item_ids)]
             selected = selected[selected["item_id"].astype(str).isin(item_ids)]
         if args.max_readout_rows:
@@ -591,23 +645,48 @@ def cmd_run_model(args) -> None:
             signal.signal(sig, handler)
 
 
-def _select_canary_items(pairs: pd.DataFrame, count: int, *, seed: int) -> list[str]:
+def _select_canary_items(
+    pairs: pd.DataFrame,
+    count: int,
+    *,
+    seed: int,
+    tokenizer=None,
+) -> list[str]:
     if count <= 0:
         raise ValueError("Canary item count must be positive")
     candidates = pairs[pairs["selected_for_patching"].astype(bool)].copy()
-    required = {"item_id", "subject", "wrapper_name"}
+    required = {"item_id", "subject", "wrapper_name", "donor_prompt", "receiver_prompt"}
     if required - set(candidates.columns):
         raise ValueError("Canary selection requires item, subject, and wrapper columns")
-    items = candidates.drop_duplicates("item_id").copy()
+    def prompt_length(value: object) -> int:
+        text = str(value)
+        return len(text) if tokenizer is None else len(tokenize_text(tokenizer, text))
+
+    candidates["_prompt_length"] = [
+        max(prompt_length(donor), prompt_length(receiver))
+        for donor, receiver in zip(
+            candidates["donor_prompt"], candidates["receiver_prompt"], strict=True
+        )
+    ]
+    items = candidates.groupby("item_id", as_index=False, sort=False).agg(
+        subject=("subject", "first"),
+        wrapper_name=("wrapper_name", "first"),
+        _prompt_length=("_prompt_length", "max"),
+    )
     if len(items) < count:
         raise ValueError(f"Canary requires {count} patchable items, found {len(items)}")
     items["_digest"] = items["item_id"].astype(str).map(
         lambda value: hashlib.sha256(f"{seed}|{value}".encode()).hexdigest()
     )
     remaining = items.to_dict("records")
-    chosen: list[dict[str, object]] = []
-    subjects: set[str] = set()
-    wrappers: set[str] = set()
+    longest = min(
+        remaining,
+        key=lambda row: (-int(row["_prompt_length"]), str(row["_digest"])),
+    )
+    remaining.remove(longest)
+    chosen: list[dict[str, object]] = [longest]
+    subjects: set[str] = {str(longest["subject"])}
+    wrappers: set[str] = {str(longest["wrapper_name"])}
     while remaining and len(chosen) < count:
         best = min(
             remaining,
@@ -709,6 +788,7 @@ def cmd_analyze(args) -> None:
             subset = scores[
                 (scores["layer"].astype(int) == int(specification["selected_layer"]))
                 & (scores["checkpoint"].astype(str) == str(specification["checkpoint"]))
+                & (scores["manipulation"].astype(str) != "controlled_baseline")
                 & scores["winner_unique"].astype(bool)
                 & ~scores["text_identity_ambiguous"].astype(bool)
             ].copy()
@@ -748,6 +828,7 @@ def cmd_analyze(args) -> None:
                     "total_items": total_items,
                     "ambiguous_items_retained_not_inferred": ambiguous_items,
                     "evaluable_items": int(len(per_item)),
+                    "controlled_variant_rows": int(len(subset)),
                     "macro_accuracy": macro_accuracy,
                     "mean_item_accuracy": float(item_values.mean()),
                     "item_accuracy_ci_low": float(np.quantile(draws, 0.025)),

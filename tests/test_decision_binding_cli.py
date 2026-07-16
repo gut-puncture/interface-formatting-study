@@ -109,6 +109,65 @@ def test_run_refuses_a_legacy_bundle_without_canonical_source_attestation(tmp_pa
         decision_binding_cli._load_bundle(root)
 
 
+def test_run_refuses_schema_two_bundle_without_scored_source_attestation(tmp_path):
+    root = tmp_path / "bundle"
+    root.mkdir()
+    readout = root / "readout_ledger.parquet"
+    pairs = root / "patch_pair_ledger.parquet"
+    pd.DataFrame(
+        {
+            "readout_work_key": [f"row-{index}" for index in range(2401)],
+            "split": ["train"] * 1801 + ["validation"] * 600,
+            "item_id": [f"train-{index}" for index in range(1801)]
+            + [f"validation-{index}" for index in range(600)],
+        }
+    ).to_parquet(readout, index=False)
+    pd.DataFrame({"pair_work_key": ["p"]}).to_parquet(pairs, index=False)
+    (root / "bundle_manifest.json").write_text(
+        json.dumps(
+            {
+                "bundle_schema_version": 2,
+                "stage": "discovery",
+                "source_validation": {"split_items": {"train": 1801, "validation": 600}},
+                "readout": {"rows": 2401, "sha256": sha256_file(readout)},
+                "pairs": {"rows": 1, "sha256": sha256_file(pairs)},
+            }
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="scored source attestation"):
+        decision_binding_cli._load_bundle(root)
+
+
+def test_scored_artifact_manifest_authenticates_every_row_and_file_hash(tmp_path):
+    scored_path = tmp_path / "causal_behavior.parquet"
+    frame = pd.DataFrame(
+        {
+            "semantic_run_id": ["run-1", "run-1"],
+            "model_id": ["model", "model"],
+            "model_revision": ["revision", "revision"],
+        }
+    )
+    frame.to_parquet(scored_path, index=False)
+    manifest_path = scored_path.with_name(scored_path.name + ".manifest.json")
+    manifest_path.write_text(json.dumps({
+        "semantic_run_id": "run-1", "model_id": "model", "model_revision": "revision",
+        "row_count": 2, "sha256": sha256_file(scored_path),
+    }))
+
+    attestation = decision_binding_cli._validate_scored_manifest(scored_path, frame)
+    assert attestation["semantic_run_id"] == "run-1"
+
+    mixed = frame.copy()
+    mixed.loc[1, "model_id"] = "other-model"
+    with pytest.raises(ValueError, match="mixed or unauthenticated model identity"):
+        decision_binding_cli._validate_scored_manifest(scored_path, mixed)
+
+    scored_path.write_bytes(scored_path.read_bytes() + b"changed")
+    with pytest.raises(ValueError, match="scored artifact manifest"):
+        decision_binding_cli._validate_scored_manifest(scored_path, frame)
+
+
 def test_analysis_uses_within_pair_differences_not_unpaired_means(tmp_path):
     run_root = tmp_path / "run"
     run_root.mkdir()
@@ -173,13 +232,15 @@ def test_analysis_keeps_discovery_and_confirmation_separate_and_reports_frozen_t
         ]).to_parquet(root / "patch_results.parquet", index=False)
         pd.DataFrame([
             {
-                "readout_work_key": "row-1", "item_id": "item-1", "split": split,
-                "layer": 1, "checkpoint": checkpoint, "probe_pred_class": 0,
+                "readout_work_key": f"row-{checkpoint}-{manipulation}",
+                "item_id": "item-1", "split": split, "manipulation": manipulation,
+                "layer": 1, "checkpoint": checkpoint, "probe_pred_class": prediction,
                 "winner_content_id": 0, "winner_position": 1, "winner_label_index": 2,
                 "winner_unique": True, "text_identity_ambiguous": False,
                 "content_log_prob": -0.1, "position_log_prob": -2.0, "label_log_prob": -3.0,
             }
             for checkpoint in ("format_end", "answer_prefix_end")
+            for manipulation, prediction in (("controlled_baseline", 2), ("label_only", 0))
         ]).to_parquet(root / "readout_scores.parquet", index=False)
         (root / "frozen_selection.json").write_text(json.dumps({
             "selection": {
@@ -200,6 +261,7 @@ def test_analysis_keeps_discovery_and_confirmation_separate_and_reports_frozen_t
     readout = pd.read_csv(output / "readout_confirmation.csv")
     assert set(readout["stage"]) == {"confirmation"}
     assert readout.iloc[0]["split"] == "test"
+    assert set(readout["controlled_variant_rows"]) == {1}
 
 
 def test_canary_selection_uses_eight_distinct_items_and_is_deterministic():
@@ -209,6 +271,8 @@ def test_canary_selection_uses_eight_distinct_items_and_is_deterministic():
             "subject": [f"subject-{index % 3}" for index in range(12) for _ in range(2)],
             "wrapper_name": [f"wrapper-{index % 4}" for index in range(12) for _ in range(2)],
             "selected_for_patching": True,
+            "donor_prompt": ["x" * (index + 1) for index in range(12) for _ in range(2)],
+            "receiver_prompt": ["y" * (index + 1) for index in range(12) for _ in range(2)],
         }
     )
 
@@ -218,6 +282,8 @@ def test_canary_selection_uses_eight_distinct_items_and_is_deterministic():
     assert len(first) == 8
     assert len(set(first)) == 8
     assert first == second
+    assert "item-11" in first
+    assert decision_binding_cli._select_canary_items(pairs, 1, seed=7) == ["item-11"]
 
 
 def test_confirmation_macro_accuracy_is_item_equal_before_class_averaging():
@@ -366,6 +432,27 @@ def test_frozen_mechanism_requires_a_complete_discovery_run(tmp_path):
     }))
 
     with pytest.raises(RuntimeError, match="complete discovery"):
+        decision_binding_cli._load_frozen(root, "qwen")
+
+
+def test_frozen_mechanism_rejects_a_completed_limited_canary(tmp_path):
+    root = tmp_path / "canary"
+    root.mkdir()
+    profile = decision_binding_cli.get_model_profile("qwen")
+    identity = {
+        "model": {"id": profile.model_id, "revision": profile.revision},
+        "semantic_run_id": "canary-id",
+        "experiment_config": {
+            "limits": {"canary_items": 8, "readout_rows": None, "pairs": None}
+        },
+    }
+    (root / "semantic_identity.json").write_text(json.dumps(identity))
+    (root / "run_manifest.json").write_text(json.dumps({
+        "status": "complete", "stage": "discovery", "semantic_identity": identity,
+        "selected_pairs": 2, "completed_pairs": 2,
+    }))
+
+    with pytest.raises(RuntimeError, match="full discovery"):
         decision_binding_cli._load_frozen(root, "qwen")
 
 

@@ -160,7 +160,10 @@ def _scored_block(
                 "raw_predicted_position": predicted_position,
                 "raw_predicted_content_id": predicted_content,
                 "raw_tie": False,
-                **{f"raw_score_{label}": float(4 - index) for index, label in enumerate("ABCD")},
+                **{
+                    f"raw_score_{label}": score
+                    for label, score in zip("ABCD", (1.0, 4.0, 2.0, 0.0), strict=True)
+                },
                 **{f"bias_score_{label}": 0.0 for label in "ABCD"},
                 **{f"cal_score_{label}": float(4 - index) for index, label in enumerate("ABCD")},
             }
@@ -314,6 +317,16 @@ def test_ledger_recomputes_coordinates_flags_duplicate_text_and_rejects_semantic
     broken = scored.copy()
     broken.loc[0, "prompt"] += "changed"
     with pytest.raises(ValueError, match="prompt checksum"):
+        prepare_readout_ledger(broken, applicability, stage="discovery")
+
+    broken = scored.copy()
+    broken.loc[0, ["raw_score_A", "raw_score_B", "raw_score_C", "raw_score_D"]] = [
+        9.0,
+        3.0,
+        2.0,
+        1.0,
+    ]
+    with pytest.raises(ValueError, match="raw winner does not match raw scores"):
         prepare_readout_ledger(broken, applicability, stage="discovery")
 
 
@@ -645,6 +658,10 @@ def _set_variant_winner_content(frame: pd.DataFrame, variant: int, content_id: i
     frame.at[index, "raw_predicted_label"] = label
     frame.at[index, "raw_predicted_position"] = position
     frame.at[index, "raw_predicted_content_id"] = content_id
+    for candidate_label in "ABCD":
+        frame.at[index, f"raw_score_{candidate_label}"] = (
+            4.0 if candidate_label == label else 0.0
+        )
 
 
 def test_patch_pair_ledger_keeps_every_candidate_and_selects_conflicts_and_controls():
@@ -681,7 +698,14 @@ def test_patch_pair_ledger_keeps_every_candidate_and_selects_conflicts_and_contr
 
 def test_patch_pair_ledger_marks_ties_and_unselected_rows_instead_of_dropping_them():
     scored, applicability = _scored_block(item_id="validation-1", split="validation")
-    scored.loc[scored["variant"] == 2, "raw_tie"] = True
+    tied = scored["variant"] == 2
+    scored.loc[tied, "raw_tie"] = True
+    scored.loc[tied, ["raw_score_A", "raw_score_B", "raw_score_C", "raw_score_D"]] = [
+        0.0,
+        4.0,
+        4.0,
+        0.0,
+    ]
     _set_variant_winner_content(scored, variant=1, content_id=1)
     _set_variant_winner_content(scored, variant=3, content_id=1)
     readout = prepare_readout_ledger(scored, applicability, stage="discovery")

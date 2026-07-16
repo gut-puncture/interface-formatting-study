@@ -16,7 +16,7 @@ import torch
 from .hooks import find_transformer_blocks
 from .interventions import score_prompt_with_optional_edit
 from .patching import score_layers_with_position_replacements
-from .scoring import single_token_label_ids, tokenize_text
+from .scoring import predict_from_scores, single_token_label_ids, tokenize_text
 
 
 LABELS = ("A", "B", "C", "D")
@@ -411,6 +411,14 @@ def prepare_readout_ledger(
             raise ValueError(f"{record['work_key']} must have four non-empty candidate texts")
         if any(not math.isfinite(float(record[column])) for column in _SCORE_COLUMNS):
             raise ValueError(f"{record['work_key']} has a non-finite A-D score")
+        expected_label, expected_tie = predict_from_scores(
+            {label: float(record[f"raw_score_{label}"]) for label in LABELS}
+        )
+        if (
+            str(record["raw_predicted_label"]) != expected_label
+            or bool(record["raw_tie"]) != expected_tie
+        ):
+            raise ValueError(f"{record['work_key']} raw winner does not match raw scores")
         transformed_records.append(
             {
                 **record,
