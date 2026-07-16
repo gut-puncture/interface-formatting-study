@@ -1043,11 +1043,31 @@ def evaluate_probe_bank(
     if len(ledger) != len(activations):
         raise ValueError("Ledger and activation row counts differ")
     log_probs = bank.log_probabilities(activations)
+    compact_columns = [
+        column
+        for column in (
+            "readout_work_key",
+            "work_key",
+            "item_id",
+            "subject",
+            "split",
+            "wrapper_name",
+            "manipulation",
+            "variant",
+            "winner_unique",
+            "winner_content_id",
+            "winner_position",
+            "winner_label_index",
+            "text_identity_ambiguous",
+        )
+        if column in ledger.columns
+    ]
+    compact_ledger = ledger.reset_index(drop=True)[compact_columns].copy()
     frames: list[pd.DataFrame] = []
     checkpoint_names = ("format_end", "answer_prefix_end")
     for layer in range(log_probs.shape[1]):
         for checkpoint, checkpoint_name in enumerate(checkpoint_names):
-            frame = ledger.reset_index(drop=True).copy()
+            frame = compact_ledger.copy()
             scores = log_probs[:, layer, checkpoint]
             frame["layer"] = layer
             frame["checkpoint"] = checkpoint_name

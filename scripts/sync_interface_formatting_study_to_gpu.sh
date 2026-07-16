@@ -71,6 +71,8 @@ rsync -az --delete \
   --include '/scripts/bootstrap_causal_followup_gpu.sh' \
   --include '/scripts/run_causal_followup_gpu.sh' \
   --include '/scripts/control_causal_followup_gpu.sh' \
+  --include '/scripts/run_decision_binding_gpu.sh' \
+  --include '/scripts/control_decision_binding_gpu.sh' \
   --include '/scripts/cache_causal_models.py' \
   --exclude '*' \
   -e "${RSYNC_RSH[*]}" \
@@ -94,5 +96,16 @@ if [[ -f "$APPLICABILITY_PATH" ]]; then
     "${ROOT_DIR}/./${APPLICABILITY_RELATIVE}" \
     "${REMOTE}:${REMOTE_DIR}/"
 fi
+DECISION_PAIR_PATH="$(dirname "$ACTIVE_DATASET_PATH")/patch_pair_ledger.parquet"
+DECISION_MANIFEST_PATH="$(dirname "$ACTIVE_DATASET_PATH")/bundle_manifest.json"
+for SIDECAR_PATH in "$DECISION_PAIR_PATH" "$DECISION_MANIFEST_PATH"; do
+  if [[ -f "$SIDECAR_PATH" ]]; then
+    SIDECAR_RELATIVE="${SIDECAR_PATH#"${ROOT_DIR}/"}"
+    rsync -az --relative \
+      -e "${RSYNC_RSH[*]}" \
+      "${ROOT_DIR}/./${SIDECAR_RELATIVE}" \
+      "${REMOTE}:${REMOTE_DIR}/"
+  fi
+done
 
 echo "Remote payload ready at ${REMOTE}:${REMOTE_DIR}"

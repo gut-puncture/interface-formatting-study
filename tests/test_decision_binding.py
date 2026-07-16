@@ -382,6 +382,8 @@ def _probe_fixture(seed: int = 7):
             "winner_position": position,
             "winner_label_index": label,
             "winner_unique": True,
+            "prompt": [f"large prompt {index}" for index in range(n_validation)],
+            "candidate_texts": [["a", "b", "c", "d"]] * n_validation,
         }
     )
     return train, y, validation, ledger
@@ -392,6 +394,8 @@ def test_linear_probes_find_distinct_content_and_label_layers_without_item_leaka
 
     bank = fit_probe_bank(train, y, c=1e-2, max_iter=5000)
     evaluated = evaluate_probe_bank(bank, validation, ledger)
+    assert "prompt" not in evaluated.columns
+    assert "candidate_texts" not in evaluated.columns
     frozen = select_readout_layers(
         evaluated,
         bootstrap_samples=200,
