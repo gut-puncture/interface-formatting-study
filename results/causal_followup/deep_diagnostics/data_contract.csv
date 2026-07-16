@@ -1,0 +1,4 @@
+model,causal_rows,causal_items,causal_blocks,answer_text_rows,letter_rows,ambiguous_text_blocks,original_rows,original_items
+Qwen,172506,2401,21609,21609,150897,19,24000,3000
+Phi,172506,2401,21609,21609,150897,19,24000,3000
+Mistral,172506,2401,21609,21609,150897,19,24000,3000
