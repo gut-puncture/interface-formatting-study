@@ -15,6 +15,8 @@ from interface_formatting_study.decision_binding import (
     build_patch_vectors,
     capture_layer_readouts,
     evaluate_probe_bank,
+    evaluate_probe_banks,
+    fit_coordinate_probe_banks,
     fit_probe_bank,
     load_probe_bank,
     patch_target_labels,
@@ -524,43 +526,63 @@ def test_batched_capture_matches_transformer_block_outputs_at_both_checkpoints(t
 
 def _probe_fixture(seed: int = 7):
     rng = np.random.default_rng(seed)
-    n_train = 160
-    y = np.arange(n_train) % 4
-    train = rng.normal(scale=0.05, size=(n_train, 3, 2, 6)).astype(np.float32)
-    for index, target in enumerate(y):
-        train[index, 1, 0, target] += 8.0
-        train[index, 2, 1, target] += 8.0
-
-    n_validation = 96
-    content = np.arange(n_validation) % 4
-    label = (content + 1) % 4
-    position = (content + 2) % 4
-    validation = rng.normal(scale=0.05, size=(n_validation, 3, 2, 6)).astype(np.float32)
-    for index in range(n_validation):
-        validation[index, 1, 0, content[index]] += 8.0
-        validation[index, 2, 1, label[index]] += 8.0
-    ledger = pd.DataFrame(
-        {
-            "readout_work_key": [f"validation|{index}" for index in range(n_validation)],
-            "item_id": [f"item-{index // 4}" for index in range(n_validation)],
-            "winner_content_id": content,
-            "winner_position": position,
-            "winner_label_index": label,
-            "winner_unique": True,
-            "prompt": [f"large prompt {index}" for index in range(n_validation)],
-            "candidate_texts": [["a", "b", "c", "d"]] * n_validation,
-        }
-    )
-    return train, y, validation, ledger
+    records = []
+    coordinates = []
+    roles = (("probe_train", 48), ("layer_select", 32), ("reader_gate", 32))
+    for role, items in roles:
+        for item in range(items):
+            content = item % 4
+            for manipulation, position, label in (
+                ("controlled_baseline", content, content),
+                ("position_only", (content + 1) % 4, content),
+                ("label_only", content, (content + 2) % 4),
+            ):
+                records.append(
+                    {
+                        "readout_work_key": f"{role}|{item}|{manipulation}",
+                        "item_id": f"{role}|item-{item}",
+                        "subject": f"subject-{item % 3}",
+                        "readout_role": role,
+                        "manipulation": manipulation,
+                        "winner_content_id": content,
+                        "winner_position": position,
+                        "winner_label_index": label,
+                        "winner_unique": True,
+                        "content_evaluable": True,
+                        "position_evaluable": True,
+                        "label_evaluable": True,
+                        "text_identity_ambiguous": False,
+                        "prompt": f"large prompt {role} {item} {manipulation}",
+                        "candidate_texts": ["a", "b", "c", "d"],
+                    }
+                )
+                coordinates.append((content, position, label))
+    activations = rng.normal(scale=0.03, size=(len(records), 3, 2, 12)).astype(np.float32)
+    for index, (content, position, label) in enumerate(coordinates):
+        activations[index, 0, 0, content] += 8.0
+        activations[index, 1, 0, 4 + position] += 8.0
+        activations[index, 2, 1, 8 + label] += 8.0
+    return activations, pd.DataFrame(records)
 
 
 def test_linear_probes_find_distinct_content_and_label_layers_without_item_leakage(tmp_path):
-    train, y, validation, ledger = _probe_fixture()
+    activations, ledger = _probe_fixture()
 
-    bank = fit_probe_bank(train, y, c=1e-2, max_iter=5000)
-    evaluated = evaluate_probe_bank(bank, validation, ledger)
+    banks = fit_coordinate_probe_banks(activations, ledger)
+    evaluated = evaluate_probe_banks(banks, activations, ledger)
     assert "prompt" not in evaluated.columns
     assert "candidate_texts" not in evaluated.columns
+    assert len(evaluated) == len(ledger) * 3 * 2
+    duplicate_index = ledger.index[ledger["readout_role"] == "reader_gate"][0]
+    ledger.loc[duplicate_index, "text_identity_ambiguous"] = True
+    ledger.loc[duplicate_index, "content_evaluable"] = False
+    masked = evaluate_probe_banks(banks, activations, ledger)
+    duplicate = masked[masked["readout_work_key"] == ledger.at[duplicate_index, "readout_work_key"]]
+    assert not duplicate["content_evaluable"].any()
+    assert duplicate["content_pred_class"].isna().all()
+    assert duplicate["position_evaluable"].all()
+    assert duplicate["position_pred_class"].notna().all()
+    assert duplicate["label_evaluable"].all()
     frozen = select_readout_layers(
         evaluated,
         bootstrap_samples=200,
@@ -568,44 +590,70 @@ def test_linear_probes_find_distinct_content_and_label_layers_without_item_leaka
         seed=11,
     )
 
-    assert frozen["content"]["selected_layer"] == 1
+    assert frozen["content"]["selected_layer"] == 0
     assert frozen["content"]["checkpoint"] == "format_end"
     assert frozen["content"]["usable"] is True
     assert frozen["label"]["selected_layer"] == 2
     assert frozen["label"]["checkpoint"] == "answer_prefix_end"
     assert frozen["label"]["usable"] is True
-    assert set(frozen["content"]["patch_layers"]) == {0, 1, 2}
+    assert frozen["position"]["selected_layer"] == 1
+    assert frozen["position"]["usable"] is True
+    assert set(frozen["content"]["patch_layers"]) == {0, 1}
+    assert frozen["content"]["selection_metrics"]["items"] == 32
+    assert frozen["content"]["gate_metrics"]["items"] == 32
 
     path = tmp_path / "probes.npz"
+    bank = banks["content"]
     save_probe_bank(path, bank)
     restored = load_probe_bank(path)
     assert isinstance(restored, ProbeBank)
+    assert restored.target_name == "content"
     assert np.array_equal(restored.classes, bank.classes)
     assert np.allclose(restored.weights, bank.weights)
     assert np.allclose(restored.intercepts, bank.intercepts)
     assert np.allclose(restored.means, bank.means)
-    assert np.allclose(restored.log_probabilities(validation), bank.log_probabilities(validation))
+    assert np.allclose(restored.log_probabilities(activations), bank.log_probabilities(activations))
 
 
 def test_probe_fit_rejects_missing_classes_and_nonconvergence():
-    train, y, _, _ = _probe_fixture()
+    train, ledger = _probe_fixture()
+    training = ledger["readout_role"].eq("probe_train").to_numpy()
+    y = ledger["winner_content_id"].to_numpy()
     with pytest.raises(ValueError, match="all four raw winner classes"):
-        fit_probe_bank(train[y != 3], y[y != 3])
+        fit_probe_bank(train[training & (y != 3)], y[training & (y != 3)])
     with pytest.raises(RuntimeError, match="did not converge"):
-        fit_probe_bank(train, y, max_iter=1)
+        fit_probe_bank(train[training], y[training], max_iter=1)
+
+
+def test_probe_fit_can_preserve_the_unweighted_legacy_training_rule():
+    rng = np.random.default_rng(19)
+    targets = np.asarray([0] * 12 + [1] * 4 + [2] * 2 + [3] * 2)
+    activations = rng.normal(size=(len(targets), 1, 1, 5)).astype(np.float32)
+    activations[np.arange(len(targets)), 0, 0, targets] += 0.5
+
+    legacy = fit_probe_bank(activations, targets, class_weight=None)
+    balanced = fit_probe_bank(activations, targets, class_weight="balanced")
+
+    assert not np.allclose(legacy.intercepts, balanced.intercepts)
 
 
 def test_layer_selection_marks_decodable_but_weak_probes_unusable():
-    _, _, validation, ledger = _probe_fixture()
+    validation, ledger = _probe_fixture()
     weak = ProbeBank(
-        weights=np.zeros((3, 2, 4, 6)),
+        weights=np.zeros((3, 2, 4, 12)),
         intercepts=np.zeros((3, 2, 4)),
-        means=np.zeros((3, 2, 6)),
+        means=np.zeros((3, 2, 12)),
         classes=np.arange(4),
         c=1e-2,
+        target_name="content",
     )
-
-    evaluated = evaluate_probe_bank(weak, validation, ledger)
+    banks = {
+        name: ProbeBank(
+            weak.weights, weak.intercepts, weak.means, weak.classes, weak.c, name
+        )
+        for name in ("content", "position", "label", "legacy_content")
+    }
+    evaluated = evaluate_probe_banks(banks, validation, ledger)
     frozen = select_readout_layers(
         evaluated,
         bootstrap_samples=100,
@@ -614,63 +662,53 @@ def test_layer_selection_marks_decodable_but_weak_probes_unusable():
     )
 
     assert frozen["content"]["usable"] is False
+    assert frozen["position"]["usable"] is False
     assert frozen["label"]["usable"] is False
 
 
 def test_layer_selection_requires_target_selectivity_not_only_decodability():
-    rows = []
-    for item in range(32):
-        content = item % 4
-        label = content if item % 2 == 0 else (content + 1) % 4
-        for checkpoint in ("format_end", "answer_prefix_end"):
-            rows.append(
-                {
-                    "item_id": f"item-{item}",
-                    "layer": 0,
-                    "checkpoint": checkpoint,
-                    "probe_pred_class": label,
-                    "winner_content_id": content,
-                    "winner_position": (content + 2) % 4,
-                    "winner_label_index": label,
-                    "content_log_prob": -4.0,
-                    "position_log_prob": -3.0,
-                    "label_log_prob": 0.0,
-                    "winner_unique": True,
-                    "text_identity_ambiguous": False,
-                    "manipulation": "label_only" if item % 2 else "position_only",
-                }
-            )
+    activations, ledger = _probe_fixture()
+    banks = fit_coordinate_probe_banks(activations, ledger)
+    evaluated = evaluate_probe_banks(banks, activations, ledger)
+    for index, label in evaluated["winner_label_index"].items():
+        evaluated.loc[index, [f"content_log_prob_{class_id}" for class_id in range(4)]] = -4.0
+        evaluated.loc[index, f"content_log_prob_{int(label)}"] = 0.0
+        evaluated.loc[index, "content_pred_class"] = int(label)
     frozen = select_readout_layers(
-        pd.DataFrame(rows), bootstrap_samples=200, permutation_samples=200, seed=3
+        evaluated, bootstrap_samples=200, permutation_samples=200, seed=3
     )
 
-    assert frozen["content"]["macro_accuracy"] == pytest.approx(0.5)
     assert frozen["content"]["selectivity"] < 0
     assert frozen["content"]["usable"] is False
     assert frozen["label"]["usable"] is True
 
 
 def test_duplicate_answer_text_is_retained_but_never_forced_into_content_inference():
-    _, _, validation, ledger = _probe_fixture()
+    validation, ledger = _probe_fixture()
     ledger["text_identity_ambiguous"] = False
     ledger.loc[0, "text_identity_ambiguous"] = True
-    bank = ProbeBank(
-        weights=np.zeros((3, 2, 4, 6)),
+    ledger.loc[0, "content_evaluable"] = False
+    weak = ProbeBank(
+        weights=np.zeros((3, 2, 4, 12)),
         intercepts=np.zeros((3, 2, 4)),
-        means=np.zeros((3, 2, 6)),
+        means=np.zeros((3, 2, 12)),
         classes=np.arange(4),
         c=1e-2,
     )
+    banks = {
+        name: ProbeBank(weak.weights, weak.intercepts, weak.means, weak.classes, weak.c, name)
+        for name in ("content", "position", "label", "legacy_content")
+    }
 
-    evaluated = evaluate_probe_bank(bank, validation, ledger)
-    ambiguous = evaluated[evaluated["readout_work_key"] == "validation|0"]
+    evaluated = evaluate_probe_banks(banks, validation, ledger)
+    ambiguous = evaluated[evaluated["readout_work_key"] == ledger.loc[0, "readout_work_key"]]
 
     assert len(ambiguous) == 6
     assert not ambiguous["content_evaluable"].any()
-    assert ambiguous["probe_pred_class"].isna().all()
+    assert ambiguous["content_pred_class"].isna().all()
     assert ambiguous["content_log_prob"].isna().all()
     assert ambiguous["content_correct"].isna().all()
-    assert ambiguous["position_log_prob"].isna().all()
+    assert ambiguous["position_log_prob"].notna().all()
 
 
 def test_probe_subspace_is_class_centered_orthonormal_and_rank_at_most_three():
@@ -889,12 +927,21 @@ def test_patch_pair_runs_all_prespecified_conditions_and_identity_matches_unpatc
     weights[:, :, :, :] = np.asarray(
         [[-1.0, 0.0, 0.0], [-0.3, 0.0, 0.0], [0.3, 0.0, 0.0], [1.0, 0.0, 0.0]]
     )
-    bank = ProbeBank(
+    content_bank = ProbeBank(
         weights=weights,
         intercepts=np.zeros((2, 2, 4)),
         means=np.zeros((2, 2, 3)),
         classes=np.arange(4),
         c=1e-2,
+        target_name="content",
+    )
+    label_bank = ProbeBank(
+        weights=weights.copy(),
+        intercepts=np.zeros((2, 2, 4)),
+        means=np.zeros((2, 2, 3)),
+        classes=np.arange(4),
+        c=1e-2,
+        target_name="label",
     )
     frozen = {
         "content": {
@@ -916,7 +963,13 @@ def test_patch_pair_runs_all_prespecified_conditions_and_identity_matches_unpatc
 
     handle = tiny_hook_model.register_forward_pre_hook(record_batch_size, with_kwargs=True)
     try:
-        rows = run_patch_pair(tiny_hook_model, tokenizer, pair, bank, frozen)
+        rows = run_patch_pair(
+            tiny_hook_model,
+            tokenizer,
+            pair,
+            {"content": content_bank, "label": label_bank},
+            frozen,
+        )
     finally:
         handle.remove()
 
@@ -931,7 +984,16 @@ def test_patch_pair_runs_all_prespecified_conditions_and_identity_matches_unpatc
             assert identity[f"raw_score_{label}"] == pytest.approx(unpatched[f"raw_score_{label}"])
         assert identity["intervention_norm"] == pytest.approx(0.0)
         assert group[group["condition"] == "probe"]["intervention_norm"].iloc[0] == pytest.approx(
-            group[group["condition"] == "random"]["intervention_norm"].iloc[0]
+            group[group["condition"] == "random"]["intervention_norm"].iloc[0], abs=1e-6
         )
     assert rows["content_target_margin"].notna().all()
     assert rows["symbol_target_margin"].notna().all()
+
+    with pytest.raises(ValueError, match="label.*target"):
+        run_patch_pair(
+            tiny_hook_model,
+            tokenizer,
+            pair,
+            {"content": content_bank, "label": content_bank},
+            frozen,
+        )

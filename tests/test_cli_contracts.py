@@ -214,8 +214,11 @@ def test_decision_binding_operator_is_thin_resumable_and_fetch_verified():
 
     assert "interface_formatting_study.decision_binding_cli" in run
     assert 'COMMON+=(--canary-items "${CANARY_ITEMS:-8}")' in run
+    assert '[[ "$MODE" =~ ^(functional|readout|full)$ ]]' in run
+    assert 'COMMON+=(--stop-after-readout)' in run
+    assert "complete|readout|partial" in fetch
     assert "MODE_FILE" in control and 'echo "$MODE" > "$MODE_FILE"' in control
-    assert '[[ "$MODE" =~ ^(functional|full)$ ]]' in control
+    assert '[[ "$MODE" =~ ^(functional|readout|full)$ ]]' in control
     assert 'ps -p "$pid" -o command=' in control
     assert "expected_bundle" in control and '"--profile $PROFILE"' in control
     assert "stop)" in control and "kill)" in control and "status)" in control

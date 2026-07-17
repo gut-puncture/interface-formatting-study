@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run_decision_binding_gpu.sh <profile> <functional|full> <bundle> [frozen-run]
+Usage: scripts/run_decision_binding_gpu.sh <profile> <functional|readout|full> <bundle> [frozen-run]
 
 Runs one pinned model through the resumable decision-binding experiment. A
 confirmation bundle requires the discovery run path as the fourth argument.
@@ -20,7 +20,7 @@ MODE="$2"
 BUNDLE="$3"
 FROZEN_RUN="${4:-}"
 [[ "$PROFILE" =~ ^(qwen|phi|mistral)$ ]] || { echo "invalid profile" >&2; exit 2; }
-[[ "$MODE" =~ ^(functional|full)$ ]] || { echo "invalid mode" >&2; exit 2; }
+[[ "$MODE" =~ ^(functional|readout|full)$ ]] || { echo "invalid mode" >&2; exit 2; }
 
 COMMON=(
   run-model
@@ -37,6 +37,8 @@ if [[ -n "$FROZEN_RUN" ]]; then
 fi
 if [[ "$MODE" == "functional" ]]; then
   COMMON+=(--canary-items "${CANARY_ITEMS:-8}")
+elif [[ "$MODE" == "readout" ]]; then
+  COMMON+=(--stop-after-readout)
 fi
 
 exec python -m interface_formatting_study.decision_binding_cli "${COMMON[@]}"

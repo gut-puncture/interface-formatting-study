@@ -38,6 +38,7 @@ def test_parser_exposes_only_the_three_focused_commands():
 
     assert prepare.command == "prepare"
     assert run.command == "run-model"
+    assert run.stop_after_readout is False
     assert analyze.command == "analyze"
 
 
@@ -82,7 +83,7 @@ def test_prepare_writes_checksum_bound_compact_bundle(tmp_path, monkeypatch):
 
     manifest = json.loads((output / "bundle_manifest.json").read_text())
     assert manifest["stage"] == "discovery"
-    assert manifest["bundle_schema_version"] == 2
+    assert manifest["bundle_schema_version"] == 3
     assert manifest["source_scored_sha256"] == sha256_file(scored_path)
     assert manifest["source_design_sha256"] == sha256_file(design_path)
     assert manifest["readout"]["rows"] == 2
@@ -109,7 +110,7 @@ def test_run_refuses_a_legacy_bundle_without_canonical_source_attestation(tmp_pa
         decision_binding_cli._load_bundle(root)
 
 
-def test_run_refuses_schema_two_bundle_without_scored_source_attestation(tmp_path):
+def test_run_refuses_schema_three_bundle_without_scored_source_attestation(tmp_path):
     root = tmp_path / "bundle"
     root.mkdir()
     readout = root / "readout_ledger.parquet"
@@ -126,7 +127,7 @@ def test_run_refuses_schema_two_bundle_without_scored_source_attestation(tmp_pat
     (root / "bundle_manifest.json").write_text(
         json.dumps(
             {
-                "bundle_schema_version": 2,
+                "bundle_schema_version": 3,
                 "stage": "discovery",
                 "source_validation": {"split_items": {"train": 1801, "validation": 600}},
                 "readout": {"rows": 2401, "sha256": sha256_file(readout)},
@@ -456,6 +457,52 @@ def test_frozen_mechanism_rejects_a_completed_limited_canary(tmp_path):
         decision_binding_cli._load_frozen(root, "qwen")
 
 
+def test_frozen_mechanism_rejects_a_bank_with_the_wrong_coordinate_identity(tmp_path):
+    root = tmp_path / "discovery"
+    root.mkdir()
+    profile = decision_binding_cli.get_model_profile("qwen")
+    identity = {
+        "model": {"id": profile.model_id, "revision": profile.revision},
+        "semantic_run_id": "frozen-id",
+        "experiment_config": {
+            "limits": {"canary_items": None, "readout_rows": None, "pairs": None}
+        },
+    }
+    (root / "semantic_identity.json").write_text(json.dumps(identity))
+    for name in ("content", "position", "label", "legacy_content"):
+        bank = ProbeBank(
+            np.zeros((1, 2, 4, 2)), np.zeros((1, 2, 4)), np.zeros((1, 2, 2)),
+            np.arange(4), 1e-2, "label" if name == "content" else name,
+        )
+        save_probe_bank(root / f"probe_bank_{name}.npz", bank)
+    bank_hashes = {
+        name: sha256_file(root / f"probe_bank_{name}.npz")
+        for name in ("content", "position", "label", "legacy_content")
+    }
+    (root / "probe_banks.json").write_text(json.dumps({"probe_bank_sha256": bank_hashes}))
+    pd.DataFrame({"x": [1]}).to_parquet(root / "readout_scores.parquet", index=False)
+    pd.DataFrame({"x": [1]}).to_parquet(root / "patch_results.parquet", index=False)
+    (root / "frozen_selection.json").write_text(json.dumps({
+        "probe_bank_sha256": bank_hashes,
+        "readout_scores_sha256": sha256_file(root / "readout_scores.parquet"),
+        "selection": {},
+    }))
+    artifacts = {
+        "frozen_selection_sha256": sha256_file(root / "frozen_selection.json"),
+        "readout_scores_sha256": sha256_file(root / "readout_scores.parquet"),
+        "patch_results_sha256": sha256_file(root / "patch_results.parquet"),
+        "probe_banks_sha256": sha256_file(root / "probe_banks.json"),
+        **{f"probe_bank_{name}_sha256": digest for name, digest in bank_hashes.items()},
+    }
+    (root / "run_manifest.json").write_text(json.dumps({
+        "status": "complete", "stage": "discovery", "semantic_identity": identity,
+        "selected_pairs": 1, "completed_pairs": 1, "artifacts": artifacts,
+    }))
+
+    with pytest.raises(RuntimeError, match="target identity"):
+        decision_binding_cli._load_frozen(root, "qwen")
+
+
 def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -505,19 +552,30 @@ def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path
             pd.read_parquet(pairs_path),
         ),
     )
-    bank = ProbeBank(
-        weights=np.zeros((1, 2, 4, 2)),
-        intercepts=np.zeros((1, 2, 4)),
-        means=np.zeros((1, 2, 2)),
-        classes=np.arange(4),
-        c=1e-2,
-    )
+    banks = {
+        target: ProbeBank(
+            weights=np.zeros((1, 2, 4, 2)),
+            intercepts=np.zeros((1, 2, 4)),
+            means=np.zeros((1, 2, 2)),
+            classes=np.arange(4),
+            c=1e-2,
+            target_name=target,
+        )
+        for target in ("content", "position", "label", "legacy_content")
+    }
 
-    def fake_bank(root, *_args):
-        save_probe_bank(root / "probe_bank.npz", bank)
-        return bank
+    def fake_banks(root, *_args):
+        for target, bank in banks.items():
+            save_probe_bank(root / f"probe_bank_{target}.npz", bank)
+        (root / "probe_banks.json").write_text(json.dumps({
+            "probe_bank_sha256": {
+                target: sha256_file(root / f"probe_bank_{target}.npz")
+                for target in banks
+            }
+        }))
+        return banks
 
-    monkeypatch.setattr(decision_binding_cli, "_fit_or_load_bank", fake_bank)
+    monkeypatch.setattr(decision_binding_cli, "_fit_or_load_banks", fake_banks)
     monkeypatch.setattr(
         decision_binding_cli,
         "capture_layer_readouts",
@@ -531,6 +589,7 @@ def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path
     )
     selection = {
         "content": {"usable": True, "checkpoint": "format_end", "patch_layers": [0]},
+        "position": {"usable": True, "checkpoint": "format_end", "patch_layers": [0]},
         "label": {"usable": True, "checkpoint": "answer_prefix_end", "patch_layers": [0]},
     }
     monkeypatch.setattr(decision_binding_cli, "select_readout_layers", lambda *_a, **_k: selection)
@@ -546,7 +605,7 @@ def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path
         bootstrap_samples=10, permutation_samples=10, stable_controls=96,
         label_binding_controls=96, max_readout_rows=None, max_pairs=None,
         local_files_only=True, allow_cpu=True, batch_size=2, max_batch_tokens=200,
-        readout_chunk_size=1, patch_shard_size=1, seed=0,
+        readout_chunk_size=1, patch_shard_size=1, seed=0, stop_after_readout=False,
     )
 
     decision_binding_cli.cmd_run_model(args)
@@ -565,6 +624,11 @@ def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path
     assert manifest["artifacts"]["readout_scores_sha256"] == sha256_file(
         root / "readout_scores.parquet"
     )
+    assert all(
+        manifest["artifacts"][f"probe_bank_{target}_sha256"]
+        == sha256_file(root / f"probe_bank_{target}.npz")
+        for target in banks
+    )
     assert manifest["artifacts"]["patch_results_sha256"] == sha256_file(
         root / "patch_results.parquet"
     )
@@ -574,3 +638,93 @@ def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path
     assert progress["phase"] == "patches"
     assert progress["completed"] == 2
     assert progress["total"] == 2
+
+
+@pytest.mark.parametrize(
+    ("stop_after_readout", "content_usable", "patch_eligible"),
+    ((True, True, True), (False, False, False)),
+)
+def test_readout_completion_stops_before_patching_when_requested_or_gate_fails(
+    tmp_path, monkeypatch, stop_after_readout, content_usable, patch_eligible
+):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    readout_path = bundle / "readout_ledger.parquet"
+    pairs_path = bundle / "patch_pair_ledger.parquet"
+    pd.DataFrame({
+        "readout_work_key": ["validation|one"], "readout_role": ["layer_select"],
+        "prompt": ["prompt"], "item_id": ["item-1"], "winner_content_id": [0],
+        "winner_position": [1], "winner_label_index": [2], "winner_unique": [True],
+        "manipulation": ["label_only"],
+    }).to_parquet(readout_path, index=False)
+    pd.DataFrame({"pair_work_key": ["pair"], "selected_for_patching": [True]}).to_parquet(
+        pairs_path, index=False
+    )
+    manifest = {
+        "stage": "discovery", "model": {"id": None, "revision": None},
+        "readout": {"rows": 1, "sha256": sha256_file(readout_path)},
+        "pairs": {"rows": 1, "sha256": sha256_file(pairs_path)},
+    }
+    (bundle / "bundle_manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        decision_binding_cli, "_load_bundle",
+        lambda _root: (manifest, pd.read_parquet(readout_path), pd.read_parquet(pairs_path)),
+    )
+    monkeypatch.setattr(
+        decision_binding_cli, "load_model_and_tokenizer",
+        lambda *_a, **_k: (torch.nn.Linear(1, 1), object(), torch.device("cpu")),
+    )
+    banks = {
+        target: ProbeBank(np.zeros((1, 2, 4, 2)), np.zeros((1, 2, 4)),
+                          np.zeros((1, 2, 2)), np.arange(4), 1e-2, target)
+        for target in ("content", "position", "label", "legacy_content")
+    }
+    def persist_banks(root, *_args):
+        for target, bank in banks.items():
+            save_probe_bank(root / f"probe_bank_{target}.npz", bank)
+        (root / "probe_banks.json").write_text(json.dumps({
+            "probe_bank_sha256": {
+                target: sha256_file(root / f"probe_bank_{target}.npz") for target in banks
+            }
+        }))
+        return banks
+
+    monkeypatch.setattr(decision_binding_cli, "_fit_or_load_banks", persist_banks)
+    monkeypatch.setattr(
+        decision_binding_cli, "capture_layer_readouts",
+        lambda _m, _t, prompts, **_k: CapturedReadouts(
+            torch.zeros((len(prompts), 1, 2, 2)), torch.zeros((len(prompts), 4)),
+            batches=1, actual_tokens=1, padded_tokens=1,
+        ),
+    )
+    monkeypatch.setattr(
+        decision_binding_cli, "select_readout_layers",
+        lambda *_a, **_k: {
+            target: {
+                "usable": content_usable if target == "content" else True,
+                "checkpoint": "format_end",
+                "patch_layers": [0],
+            }
+            for target in ("content", "position", "label")
+        },
+    )
+    monkeypatch.setattr(
+        decision_binding_cli, "run_patch_pair",
+        lambda *_a, **_k: pytest.fail("readout-only mode must not patch"),
+    )
+    args = SimpleNamespace(
+        bundle=str(bundle), profile="qwen", frozen_run=None,
+        output_base=str(tmp_path / "runs"), bootstrap_samples=10, permutation_samples=10,
+        stable_controls=96, label_binding_controls=96, max_readout_rows=None,
+        max_pairs=None, canary_items=None, local_files_only=True, allow_cpu=True,
+        batch_size=2, max_batch_tokens=200, readout_chunk_size=1,
+        patch_shard_size=1, seed=0, stop_after_readout=stop_after_readout,
+    )
+
+    decision_binding_cli.cmd_run_model(args)
+
+    run_root = next((tmp_path / "runs" / "qwen2.5-1.5b-instruct").iterdir())
+    result = json.loads((run_root / "run_manifest.json").read_text())
+    assert result["status"] == "readout_complete"
+    assert result["patch_eligible"] is patch_eligible
+    assert not (run_root / "patch_results.parquet").exists()

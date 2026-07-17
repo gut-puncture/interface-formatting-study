@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  echo "Usage: $0 <start|status|stop|kill|tail> <profile> [functional|full] [bundle] [frozen-run]"
+  echo "Usage: $0 <start|status|stop|kill|tail> <profile> [functional|readout|full] [bundle] [frozen-run]"
   exit 0
 fi
 
@@ -19,7 +19,7 @@ MODE_FILE="$STATE_DIR/${PROFILE}.mode"
 ARGS_FILE="$STATE_DIR/${PROFILE}.args"
 if [[ -z "$MODE" && -f "$MODE_FILE" ]]; then MODE="$(cat "$MODE_FILE")"; fi
 MODE="${MODE:-full}"
-[[ "$MODE" =~ ^(functional|full)$ ]] || { echo "invalid mode" >&2; exit 2; }
+[[ "$MODE" =~ ^(functional|readout|full)$ ]] || { echo "invalid mode" >&2; exit 2; }
 LOG_FILE="$STATE_DIR/${PROFILE}-${MODE}.log"
 LOCK_FILE="$STATE_DIR/${PROFILE}.lock"
 

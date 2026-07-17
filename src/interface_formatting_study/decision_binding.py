@@ -607,8 +607,8 @@ def capture_layer_readouts(
     input_preparation_seconds = time.monotonic() - preparation_started
 
     blocks = find_transformer_blocks(model)
-    output_activations: list[torch.Tensor | None] = [None] * len(prompts)
-    output_scores: list[torch.Tensor | None] = [None] * len(prompts)
+    output_activations: torch.Tensor | None = None
+    output_scores: torch.Tensor | None = None
     device_obj = device or next(model.parameters()).device
     pad_id = int(getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", 0) or 0)
     padded_tokens = 0
@@ -664,15 +664,21 @@ def capture_layer_readouts(
         log_probs = torch.log_softmax(logits[rows, last_positions], dim=-1)
         label_tensor = torch.tensor([label_ids[label] for label in LABELS], device=logits.device)
         scores = log_probs.index_select(-1, label_tensor).detach().float().cpu()
+        if output_activations is None:
+            output_activations = torch.empty(
+                (len(prompts), *layer_tensor.shape[1:]), dtype=layer_tensor.dtype
+            )
+            output_scores = torch.empty((len(prompts), 4), dtype=scores.dtype)
         for row, index in enumerate(indices):
             output_activations[index] = layer_tensor[row]
+            assert output_scores is not None
             output_scores[index] = scores[row]
         padded_tokens += len(indices) * max_len
-    if any(value is None for value in (*output_activations, *output_scores)):
+    if output_activations is None or output_scores is None:
         raise RuntimeError("Batched readout did not produce every requested row")
     return CapturedReadouts(
-        activations=torch.stack([value for value in output_activations if value is not None]),
-        raw_log_probs=torch.stack([value for value in output_scores if value is not None]),
+        activations=output_activations,
+        raw_log_probs=output_scores,
         batches=len(groups),
         actual_tokens=sum(map(len, encoded)),
         padded_tokens=padded_tokens,
@@ -688,6 +694,7 @@ class ProbeBank:
     means: np.ndarray
     classes: np.ndarray
     c: float
+    target_name: str = "content"
 
     def log_probabilities(self, activations: np.ndarray | torch.Tensor) -> np.ndarray:
         values = np.asarray(activations, dtype=np.float64)
@@ -1008,13 +1015,20 @@ def run_patch_pair(
     model,
     tokenizer,
     pair: Mapping[str, object],
-    bank: ProbeBank,
+    banks: Mapping[str, ProbeBank],
     frozen_selection: Mapping[str, Mapping[str, object]],
     *,
     device=None,
 ) -> pd.DataFrame:
     if not bool(pair.get("selected_for_patching")):
         raise ValueError("Patch pair is not selected for patching")
+    for mechanism in ("content", "label"):
+        if mechanism not in banks:
+            raise ValueError(f"Probe banks are missing {mechanism}")
+        if banks[mechanism].target_name != mechanism:
+            raise ValueError(
+                f"{mechanism} probe bank carries target {banks[mechanism].target_name!r}"
+            )
     donor_prompt = str(pair["donor_prompt"])
     receiver_prompt = str(pair["receiver_prompt"])
     for prefix, prompt in (("donor", donor_prompt), ("receiver", receiver_prompt)):
@@ -1047,8 +1061,11 @@ def run_patch_pair(
         batch_size=2,
         device=device,
     )
-    if captured.activations.shape[1] != bank.weights.shape[0]:
-        raise ValueError("Captured model layers do not match the frozen probe bank")
+    if any(
+        captured.activations.shape[1] != banks[mechanism].weights.shape[0]
+        for mechanism in ("content", "label")
+    ):
+        raise ValueError("Captured model layers do not match the frozen probe banks")
     unpatched = _scored_label_result(
         {
             label: float(captured.raw_log_probs[1, index])
@@ -1108,6 +1125,7 @@ def run_patch_pair(
         return record
 
     for mechanism in ("content", "label"):
+        bank = banks[mechanism]
         if mechanism not in frozen_selection:
             raise ValueError(f"Frozen selection is missing {mechanism}")
         specification = frozen_selection[mechanism]
@@ -1184,31 +1202,119 @@ def fit_probe_bank(
     *,
     c: float = 1e-2,
     max_iter: int = 5000,
+    target_name: str = "content",
+    row_mask: Sequence[bool] | None = None,
+    class_weight: Literal["balanced"] | None = None,
 ) -> ProbeBank:
     from sklearn.exceptions import ConvergenceWarning
     from sklearn.linear_model import LogisticRegression
 
-    values = np.asarray(activations, dtype=np.float64)
+    values = np.asarray(activations)
     labels = np.asarray(targets, dtype=np.int64)
     if values.ndim != 4 or len(values) != len(labels):
         raise ValueError("Probe activations must have shape [rows, layers, checkpoints, hidden]")
-    if sorted(np.unique(labels).tolist()) != list(range(4)):
+    selected = (
+        np.ones(len(values), dtype=bool)
+        if row_mask is None
+        else np.asarray(row_mask, dtype=bool)
+    )
+    if selected.shape != (len(values),) or not selected.any():
+        raise ValueError("Probe row mask must select at least one activation row")
+    selected_labels = labels[selected]
+    if sorted(np.unique(selected_labels).tolist()) != list(range(4)):
         raise ValueError("Probe fitting requires all four raw winner classes")
     layers, checkpoints, hidden = values.shape[1:]
     weights = np.empty((layers, checkpoints, 4, hidden), dtype=np.float64)
     intercepts = np.empty((layers, checkpoints, 4), dtype=np.float64)
-    means = values.mean(axis=0)
+    means = np.empty((layers, checkpoints, hidden), dtype=np.float64)
     for layer in range(layers):
         for checkpoint in range(checkpoints):
-            estimator = LogisticRegression(C=float(c), solver="lbfgs", max_iter=int(max_iter))
+            slice_values = np.asarray(values[selected, layer, checkpoint], dtype=np.float64)
+            means[layer, checkpoint] = slice_values.mean(axis=0)
+            estimator = LogisticRegression(
+                C=float(c), solver="lbfgs", max_iter=int(max_iter), class_weight=class_weight
+            )
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ConvergenceWarning)
-                estimator.fit(values[:, layer, checkpoint] - means[layer, checkpoint], labels)
+                estimator.fit(slice_values - means[layer, checkpoint], selected_labels)
             if any(issubclass(warning.category, ConvergenceWarning) for warning in caught):
                 raise RuntimeError(f"Probe did not converge at layer {layer}, checkpoint {checkpoint}")
             weights[layer, checkpoint] = estimator.coef_
             intercepts[layer, checkpoint] = estimator.intercept_
-    return ProbeBank(weights, intercepts, means, np.arange(4, dtype=np.int64), float(c))
+    return ProbeBank(
+        weights,
+        intercepts,
+        means,
+        np.arange(4, dtype=np.int64),
+        float(c),
+        str(target_name),
+    )
+
+
+def fit_coordinate_probe_banks(
+    activations: np.ndarray | torch.Tensor,
+    ledger: pd.DataFrame,
+    *,
+    c: float = 1e-2,
+    max_iter: int = 5000,
+) -> dict[str, ProbeBank]:
+    """Fit independent content, position, label, and legacy content readers."""
+    values = np.asarray(activations)
+    if len(values) != len(ledger):
+        raise ValueError("Ledger and activation row counts differ")
+    required = {
+        "readout_role",
+        "manipulation",
+        "winner_content_id",
+        "winner_position",
+        "winner_label_index",
+        "winner_unique",
+    }
+    missing = required - set(ledger.columns)
+    if missing:
+        raise ValueError(f"Probe ledger is missing columns: {sorted(missing)}")
+    training = ledger["readout_role"].astype(str).eq("probe_train").to_numpy()
+    if not training.any():
+        raise ValueError("Probe ledger contains no probe_train rows")
+    banks: dict[str, ProbeBank] = {}
+    for name, target_column in (
+        ("content", "winner_content_id"),
+        ("position", "winner_position"),
+        ("label", "winner_label_index"),
+    ):
+        evaluable_column = f"{name}_evaluable"
+        evaluable = (
+            ledger[evaluable_column].astype(bool).to_numpy()
+            if evaluable_column in ledger
+            else ledger["winner_unique"].astype(bool).to_numpy()
+        )
+        mask = training & evaluable
+        banks[name] = fit_probe_bank(
+            values,
+            ledger[target_column].to_numpy(dtype=np.int64),
+            c=c,
+            max_iter=max_iter,
+            target_name=name,
+            row_mask=mask,
+            class_weight="balanced",
+        )
+    legacy_mask = (
+        training
+        & ledger["winner_unique"].astype(bool).to_numpy()
+        & ledger["manipulation"].astype(str).eq("controlled_baseline").to_numpy()
+    )
+    if "content_evaluable" in ledger:
+        legacy_mask &= ledger["content_evaluable"].astype(bool).to_numpy()
+    banks["legacy_content"] = fit_probe_bank(
+        values,
+        ledger["winner_content_id"].to_numpy(dtype=np.int64),
+        c=c,
+        max_iter=max_iter,
+        target_name="legacy_content",
+        row_mask=legacy_mask,
+        class_weight=None,
+    )
+    return banks
 
 
 def save_probe_bank(path: str | Path, bank: ProbeBank) -> None:
@@ -1219,6 +1325,7 @@ def save_probe_bank(path: str | Path, bank: ProbeBank) -> None:
         means=bank.means,
         classes=bank.classes,
         c=np.asarray(bank.c),
+        target_name=np.asarray(bank.target_name),
     )
 
 
@@ -1230,7 +1337,108 @@ def load_probe_bank(path: str | Path) -> ProbeBank:
             payload["means"],
             payload["classes"],
             float(payload["c"]),
+            str(payload["target_name"].item()) if "target_name" in payload else "content",
         )
+
+
+def evaluate_probe_banks(
+    banks: Mapping[str, ProbeBank],
+    activations: np.ndarray | torch.Tensor,
+    ledger: pd.DataFrame,
+) -> pd.DataFrame:
+    """Score all coordinate readers without duplicating structural output rows."""
+    expected = {"content", "position", "label", "legacy_content"}
+    if set(banks) != expected:
+        raise ValueError(f"Probe banks must be exactly {sorted(expected)}")
+    for name, bank in banks.items():
+        if bank.target_name != name:
+            raise ValueError(f"Probe bank {name!r} carries target {bank.target_name!r}")
+    if len(ledger) != len(activations):
+        raise ValueError("Ledger and activation row counts differ")
+    required = {
+        "readout_work_key", "item_id", "readout_role", "manipulation",
+        "winner_unique", "winner_content_id", "winner_position", "winner_label_index",
+    }
+    missing = required - set(ledger.columns)
+    if missing:
+        raise ValueError(f"Readout ledger is missing columns: {sorted(missing)}")
+    compact_columns = [
+        column for column in (
+            "readout_work_key", "work_key", "item_id", "subject", "split",
+            "wrapper_name", "readout_role", "manipulation", "variant",
+            "winner_unique", "winner_content_id", "winner_position",
+            "winner_label_index", "text_identity_ambiguous", "content_evaluable",
+            "position_evaluable", "label_evaluable",
+        ) if column in ledger
+    ]
+    compact = ledger.reset_index(drop=True)[compact_columns].copy()
+    unique = compact["winner_unique"].astype(bool).to_numpy()
+    ambiguous = (
+        compact.get("text_identity_ambiguous", pd.Series(False, index=compact.index))
+        .astype(bool).to_numpy()
+    )
+    default_masks = {
+        "content": unique & ~ambiguous,
+        "position": unique,
+        "label": unique,
+    }
+    masks = {
+        name: (
+            compact[f"{name}_evaluable"].astype(bool).to_numpy()
+            if f"{name}_evaluable" in compact
+            else default_masks[name]
+        )
+        for name in ("content", "position", "label")
+    }
+    targets = {
+        "content": compact["winner_content_id"].to_numpy(dtype=int),
+        "position": compact["winner_position"].to_numpy(dtype=int),
+        "label": compact["winner_label_index"].to_numpy(dtype=int),
+    }
+    values = np.asarray(activations)
+    reference = banks["content"]
+    shape = (len(values), *reference.weights.shape[:2], 4)
+    if any(
+        bank.weights.shape[:2] != reference.weights.shape[:2]
+        or bank.weights.shape[-1] != values.shape[-1]
+        for bank in banks.values()
+    ):
+        raise ValueError("Probe bank shapes differ from the activations")
+    frames: list[pd.DataFrame] = []
+    for layer in range(shape[1]):
+        for checkpoint_index, checkpoint in enumerate(("format_end", "answer_prefix_end")):
+            frame = compact.copy()
+            frame["layer"] = layer
+            frame["checkpoint"] = checkpoint
+            row_indices = np.arange(len(frame))
+            site_values = np.asarray(values[:, layer, checkpoint_index], dtype=np.float64)
+            for name, bank in banks.items():
+                scores = (site_values - bank.means[layer, checkpoint_index]) @ bank.weights[
+                    layer, checkpoint_index
+                ].T
+                scores += bank.intercepts[layer, checkpoint_index]
+                scores -= scores.max(axis=1, keepdims=True)
+                scores -= np.log(np.exp(scores).sum(axis=1, keepdims=True))
+                prediction = scores.argmax(axis=1)
+                for class_id in range(4):
+                    frame[f"{name}_log_prob_{class_id}"] = scores[:, class_id]
+                if name == "legacy_content":
+                    frame[f"{name}_pred_class"] = prediction
+                    continue
+                mask = masks[name]
+                target = targets[name]
+                frame[f"{name}_evaluable"] = mask
+                frame[f"{name}_pred_class"] = pd.array(
+                    np.where(mask, prediction, np.nan), dtype="Int64"
+                )
+                frame[f"{name}_log_prob"] = np.where(
+                    mask, scores[row_indices, target], np.nan
+                )
+                frame[f"{name}_correct"] = pd.array(
+                    np.where(mask, prediction == target, np.nan), dtype="boolean"
+                )
+            frames.append(frame)
+    return pd.concat(frames, ignore_index=True)
 
 
 def evaluate_probe_bank(
@@ -1296,32 +1504,57 @@ def evaluate_probe_bank(
     return pd.concat(frames, ignore_index=True)
 
 
-def _macro_accuracy(frame: pd.DataFrame, target: str) -> float:
-    scored = frame[["item_id", target, "probe_pred_class"]].copy()
-    scored["correct"] = scored[target].astype(int) == scored["probe_pred_class"].astype(int)
-    per_item_class = scored.groupby(["item_id", target], sort=False)["correct"].mean()
-    return float(per_item_class.groupby(level=1).mean().mean())
+def _item_confusion(frame: pd.DataFrame, target: str, prediction: str) -> np.ndarray:
+    columns = ["item_id", target, prediction]
+    if "wrapper_name" in frame:
+        columns.append("wrapper_name")
+    scored = frame[columns].dropna().copy()
+    if scored.empty:
+        raise ValueError("No evaluable rows for macro accuracy")
+    if "wrapper_name" not in scored:
+        scored["wrapper_name"] = "__single_wrapper__"
+    scored[target] = scored[target].astype(int)
+    scored[prediction] = scored[prediction].astype(int)
+    counts = scored.groupby(
+        ["item_id", "wrapper_name", target, prediction], sort=False
+    ).size()
+    distributions = counts / counts.groupby(
+        level=["item_id", "wrapper_name", target], sort=False
+    ).transform("sum")
+    per_item = distributions.groupby(level=["item_id", target, prediction], sort=False).mean()
+    item_ids = sorted(scored["item_id"].astype(str).unique())
+    item_index = {item_id: index for index, item_id in enumerate(item_ids)}
+    confusion = np.full((len(item_ids), 4, 4), np.nan, dtype=float)
+    for (item_id, target_class, predicted_class), value in per_item.items():
+        row = item_index[str(item_id)]
+        target_index = int(target_class)
+        if np.isnan(confusion[row, target_index]).all():
+            confusion[row, target_index] = 0.0
+        confusion[row, target_index, int(predicted_class)] = float(value)
+    return confusion
+
+
+def _macro_accuracy(frame: pd.DataFrame, target: str, prediction: str) -> float:
+    per_item_class = np.diagonal(
+        _item_confusion(frame, target, prediction), axis1=1, axis2=2
+    )
+    return float(np.nanmean(np.nanmean(per_item_class, axis=0)))
 
 
 def _selection_gate(
     frame: pd.DataFrame,
     *,
     target: str,
+    prediction: str,
     bootstrap_samples: int,
     permutation_samples: int,
     rng: np.random.Generator,
 ) -> tuple[float, float, float, bool]:
-    observed = _macro_accuracy(frame, target)
-    _, item_index = np.unique(frame["item_id"].astype(str), return_inverse=True)
-    targets = frame[target].to_numpy(dtype=int)
-    predictions = frame["probe_pred_class"].to_numpy(dtype=int)
-    n_items = int(item_index.max()) + 1
-    counts = np.zeros((n_items, 4), dtype=float)
-    prediction_counts = np.zeros((n_items, 4, 4), dtype=float)
-    np.add.at(counts, (item_index, targets), 1)
-    np.add.at(prediction_counts, (item_index, targets, predictions), 1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        per_item_class = np.where(counts > 0, np.diagonal(prediction_counts, axis1=1, axis2=2) / counts, np.nan)
+    frame = frame.dropna(subset=[prediction]).copy()
+    observed = _macro_accuracy(frame, target, prediction)
+    confusion = _item_confusion(frame, target, prediction)
+    n_items = len(confusion)
+    per_item_class = np.diagonal(confusion, axis1=1, axis2=2)
     draws = rng.integers(0, n_items, size=(bootstrap_samples, n_items))
     sampled = per_item_class[draws]
     class_counts = np.sum(~np.isnan(sampled), axis=1)
@@ -1341,15 +1574,97 @@ def _selection_gate(
             class_scores = []
             for new_class in range(4):
                 original_class = (new_class - offset) % 4
-                denominator = counts[item_rows, original_class]
-                numerator = prediction_counts[item_rows, original_class, new_class]
-                valid = denominator > 0
+                numerator = confusion[item_rows, original_class, new_class]
+                valid = ~np.isnan(numerator)
                 if valid.any():
-                    class_scores.append(float(np.mean(numerator[valid] / denominator[valid])))
+                    class_scores.append(float(np.mean(numerator[valid])))
             null.append(float(np.mean(class_scores)))
     lower = float(np.quantile(boot, 0.025))
     null_99 = float(np.quantile(null, 0.99))
     return observed, lower, null_99, bool(observed >= 0.50 and lower > 0.25 and observed > null_99)
+
+
+_TARGET_COLUMNS = {
+    "content": "winner_content_id",
+    "position": "winner_position",
+    "label": "winner_label_index",
+}
+_SELECTIVITY_CONTRASTS = {
+    "content": (("position_only", "position"), ("label_only", "label")),
+    "position": (("position_only", "content"),),
+    "label": (("label_only", "content"),),
+}
+
+
+def _coordinate_log_probability(
+    frame: pd.DataFrame,
+    *,
+    reader: str,
+    coordinate: str,
+) -> np.ndarray:
+    targets = frame[_TARGET_COLUMNS[coordinate]].to_numpy(dtype=int)
+    scores = frame[[f"{reader}_log_prob_{class_id}" for class_id in range(4)]].to_numpy(float)
+    return scores[np.arange(len(frame)), targets]
+
+
+def _selectivity_metrics(
+    frame: pd.DataFrame,
+    *,
+    reader: str,
+    bootstrap_samples: int,
+    seed: int,
+) -> tuple[float, float, dict[str, dict[str, float]]]:
+    contrasts: dict[str, dict[str, float]] = {}
+    for manipulation, nuisance in _SELECTIVITY_CONTRASTS[reader]:
+        arm = frame[frame["manipulation"].astype(str) == manipulation].copy()
+        arm = arm[arm[f"{reader}_evaluable"].astype(bool)]
+        if arm.empty:
+            raise ValueError(f"No evaluable {manipulation} rows for {reader} selectivity")
+        differences = _coordinate_log_probability(
+            arm, reader=reader, coordinate=reader
+        ) - _coordinate_log_probability(arm, reader=reader, coordinate=nuisance)
+        difference_frame = pd.DataFrame(
+            {
+                "item_id": arm["item_id"].astype(str).to_numpy(),
+                "wrapper_name": (
+                    arm["wrapper_name"].astype(str).to_numpy()
+                    if "wrapper_name" in arm
+                    else "__single_wrapper__"
+                ),
+                "difference": differences,
+            }
+        )
+        per_item_wrapper = difference_frame.groupby(
+            ["item_id", "wrapper_name"], sort=False
+        )["difference"].mean()
+        per_item = per_item_wrapper.groupby(level="item_id", sort=False).mean().to_numpy(float)
+        rng = np.random.default_rng(
+            int(_stable_digest(str(seed), reader, manipulation, nuisance)[:16], 16)
+        )
+        draws = per_item[
+            rng.integers(0, len(per_item), size=(bootstrap_samples, len(per_item)))
+        ].mean(axis=1)
+        contrasts[f"{manipulation}:{nuisance}"] = {
+            "mean": float(per_item.mean()),
+            "bootstrap_lower_95": float(np.quantile(draws, 0.025)),
+        }
+    return (
+        min(value["mean"] for value in contrasts.values()),
+        min(value["bootstrap_lower_95"] for value in contrasts.values()),
+        contrasts,
+    )
+
+
+def _accuracy_rows(frame: pd.DataFrame, reader: str) -> pd.DataFrame:
+    allowed = {
+        "content": {"position_only", "label_only"},
+        "position": {"position_only"},
+        "label": {"label_only"},
+    }[reader]
+    return frame[
+        frame["manipulation"].astype(str).isin(allowed)
+        & frame[f"{reader}_evaluable"].astype(bool)
+    ]
 
 
 def select_readout_layers(
@@ -1360,62 +1675,87 @@ def select_readout_layers(
     seed: int = 0,
 ) -> dict[str, dict[str, object]]:
     required = {
-        "item_id", "layer", "checkpoint", "probe_pred_class", "winner_content_id",
-        "winner_position", "winner_label_index", "content_log_prob", "position_log_prob",
-        "label_log_prob", "winner_unique", "text_identity_ambiguous",
+        "item_id", "readout_role", "manipulation", "layer", "checkpoint",
+        "winner_content_id", "winner_position", "winner_label_index",
+        *{
+            f"{reader}_{suffix}"
+            for reader in ("content", "position", "label")
+            for suffix in ("pred_class", "evaluable")
+        },
+        *{
+            f"{reader}_log_prob_{class_id}"
+            for reader in ("content", "position", "label")
+            for class_id in range(4)
+        },
     }
     missing = required - set(evaluated.columns)
     if missing or bootstrap_samples <= 0 or permutation_samples <= 0:
         raise ValueError(f"Invalid layer-selection input; missing={sorted(missing)}")
-    candidates = evaluated[
-        evaluated["winner_unique"].astype(bool)
-        & ~evaluated["text_identity_ambiguous"].astype(bool)
-    ].copy()
-    if "manipulation" in candidates:
-        candidates = candidates[candidates["manipulation"] != "controlled_baseline"]
-    rng = np.random.default_rng(seed)
+    selection = evaluated[evaluated["readout_role"].astype(str) == "layer_select"].copy()
+    gate = evaluated[evaluated["readout_role"].astype(str) == "reader_gate"].copy()
+    if selection.empty or gate.empty:
+        raise ValueError("Layer selection and reader gate must both contain rows")
     result: dict[str, dict[str, object]] = {}
-    for name, checkpoint, target in (
-        ("content", "format_end", "winner_content_id"),
-        ("label", "answer_prefix_end", "winner_label_index"),
-    ):
-        subset = candidates[candidates["checkpoint"] == checkpoint]
-        rows = []
-        for layer, group in subset.groupby("layer", sort=True):
-            per_item = group.groupby("item_id", sort=False)[
-                [f"{coordinate}_log_prob" for coordinate in ("content", "position", "label")]
-            ].mean()
-            scores = {
-                coordinate: float(per_item[f"{coordinate}_log_prob"].mean())
-                for coordinate in ("content", "position", "label")
-            }
-            nuisance_columns = [
-                f"{coordinate}_log_prob" for coordinate in ("content", "position", "label")
-                if coordinate != name
-            ]
-            item_selectivity = (
-                per_item[f"{name}_log_prob"] - per_item[nuisance_columns].max(axis=1)
-            ).to_numpy(float)
-            selectivity = float(item_selectivity.mean())
-            selectivity_draws = rng.choice(
-                item_selectivity,
-                size=(bootstrap_samples, len(item_selectivity)),
-                replace=True,
-            ).mean(axis=1)
-            selectivity_lower = float(np.quantile(selectivity_draws, 0.025))
-            rows.append((selectivity, selectivity_lower, int(layer), scores))
-        if not rows:
-            raise ValueError(f"No usable {checkpoint} rows for layer selection")
-        selectivity, selectivity_lower, selected_layer, scores = max(
-            rows, key=lambda row: (row[0], -row[2])
+    for name in ("content", "position", "label"):
+        target = _TARGET_COLUMNS[name]
+        candidates: list[dict[str, object]] = []
+        for (layer, checkpoint), group in selection.groupby(
+            ["layer", "checkpoint"], sort=True
+        ):
+            group = group[group[f"{name}_evaluable"].astype(bool)]
+            selectivity, selectivity_lower, contrasts = _selectivity_metrics(
+                group,
+                reader=name,
+                bootstrap_samples=bootstrap_samples,
+                seed=int(_stable_digest(str(seed), name, layer, checkpoint)[:16], 16),
+            )
+            accuracy_group = _accuracy_rows(group, name)
+            accuracy = _macro_accuracy(accuracy_group, target, f"{name}_pred_class")
+            candidates.append(
+                {
+                    "layer": int(layer),
+                    "checkpoint": str(checkpoint),
+                    "selectivity": selectivity,
+                    "selectivity_bootstrap_lower_95": selectivity_lower,
+                    "contrasts": contrasts,
+                    "macro_accuracy": accuracy,
+                }
+            )
+        if not candidates:
+            raise ValueError(f"No usable rows for {name} layer selection")
+        chosen = max(
+            candidates,
+            key=lambda value: (
+                value["selectivity"],
+                value["macro_accuracy"],
+                -value["layer"],
+                value["checkpoint"] == "format_end",
+            ),
         )
-        selected = subset[subset["layer"].astype(int) == selected_layer]
+        selected_layer = int(chosen["layer"])
+        checkpoint = str(chosen["checkpoint"])
+        gated = gate[
+            (gate["layer"].astype(int) == selected_layer)
+            & (gate["checkpoint"].astype(str) == checkpoint)
+            & gate[f"{name}_evaluable"].astype(bool)
+        ]
+        accuracy_gate = _accuracy_rows(gated, name)
+        rng = np.random.default_rng(
+            int(_stable_digest(str(seed), "gate", name, selected_layer, checkpoint)[:16], 16)
+        )
         observed, lower, null_99, accuracy_usable = _selection_gate(
-            selected,
+            accuracy_gate,
             target=target,
+            prediction=f"{name}_pred_class",
             bootstrap_samples=bootstrap_samples,
             permutation_samples=permutation_samples,
             rng=rng,
+        )
+        gate_selectivity, gate_selectivity_lower, gate_contrasts = _selectivity_metrics(
+            gated,
+            reader=name,
+            bootstrap_samples=bootstrap_samples,
+            seed=int(_stable_digest(str(seed), "gate-selectivity", name)[:16], 16),
         )
         max_layer = int(evaluated["layer"].max())
         patch_layers = sorted({0, *range(max(0, selected_layer - 1), min(max_layer, selected_layer + 1) + 1)})
@@ -1423,12 +1763,24 @@ def select_readout_layers(
             "selected_layer": selected_layer,
             "checkpoint": checkpoint,
             "patch_layers": patch_layers,
-            "selectivity": selectivity,
-            "selectivity_bootstrap_lower_95": selectivity_lower,
-            "coordinate_scores": scores,
+            "selectivity": gate_selectivity,
+            "selectivity_bootstrap_lower_95": gate_selectivity_lower,
             "macro_accuracy": observed,
             "bootstrap_lower_95": lower,
             "permutation_99": null_99,
-            "usable": bool(accuracy_usable and selectivity_lower > 0.0),
+            "selection_metrics": {
+                **chosen,
+                "items": int(selection["item_id"].nunique()),
+            },
+            "gate_metrics": {
+                "items": int(gated["item_id"].nunique()),
+                "macro_accuracy": observed,
+                "bootstrap_lower_95": lower,
+                "permutation_99": null_99,
+                "selectivity": gate_selectivity,
+                "selectivity_bootstrap_lower_95": gate_selectivity_lower,
+                "contrasts": gate_contrasts,
+            },
+            "usable": bool(accuracy_usable and gate_selectivity_lower > 0.0),
         }
     return result

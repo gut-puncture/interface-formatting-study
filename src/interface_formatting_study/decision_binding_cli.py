@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import signal
@@ -16,8 +17,8 @@ import torch
 
 from .decision_binding import (
     capture_layer_readouts,
-    evaluate_probe_bank,
-    fit_probe_bank,
+    evaluate_probe_banks,
+    fit_coordinate_probe_banks,
     load_probe_bank,
     prepare_patch_pair_ledger,
     prepare_readout_ledger,
@@ -48,7 +49,7 @@ def _atomic_json(payload: object, path: Path) -> None:
 def _load_bundle(root: Path) -> tuple[dict[str, object], pd.DataFrame, pd.DataFrame]:
     manifest_path = root / "bundle_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("bundle_schema_version") != 2 or "source_validation" not in manifest:
+    if manifest.get("bundle_schema_version") != 3 or "source_validation" not in manifest:
         raise RuntimeError("Decision-binding bundle lacks canonical source attestation")
     scored_attestation = manifest["source_validation"].get("scored_artifact", {})
     required_attestation = {
@@ -118,7 +119,7 @@ def cmd_prepare(args) -> None:
     write_table_atomic(pairs, pairs_path)
     _atomic_json(
         {
-            "bundle_schema_version": 2,
+            "bundle_schema_version": 3,
             "stage": args.stage,
             "seed": args.seed,
             "source_scored_sha256": sha256_file(scored_path),
@@ -233,6 +234,27 @@ def _stable_sort(frame: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
     return frame.sort_values(available, kind="mergesort").reset_index(drop=True) if available else frame
 
 
+_BANK_TARGETS = ("content", "position", "label", "legacy_content")
+
+
+def _bank_paths(root: Path) -> dict[str, Path]:
+    return {target: root / f"probe_bank_{target}.npz" for target in _BANK_TARGETS}
+
+
+def _bank_hashes(root: Path) -> dict[str, str]:
+    return {target: sha256_file(path) for target, path in _bank_paths(root).items()}
+
+
+def _bank_artifact_hashes(root: Path) -> dict[str, str]:
+    return {
+        **{
+            f"probe_bank_{target}_sha256": digest
+            for target, digest in _bank_hashes(root).items()
+        },
+        "probe_banks_sha256": sha256_file(root / "probe_banks.json"),
+    }
+
+
 def _load_frozen(run_root: Path, profile_name: str):
     identity = json.loads((run_root / "semantic_identity.json").read_text(encoding="utf-8"))
     manifest = json.loads((run_root / "run_manifest.json").read_text(encoding="utf-8"))
@@ -251,43 +273,46 @@ def _load_frozen(run_root: Path, profile_name: str):
     if any(value is not None for value in limits.values()):
         raise RuntimeError("Frozen mechanism must come from an unrestricted full discovery run")
     selection_path = run_root / "frozen_selection.json"
-    bank_path = run_root / "probe_bank.npz"
+    bank_paths = _bank_paths(run_root)
     readout_path = run_root / "readout_scores.parquet"
     patch_path = run_root / "patch_results.parquet"
-    if not all(path.exists() for path in (selection_path, bank_path, readout_path, patch_path)):
+    if not all(path.exists() for path in (selection_path, readout_path, patch_path, *bank_paths.values())):
         raise RuntimeError("Frozen discovery run is missing required artifacts")
     selection_payload = json.loads(selection_path.read_text(encoding="utf-8"))
-    if selection_payload["probe_bank_sha256"] != sha256_file(bank_path):
-        raise RuntimeError("Frozen probe bank checksum mismatch")
+    bank_hashes = _bank_hashes(run_root)
+    if selection_payload.get("probe_bank_sha256") != bank_hashes:
+        raise RuntimeError("Frozen probe bank checksums mismatch")
     if selection_payload.get("readout_scores_sha256") != sha256_file(readout_path):
         raise RuntimeError("Frozen selection is not bound to the discovery readout scores")
     artifacts = manifest.get("artifacts", {})
     expected_hashes = {
         "frozen_selection_sha256": sha256_file(selection_path),
-        "probe_bank_sha256": sha256_file(bank_path),
         "readout_scores_sha256": sha256_file(readout_path),
         "patch_results_sha256": sha256_file(patch_path),
+        **_bank_artifact_hashes(run_root),
     }
     if any(artifacts.get(key) != value for key, value in expected_hashes.items()):
         raise RuntimeError("Frozen discovery manifest artifact checksums do not reconcile")
-    return load_probe_bank(bank_path), selection_payload["selection"], selection_path, bank_path
+    banks = {target: load_probe_bank(path) for target, path in bank_paths.items()}
+    if any(bank.target_name != target for target, bank in banks.items()):
+        raise RuntimeError("Frozen probe bank target identity mismatch")
+    return banks, selection_payload["selection"], selection_path, bank_paths
 
 
-def _fit_or_load_bank(root: Path, ledger: pd.DataFrame, model, tokenizer, args):
-    bank_path = root / "probe_bank.npz"
-    meta_path = root / "probe_bank.json"
-    if bank_path.exists() and meta_path.exists():
+def _fit_or_load_banks(root: Path, ledger: pd.DataFrame, model, tokenizer, args):
+    paths = _bank_paths(root)
+    meta_path = root / "probe_banks.json"
+    if all(path.exists() for path in paths.values()) and meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta["sha256"] != sha256_file(bank_path):
-            raise RuntimeError("Persisted probe bank checksum mismatch")
-        return load_probe_bank(bank_path)
-    train = ledger[
-        (ledger["readout_role"] == "probe_train")
-        & ledger["winner_unique"].astype(bool)
-        & ~ledger["text_identity_ambiguous"].astype(bool)
-    ]
+        if meta.get("probe_bank_sha256") != _bank_hashes(root):
+            raise RuntimeError("Persisted probe bank checksums mismatch")
+        banks = {target: load_probe_bank(path) for target, path in paths.items()}
+        if any(bank.target_name != target for target, bank in banks.items()):
+            raise RuntimeError("Persisted probe bank target identity mismatch")
+        return banks
+    train = ledger[ledger["readout_role"].astype(str).eq("probe_train")].copy()
     if train.empty:
-        raise RuntimeError("Discovery bundle has no unique-winner probe-training rows")
+        raise RuntimeError("Discovery bundle has no probe-training rows")
     fit_started = time.monotonic()
     captured = capture_layer_readouts(
         model,
@@ -296,19 +321,27 @@ def _fit_or_load_bank(root: Path, ledger: pd.DataFrame, model, tokenizer, args):
         batch_size=args.batch_size,
         max_batch_tokens=args.max_batch_tokens,
     )
-    bank = fit_probe_bank(captured.activations, train["winner_content_id"].astype(int).tolist())
-    save_probe_bank(bank_path, bank)
+    banks = fit_coordinate_probe_banks(captured.activations, train)
+    for target, path in paths.items():
+        temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.npz")
+        save_probe_bank(temporary, banks[target])
+        os.replace(temporary, path)
+    eligible_counts = {
+        target: int(train.get(f"{target}_evaluable", train["winner_unique"]).astype(bool).sum())
+        for target in ("content", "position", "label")
+    }
+    eligible_counts["legacy_content"] = int(
+        (
+            train["winner_unique"].astype(bool)
+            & train["manipulation"].astype(str).eq("controlled_baseline")
+            & train.get("content_evaluable", train["winner_unique"]).astype(bool)
+        ).sum()
+    )
     _atomic_json(
         {
-            "sha256": sha256_file(bank_path),
+            "probe_bank_sha256": _bank_hashes(root),
             "training_rows": len(train),
-            "ambiguous_training_items_retained_not_fitted": int(
-                ledger.loc[
-                    (ledger["readout_role"] == "probe_train")
-                    & ledger["text_identity_ambiguous"].astype(bool),
-                    "item_id",
-                ].nunique()
-            ),
+            "eligible_rows": eligible_counts,
             "telemetry": {
                 "actual_tokens": captured.actual_tokens,
                 "padded_tokens": captured.padded_tokens,
@@ -320,7 +353,7 @@ def _fit_or_load_bank(root: Path, ledger: pd.DataFrame, model, tokenizer, args):
         },
         meta_path,
     )
-    return bank
+    return banks
 
 
 def cmd_run_model(args) -> None:
@@ -349,13 +382,17 @@ def cmd_run_model(args) -> None:
     if stage == "confirmation":
         if not args.frozen_run:
             raise ValueError("Confirmation requires --frozen-run")
-        bank, selection, selection_path, bank_path = _load_frozen(Path(args.frozen_run), args.profile)
+        banks, selection, selection_path, bank_paths = _load_frozen(
+            Path(args.frozen_run), args.profile
+        )
         frozen_hashes = {
             "selection_sha256": sha256_file(selection_path),
-            "probe_bank_sha256": sha256_file(bank_path),
+            "probe_bank_sha256": {
+                target: sha256_file(path) for target, path in bank_paths.items()
+            },
         }
     config = {
-        "study": "decision_binding_v1",
+        "study": "decision_binding_v2",
         "stage": stage,
         "bundle_manifest_sha256": sha256_file(bundle_root / "bundle_manifest.json"),
         "readout_sha256": bundle_manifest["readout"]["sha256"],
@@ -373,12 +410,20 @@ def cmd_run_model(args) -> None:
             "pairs": args.max_pairs,
             "canary_items": canary_items,
         },
+        "runtime": {
+            name: importlib.metadata.version(name)
+            for name in ("torch", "transformers", "tokenizers", "numpy", "scikit-learn")
+        },
     }
+    source_paths = default_semantic_source_paths(PROJECT_ROOT)
+    lock_path = PROJECT_ROOT / "requirements-gpu.lock"
+    if lock_path.exists():
+        source_paths.append(lock_path)
     identity = build_semantic_identity(
         profile,
         config=config,
         dataset_path=bundle_root / "readout_ledger.parquet",
-        source_paths=default_semantic_source_paths(PROJECT_ROOT),
+        source_paths=source_paths,
     )
     root = Path(args.output_base) / profile.slug / identity.semantic_run_id
     root.mkdir(parents=True, exist_ok=True)
@@ -395,7 +440,14 @@ def cmd_run_model(args) -> None:
     _atomic_json(identity.as_dict(), identity_path)
     if stage == "confirmation":
         shutil.copy2(selection_path, root / "frozen_selection.json")
-        shutil.copy2(bank_path, root / "probe_bank.npz")
+        for target, bank_path in bank_paths.items():
+            shutil.copy2(bank_path, root / f"probe_bank_{target}.npz")
+        _atomic_json(
+            {
+                "probe_bank_sha256": _bank_hashes(root),
+            },
+            root / "probe_banks.json",
+        )
     _atomic_json(
         {
             "status": "starting",
@@ -437,7 +489,7 @@ def cmd_run_model(args) -> None:
         if not args.allow_cpu and (not torch.cuda.is_available() or device.type != "cuda"):
             raise RuntimeError("Decision-binding model runs require CUDA")
         if stage == "discovery":
-            bank = _fit_or_load_bank(root, ledger, model, tokenizer, args)
+            banks = _fit_or_load_banks(root, ledger, model, tokenizer, args)
 
         def progress(phase: str, completed: int, total: int, shard: Path | None = None) -> None:
             elapsed = max(time.monotonic() - started, 1e-9)
@@ -456,7 +508,9 @@ def cmd_run_model(args) -> None:
                 root / "progress.json",
             )
 
-        evaluation = ledger[ledger["readout_role"].isin(["layer_select", "confirmation"])].copy()
+        evaluation = ledger[
+            ledger["readout_role"].isin(["layer_select", "reader_gate", "confirmation"])
+        ].copy()
         selected = pairs[pairs["selected_for_patching"].astype(bool)].copy()
         if canary_items is not None:
             item_ids = _select_canary_items(
@@ -492,7 +546,7 @@ def cmd_run_model(args) -> None:
             readout_metrics["padded_tokens"] += captured.padded_tokens
             readout_metrics["input_preparation_seconds"] += captured.input_preparation_seconds
             readout_metrics["forward_seconds"] += captured.forward_seconds
-            return evaluate_probe_bank(bank, captured.activations, chunk)
+            return evaluate_probe_banks(banks, captured.activations, chunk)
 
         readout_scores = run_sharded_phase(
             readout_store,
@@ -536,10 +590,52 @@ def cmd_run_model(args) -> None:
             )
             selection_payload = {
                 "selection": selection,
-                "probe_bank_sha256": sha256_file(root / "probe_bank.npz"),
+                "probe_bank_sha256": _bank_hashes(root),
                 "readout_scores_sha256": sha256_file(root / "readout_scores.parquet"),
             }
             _atomic_json(selection_payload, root / "frozen_selection.json")
+        patch_eligible = bool(
+            selection.get("content", {}).get("usable")
+            and selection.get("label", {}).get("usable")
+        )
+        if getattr(args, "stop_after_readout", False) or not patch_eligible:
+            actual_tokens = int(readout_metrics["actual_tokens"])
+            padded_tokens = int(readout_metrics["padded_tokens"])
+            _atomic_json(
+                {
+                    "status": "readout_complete",
+                    "stage": stage,
+                    "profile": args.profile,
+                    "semantic_identity": identity.as_dict(),
+                    "patch_eligible": patch_eligible,
+                    "readout_rows": len(readout_scores),
+                    "expected_readout_rows": len(evaluation)
+                    * int(banks["content"].weights.shape[0]) * 2,
+                    "readout_chunks": len(readout_work),
+                    "expected_readout_chunks": len(readout_work),
+                    "completed_readout_chunks": len(readout_store.completed_work_keys()),
+                    "selection": selection,
+                    "telemetry": {
+                        "readout": {
+                            **readout_metrics,
+                            "padding_ratio": padded_tokens / actual_tokens if actual_tokens else 0.0,
+                            "tokens_per_forward_second": actual_tokens
+                            / max(float(readout_metrics["forward_seconds"]), 1e-9),
+                            "write_seconds": float(prior_readout.get("write_seconds", 0.0))
+                            + readout_store.write_seconds,
+                        }
+                    },
+                    "artifacts": {
+                        "readout_scores_sha256": sha256_file(root / "readout_scores.parquet"),
+                        "frozen_selection_sha256": sha256_file(root / "frozen_selection.json"),
+                        **_bank_artifact_hashes(root),
+                    },
+                    "wall_seconds": time.monotonic() - started,
+                    "stop_signal": stop.signal_name,
+                },
+                root / "run_manifest.json",
+            )
+            return
         if args.max_pairs:
             selected = selected.iloc[: args.max_pairs]
         patch_store = ShardStore(root / "shards" / "patches", identity)
@@ -550,7 +646,7 @@ def cmd_run_model(args) -> None:
         def process_patch(_key: str, row: pd.Series) -> pd.DataFrame:
             nonlocal patch_seconds
             patch_started = time.monotonic()
-            result = run_patch_pair(model, tokenizer, row, bank, selection, device=device)
+            result = run_patch_pair(model, tokenizer, row, banks, selection, device=device)
             patch_seconds += time.monotonic() - patch_started
             return result
 
@@ -574,7 +670,7 @@ def cmd_run_model(args) -> None:
         patch_rows_per_pair = 5 * sum(
             len(selection[mechanism]["patch_layers"]) for mechanism in ("content", "label")
         )
-        expected_readout_rows = len(evaluation) * int(bank.weights.shape[0]) * 2
+        expected_readout_rows = len(evaluation) * int(banks["content"].weights.shape[0]) * 2
         expected_patch_rows = len(selected) * patch_rows_per_pair
         actual_tokens = int(readout_metrics["actual_tokens"])
         padded_tokens = int(readout_metrics["padded_tokens"])
@@ -616,9 +712,7 @@ def cmd_run_model(args) -> None:
                     "frozen_selection_sha256": sha256_file(root / "frozen_selection.json")
                     if (root / "frozen_selection.json").exists()
                     else frozen_hashes["selection_sha256"],
-                    "probe_bank_sha256": sha256_file(root / "probe_bank.npz")
-                    if (root / "probe_bank.npz").exists()
-                    else frozen_hashes["probe_bank_sha256"],
+                    **_bank_artifact_hashes(root),
                 },
                 "wall_seconds": time.monotonic() - started,
                 "peak_vram_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
@@ -879,6 +973,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--local-files-only", action="store_true")
     run.add_argument("--allow-cpu", action="store_true", help=argparse.SUPPRESS)
+    run.add_argument("--stop-after-readout", action="store_true")
     run.set_defaults(func=cmd_run_model)
     analyze = sub.add_parser("analyze")
     analyze.add_argument("--run", action="append", required=True)
