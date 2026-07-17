@@ -2,12 +2,12 @@
 
 ## Owner Scope Box
 
-- Existing path reused: the causal-follow-up model profiles, exact prompt artifacts, token-aware scorer, residual hooks/patcher, semantic identity, atomic shards, and GPU operators.
-- New production code: one focused decision-binding domain module and one thin CLI are necessary because the repository has no all-layer readout, linear-probe, or probe-subspace patch path.
-- Expected scope: after the first review exposed missing canonical-source attestation, frozen-test analysis, and artifact completeness proof, about 2,100-2,250 net production lines plus focused tests; still one experiment domain module, one CLI, and narrow operator/analysis additions. Scientific scope is unchanged; the measured increase is fail-closed validation and proof for already approved behavior, not new features.
+- Existing path reused: the current decision-binding ledger, all-layer/two-checkpoint capture, linear probes, patching, semantic identity, atomic shards, and GPU operators.
+- New production code: a narrow correction is required because the current single probe is trained only where answer content, physical position, and displayed label coincide. The correction trains three independently identified readers and adds a readout-only verification boundary.
+- Expected scope: about 450-650 net new production lines plus focused tests, confined to the existing decision-binding module, CLI, and thin operator/verifier scripts. Pause and simplify before 700 production lines or ten implementation hours before review.
 - Review: exactly two independent reviewers, one for scientific/data semantics and one for runtime/resume/operator behavior; maximum two review rounds.
-- Final validation: one full local suite after review closes, expected under five minutes; first real GPU proof is one eight-item canary per model after local acceptance and explicit rental approval.
-- Deviation gate: the first 1,750-line gate triggered and the design was rechecked after review; stop again before exceeding 2,300 net production lines, fourteen implementation hours, two review rounds, or adding generalized orchestration, persistent hidden-state storage, head/MLP hooks, or new prompt/audit infrastructure.
+- Final validation: one full local suite after review closes, expected under five minutes; first real GPU proof is one full Mistral readout-only run after local acceptance and explicit rental approval. A smaller run would repeat the full probe-training cost without faithfully testing the changed surface.
+- Deviation gate: stop before 700 net new production lines, ten implementation hours before review, two review rounds, or adding generalized orchestration, persistent hidden-state storage, new token positions, nonlinear probes, position patching, head/MLP hooks, or new prompt/audit infrastructure.
 
 ## Source Truth Read
 
@@ -20,7 +20,8 @@
 
 - Preserve every existing plain/wrapped prompt byte-for-byte and build controlled variants only through audited spans.
 - Track canonical answer content, physical position, and displayed output label as separate structured coordinates; never infer content identity from normalized or generated answer text.
-- Train all-layer four-class linear readouts on the 1,801-item plain training split, choose content/label layers on the 600-item validation split, freeze the mechanism specification, and confirm it on all 599 test items.
+- Train independent content, position, and displayed-label four-class linear readouts on all seven exact stored plain variants for the 1,801-item training split. Train a baseline-only legacy reader from the same capture for comparison.
+- Split the 600 validation items deterministically and subject-stratified into 300 layer-selection items and 300 untouched reader-gate items. Freeze only readers that pass the predeclared gate; keep all 599 test items untouched for later confirmation.
 - Use raw model scores for mechanistic targets and causal endpoints. Carry calibrated scores only as secondary continuity with the existing paper.
 - Apply probe-subspace, full-residual, norm-matched random, identity, and unpatched conditions on every prespecified validation/test conflict pair plus deterministic stable and label-binding controls.
 - Non-goals: new prompts/wrappers, LLM parsing, literal answer-text token lenses, nonlinear probes, attention/head/MLP/neuron searches, broad behavioral reruns, quantization, compile tuning, or paper edits.
@@ -42,33 +43,33 @@
 
 ## Edge Cases And Failure Modes
 
-- Retain literal duplicate answers and mark content identity ambiguous; never force an item-level mechanism label.
+- Retain literal duplicate answers and mark content identity ambiguous. Exclude them only from content-reader fitting and content-specific metrics; position and label targets remain valid.
 - Retain all baseline prompts. Mark only scientifically impossible single-factor transforms not applicable; parsing/anchor failures are fatal rather than row exclusions.
 - Keep exact raw ties in artifacts but out of hard-winner probe fitting and classification.
 - Resolve checkpoints on the complete tokenized prompt with offset mappings; reject missing offsets, mismatched IDs, instruction-overlapping content tokens, empty prompts, and wrong padding adjustment.
 - Reject stale prompt hashes, wrong mappings, wrong model/tokenizer/code identity, conflicting duplicate shards, nonconverged probes, and mismatched frozen specifications.
-- SIGINT/SIGTERM completes the current shard and writes progress. Training activation capture may restart because it is bounded; validation/confirmation readout and patching resume by deterministic work key.
+- SIGINT/SIGTERM completes the current shard and writes progress. Save each completed coordinate reader atomically. Training activation capture may restart because it is bounded; validation/confirmation readout and patching resume by deterministic work key.
 
 ## Design Simplicity
 
 - One domain module owns scientific mappings, readout, probes, and patch rows; the CLI owns filesystem orchestration only.
 - Existing scorer, residual capture/replacement, identity, and shard modules remain the mechanism owners.
-- Hidden activations are bounded in memory and discarded after fitting/scoring. Only compact probe weights, probabilities, logits, patch effects, manifests, and timings persist.
+- Hidden activations are preallocated as float32, reused by every reader, converted to float64 only one layer/checkpoint slice at a time, and discarded after fitting/scoring. Only compact probe weights, probabilities, logits, patch effects, manifests, and timings persist.
 - Rejected: database, registry/plugin framework, generic campaign system, model-specific hook hierarchy, persistent activation archive, and task-budget architecture.
 - Paid-run cost remains task-local: live provider receipt, five-minute monitoring, explicit scale approval, and immediate task-owned teardown.
 
 ## Task Slices
 
-1. Exact ledgers/mappings/checkpoints; focused RED-GREEN-REFACTOR; commit and push.
-2. Batched all-layer capture, deterministic linear probes, coordinate selectivity, usability gates, and frozen layer selection; focused RED-GREEN-REFACTOR; commit and push.
-3. Probe-subspace patches, controls, deterministic pair selection, compact shards, interruption/resume, and semantic identity; focused RED-GREEN-REFACTOR; commit and push.
-4. CLI, local analysis, operator lifecycle, documentation, two-reviewer batch, coordinated fix/re-review, final suite, commit and push.
+1. Exact seven-variant training ledger, coordinate-specific eligibility, and deterministic 300/300 validation roles; focused RED-GREEN-REFACTOR; commit and push.
+2. Shared activation capture, three coordinate readers plus legacy comparator, arm-aware selectivity, held-out usability gates, and coordinate-bound patching; focused RED-GREEN-REFACTOR; commit and push.
+3. Readout-only status/resume, strict readout verification, partial-fetch correction, dependency/runtime identity, and thin operator mode; focused RED-GREEN-REFACTOR; commit and push.
+4. Documentation, two-reviewer batch, coordinated fix/re-review, final suite, commit and push.
 
 ## Validation Ladder
 
 - TDD: every behavior-changing slice begins with a focused test through the exported module or CLI and an observed expected RED failure.
 - Source/smoke: imports, CLI help, ledger schema, deterministic fixture preparation.
-- Real-use micro-proof: exact stored prompts and pinned tokenizers locally where available; eight-item production-entrypoint GPU canary for each pinned model.
+- Real-use micro-proof: exact stored prompts and pinned tokenizers locally where available; one complete Mistral readout-only production run after local acceptance. Phi and Qwen do not start until the corrected Mistral readers are assessed.
 - Focused tests: semantic mappings, tokenizer boundaries/padding, synthetic coordinate probes, projection math, target mapping, scalar/batched parity, identity/random controls, semantic identity, interruption/resume, duplicate conflict handling, and frozen confirmation.
 - Review gate: freeze after focused tests and owner self-review; open both reviewers together; make no production edit or final-suite run while review is open; reconcile all findings together; apply one fix batch; run affected tests and focused re-review.
 - Full gate: run the full suite exactly once after re-review closes and no further production edit is planned.
@@ -76,8 +77,8 @@
 ## Operator / Cost Preflight
 
 - New/changed operator mode: add only the missing decision-binding run, monitor, fetch, and verify surface around existing causal operators.
-- Lifecycle DAG: local prepare -> code-only sync -> remote preflight -> eight-item canary/resume proof -> explicit scale decision -> full run -> shard/manifest validation -> compact fetch -> local checksum verification -> task-owned teardown -> local analysis.
-- Remote mode: BF16, SDPA, inference mode, one model per non-spot 80 GB H100 by default; non-spot 80 GB A100 fallback. No eager-attention reload or tuning campaign.
+- Lifecycle DAG: local prepare -> code-only sync -> remote tokenizer/checkpoint preflight -> complete Mistral readout-only run -> shard/manifest validation -> compact fetch -> local checksum verification -> task-owned teardown -> local analysis -> explicit patch/other-model decision.
+- Remote mode: BF16, SDPA, inference mode, one model on a non-spot 80 GB A100 with at least 64 GB host RAM. H100 is unnecessary because the corrected probe fitting is expected to be CPU-dominant. No eager-attention reload or tuning campaign.
 - Telemetry: phase, completed/total work, last shard, throughput, token/padding ratio, preparation/forward/write time, peak VRAM, errors, ETA, provider spend, and stop reason.
 - No rental or full scale begins until local validation, exact operator commands, changed-surface canaries, artifact fetch, and teardown are proven and the owner explicitly approves current spend.
 

@@ -252,21 +252,128 @@ def test_readout_checkpoints_fail_closed_on_tokenization_drift_or_instruction_ov
         CheckpointIndices(1, 2, 3).padded(padded_length=4, padding_side="middle")
 
 
-def test_discovery_ledger_uses_plain_train_once_and_every_validation_rotation():
+def test_discovery_ledger_uses_every_exact_plain_train_and_validation_rotation():
     train, train_app = _scored_block(item_id="train-1", split="train")
-    validation, validation_app = _scored_block(item_id="validation-1", split="validation")
+    validation_blocks = [
+        _scored_block(item_id=f"validation-{index}", split="validation")
+        for index in range(2)
+    ]
+    scored = pd.concat(
+        [train, *(block[0] for block in validation_blocks)], ignore_index=True
+    )
+    applicability = pd.concat(
+        [train_app, *(block[1] for block in validation_blocks)], ignore_index=True
+    )
+    exact_prompts = scored.set_index("work_key")[["prompt", "prompt_sha256"]].to_dict(
+        "index"
+    )
 
     ledger = prepare_readout_ledger(
-        pd.concat([train, validation], ignore_index=True),
-        pd.concat([train_app, validation_app], ignore_index=True),
+        scored,
+        applicability,
         stage="discovery",
     )
 
-    assert ledger[ledger["split"] == "train"]["variant"].tolist() == [0]
+    assert set(ledger[ledger["split"] == "train"]["variant"]) == set(range(7))
     assert set(ledger[ledger["split"] == "validation"]["variant"]) == set(range(7))
     assert set(ledger[ledger["split"] == "train"]["readout_role"]) == {"probe_train"}
-    assert set(ledger[ledger["split"] == "validation"]["readout_role"]) == {"layer_select"}
+    assert set(ledger[ledger["split"] == "validation"]["readout_role"]) == {
+        "layer_select",
+        "reader_gate",
+    }
+    for row in ledger.itertuples(index=False):
+        assert row.prompt == exact_prompts[row.work_key]["prompt"]
+        assert row.prompt_sha256 == exact_prompts[row.work_key]["prompt_sha256"]
     assert ledger["readout_work_key"].is_unique
+
+
+def test_discovery_validation_split_is_subject_stratified_stable_and_item_atomic():
+    train, train_app = _scored_block(item_id="train-1", split="train")
+    blocks = []
+    for subject in ("biology", "chemistry"):
+        for index in range(4):
+            scored, applicability = _scored_block(
+                item_id=f"{subject}-{index}", split="validation"
+            )
+            scored["subject"] = subject
+            applicability["subject"] = subject
+            blocks.append((scored, applicability))
+    scored = pd.concat([train, *(block[0] for block in blocks)], ignore_index=True)
+    applicability = pd.concat(
+        [train_app, *(block[1] for block in blocks)], ignore_index=True
+    )
+
+    first = prepare_readout_ledger(scored, applicability, stage="discovery", seed="fixed")
+    reordered = prepare_readout_ledger(
+        scored.sample(frac=1, random_state=11).reset_index(drop=True),
+        applicability.sample(frac=1, random_state=12).reset_index(drop=True),
+        stage="discovery",
+        seed="fixed",
+    )
+    roles = first[first["split"] == "validation"].groupby("item_id")["readout_role"]
+
+    assert roles.nunique().eq(1).all()
+    assert roles.first().value_counts().to_dict() == {
+        "layer_select": 4,
+        "reader_gate": 4,
+    }
+    per_subject = (
+        first[first["split"] == "validation"]
+        .drop_duplicates("item_id")
+        .groupby(["subject", "readout_role"])["item_id"]
+        .count()
+    )
+    assert per_subject.to_dict() == {
+        ("biology", "layer_select"): 2,
+        ("biology", "reader_gate"): 2,
+        ("chemistry", "layer_select"): 2,
+        ("chemistry", "reader_gate"): 2,
+    }
+    assert first[["readout_work_key", "readout_role"]].equals(
+        reordered[["readout_work_key", "readout_role"]]
+    )
+
+
+def test_readout_eligibility_excludes_ties_for_all_and_duplicate_text_only_for_content():
+    tie, tie_app = _scored_block(item_id="tie", split="train")
+    tie.loc[0, "raw_score_C"] = tie.loc[0, "raw_score_B"]
+    tie.loc[0, "raw_tie"] = True
+    duplicate, duplicate_app = _scored_block(
+        item_id="duplicate", split="validation", duplicate_text=True
+    )
+
+    ledger = prepare_readout_ledger(
+        pd.concat([tie, duplicate], ignore_index=True),
+        pd.concat([tie_app, duplicate_app], ignore_index=True),
+        stage="discovery",
+    )
+    tied = ledger[ledger["work_key"] == "letter|tie|plain|0"].iloc[0]
+    ambiguous = ledger[ledger["item_id"] == "duplicate"]
+
+    assert not bool(tied["winner_unique"])
+    assert not bool(tied["content_evaluable"])
+    assert not bool(tied["position_evaluable"])
+    assert not bool(tied["label_evaluable"])
+    assert ambiguous["text_identity_ambiguous"].all()
+    assert not ambiguous["content_evaluable"].any()
+    assert ambiguous["position_evaluable"].all()
+    assert ambiguous["label_evaluable"].all()
+
+
+def test_discovery_rejects_plain_train_without_all_rotations():
+    train, train_app = _scored_block(
+        item_id="train-baseline-only", split="train", separable=False
+    )
+    validation, validation_app = _scored_block(
+        item_id="validation-1", split="validation"
+    )
+
+    with pytest.raises(ValueError, match="seven plain training variants"):
+        prepare_readout_ledger(
+            pd.concat([train, validation], ignore_index=True),
+            pd.concat([train_app, validation_app], ignore_index=True),
+            stage="discovery",
+        )
 
 
 def test_confirmation_ledger_retains_every_baseline_and_balances_one_rotation_per_arm():

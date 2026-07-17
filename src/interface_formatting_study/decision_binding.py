@@ -354,6 +354,47 @@ def _balanced_confirmation_rows(
     return pd.DataFrame(selected, columns=frame.columns)
 
 
+def _validation_readout_roles(frame: pd.DataFrame, *, seed: str) -> dict[str, str]:
+    items = frame[["item_id", "subject"]].drop_duplicates()
+    if items.groupby("item_id", sort=False)["subject"].nunique().gt(1).any():
+        raise ValueError("A validation item cannot belong to multiple subjects")
+    items = items.drop_duplicates("item_id")
+    layer_select_target = len(items) // 2
+    selected_by_subject: dict[str, int] = {}
+    odd_subjects: list[str] = []
+    subject_items: dict[str, list[str]] = {}
+    for subject, group in items.groupby("subject", sort=False):
+        normalized_subject = str(subject)
+        ordered = sorted(
+            group["item_id"].astype(str),
+            key=lambda item_id: (
+                _stable_digest(seed, "validation-role", normalized_subject, item_id),
+                item_id,
+            ),
+        )
+        subject_items[normalized_subject] = ordered
+        selected_by_subject[normalized_subject] = len(ordered) // 2
+        if len(ordered) % 2:
+            odd_subjects.append(normalized_subject)
+    remaining = layer_select_target - sum(selected_by_subject.values())
+    for subject in sorted(
+        odd_subjects,
+        key=lambda value: (_stable_digest(seed, "validation-role-extra", value), value),
+    )[:remaining]:
+        selected_by_subject[subject] += 1
+
+    roles: dict[str, str] = {}
+    for subject, item_ids in subject_items.items():
+        selected = set(item_ids[: selected_by_subject[subject]])
+        roles.update(
+            {
+                item_id: "layer_select" if item_id in selected else "reader_gate"
+                for item_id in item_ids
+            }
+        )
+    return roles
+
+
 def prepare_readout_ledger(
     scored: pd.DataFrame,
     applicability: pd.DataFrame,
@@ -437,6 +478,11 @@ def prepare_readout_ledger(
                 "winner_content_id": coordinates.content_id,
                 "winner_unique": not bool(record["raw_tie"]),
                 "text_identity_ambiguous": len(set(candidate_texts)) != 4,
+                "content_evaluable": (
+                    not bool(record["raw_tie"]) and len(set(candidate_texts)) == 4
+                ),
+                "position_evaluable": not bool(record["raw_tie"]),
+                "label_evaluable": not bool(record["raw_tie"]),
             }
         )
     normalized = pd.DataFrame(transformed_records)
@@ -470,11 +516,22 @@ def prepare_readout_ledger(
         train = normalized[
             (normalized["split"] == "train")
             & (normalized["wrapper_name"] == "plain")
-            & (normalized["manipulation"] == "controlled_baseline")
         ].copy()
+        train_variants = train.groupby("item_id", sort=False)["variant"].agg(
+            lambda values: {int(value) for value in values}
+        )
+        if not train_variants.empty and not train_variants.map(
+            lambda variants: variants == set(range(7))
+        ).all():
+            raise ValueError("Discovery requires all seven plain training variants per item")
         validation = normalized[normalized["split"] == "validation"].copy()
         train["readout_role"] = "probe_train"
-        validation["readout_role"] = "layer_select"
+        validation_roles = _validation_readout_roles(validation, seed=seed)
+        validation["readout_role"] = (
+            validation["item_id"].astype(str).map(validation_roles)
+        )
+        if validation["readout_role"].isna().any():
+            raise AssertionError("Validation role assignment omitted an item")
         selected = pd.concat([train, validation], ignore_index=True)
     else:
         baseline = normalized[normalized["manipulation"] == "controlled_baseline"].copy()
