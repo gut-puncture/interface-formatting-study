@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 from interface_formatting_study.model_profiles import get_model_profile
-from interface_formatting_study.run_identity import build_semantic_identity, sha256_file
+from interface_formatting_study.run_identity import SemanticIdentity, build_semantic_identity, sha256_file
 from interface_formatting_study.shards import ShardStore
 
 
@@ -38,6 +38,13 @@ def _fixture(root: Path, *, status: str = "complete"):
         dataset_path=dataset,
         source_paths=[source],
     )
+    identity.payload["model"]["expected_layers"] = 2
+    semantic_sha = hashlib.sha256(
+        json.dumps(
+            identity.payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+    identity = SemanticIdentity(semantic_sha[:20], semantic_sha, identity.payload)
     root.mkdir()
     (root / "semantic_identity.json").write_text(json.dumps(identity.as_dict()))
     readout = ShardStore(root / "shards" / "readout", identity)
@@ -356,7 +363,7 @@ def test_readout_rejects_missing_and_phantom_layer_checkpoint_substitution(tmp_p
     )
     (root / "run_manifest.json").write_text(json.dumps(manifest))
 
-    with pytest.raises(ValueError, match="complete layer/checkpoint Cartesian product"):
+    with pytest.raises(ValueError, match="model identity layer range"):
         MODULE.verify(root, run_id, slug, "readout")
 
 
@@ -401,4 +408,23 @@ def test_confirmation_rejects_internally_consistent_artifact_set_not_bound_by_id
     (root / "run_manifest.json").write_text(json.dumps(manifest))
 
     with pytest.raises(ValueError, match="does not match semantic identity frozen hashes"):
+        MODULE.verify(root, run_id, slug, "readout")
+
+
+def test_readout_rejects_uniform_phantom_layer_substitution(tmp_path):
+    root = tmp_path / "uniform-phantom-layer"
+    run_id, slug = _fixture(root, status="readout_complete")
+    frame = pd.read_parquet(root / "readout_scores.parquet")
+    frame.loc[frame["layer"] == 1, "layer"] = 2
+    _rewrite_phase(root, "readout", "readout_scores.parquet", frame)
+    selection = json.loads((root / "frozen_selection.json").read_text())
+    selection["readout_scores_sha256"] = sha256_file(root / "readout_scores.parquet")
+    (root / "frozen_selection.json").write_text(json.dumps(selection))
+    manifest = json.loads((root / "run_manifest.json").read_text())
+    manifest["artifacts"]["frozen_selection_sha256"] = sha256_file(
+        root / "frozen_selection.json"
+    )
+    (root / "run_manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="model identity layer range"):
         MODULE.verify(root, run_id, slug, "readout")

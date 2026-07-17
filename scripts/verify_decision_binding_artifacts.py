@@ -117,7 +117,17 @@ def _verify_readout_completion(
         raise ValueError("readout artifact has missing or duplicate structural rows")
     layers = {int(value) for value in readout_frame["layer"]}
     checkpoints = {str(value) for value in readout_frame["checkpoint"]}
-    expected_structure = {(layer, checkpoint) for layer in layers for checkpoint in checkpoints}
+    expected_layers = set(range(int(identity["model"]["expected_layers"])))
+    expected_checkpoints = {"format_end", "answer_prefix_end"}
+    if layers != expected_layers:
+        raise ValueError("readout layers do not match model identity layer range")
+    if checkpoints != expected_checkpoints:
+        raise ValueError("readout checkpoints do not match the required checkpoint set")
+    expected_structure = {
+        (layer, checkpoint)
+        for layer in expected_layers
+        for checkpoint in expected_checkpoints
+    }
     work = readout_frame["readout_work_key"].astype(str)
     if len(readout_frame) != work.nunique() * len(expected_structure):
         raise ValueError("readout rows do not form a complete layer/checkpoint Cartesian product")
