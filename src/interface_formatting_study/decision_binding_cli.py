@@ -18,7 +18,7 @@ import torch
 from .decision_binding import (
     capture_layer_readouts,
     evaluate_probe_banks,
-    fit_coordinate_probe_banks,
+    fit_coordinate_probe_bank,
     load_probe_bank,
     prepare_patch_pair_ledger,
     prepare_readout_ledger,
@@ -299,7 +299,7 @@ def _load_frozen(run_root: Path, profile_name: str):
     return banks, selection_payload["selection"], selection_path, bank_paths
 
 
-def _fit_or_load_banks(root: Path, ledger: pd.DataFrame, model, tokenizer, args):
+def _fit_or_load_banks(root: Path, ledger: pd.DataFrame, model, tokenizer, args, *, stop=None):
     paths = _bank_paths(root)
     meta_path = root / "probe_banks.json"
     if all(path.exists() for path in paths.values()) and meta_path.exists():
@@ -313,19 +313,40 @@ def _fit_or_load_banks(root: Path, ledger: pd.DataFrame, model, tokenizer, args)
     train = ledger[ledger["readout_role"].astype(str).eq("probe_train")].copy()
     if train.empty:
         raise RuntimeError("Discovery bundle has no probe-training rows")
-    fit_started = time.monotonic()
-    captured = capture_layer_readouts(
-        model,
-        tokenizer,
-        train["prompt"].astype(str).tolist(),
-        batch_size=args.batch_size,
-        max_batch_tokens=args.max_batch_tokens,
-    )
-    banks = fit_coordinate_probe_banks(captured.activations, train)
+    banks: dict[str, object] = {}
     for target, path in paths.items():
-        temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.npz")
-        save_probe_bank(temporary, banks[target])
-        os.replace(temporary, path)
+        if not path.exists():
+            continue
+        try:
+            bank = load_probe_bank(path)
+        except (OSError, ValueError):
+            continue
+        if bank.target_name == target:
+            banks[target] = bank
+    missing = [target for target in _BANK_TARGETS if target not in banks]
+    fit_started = time.monotonic()
+    captured = None
+    if missing and not (stop is not None and stop.requested):
+        captured = capture_layer_readouts(
+            model,
+            tokenizer,
+            train["prompt"].astype(str).tolist(),
+            batch_size=args.batch_size,
+            max_batch_tokens=args.max_batch_tokens,
+        )
+        for target in missing:
+            if stop is not None and stop.requested:
+                break
+            bank = fit_coordinate_probe_bank(captured.activations, train, target)
+            path = paths[target]
+            temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.npz")
+            save_probe_bank(temporary, bank)
+            os.replace(temporary, path)
+            banks[target] = bank
+            if stop is not None and stop.requested:
+                break
+    if set(banks) != set(_BANK_TARGETS):
+        return banks
     eligible_counts = {
         target: int(train.get(f"{target}_evaluable", train["winner_unique"]).astype(bool).sum())
         for target in ("content", "position", "label")
@@ -343,11 +364,13 @@ def _fit_or_load_banks(root: Path, ledger: pd.DataFrame, model, tokenizer, args)
             "training_rows": len(train),
             "eligible_rows": eligible_counts,
             "telemetry": {
-                "actual_tokens": captured.actual_tokens,
-                "padded_tokens": captured.padded_tokens,
-                "padding_ratio": captured.padded_tokens / captured.actual_tokens,
-                "input_preparation_seconds": captured.input_preparation_seconds,
-                "forward_seconds": captured.forward_seconds,
+                "actual_tokens": 0 if captured is None else captured.actual_tokens,
+                "padded_tokens": 0 if captured is None else captured.padded_tokens,
+                "padding_ratio": 0.0
+                if captured is None else captured.padded_tokens / captured.actual_tokens,
+                "input_preparation_seconds": 0.0
+                if captured is None else captured.input_preparation_seconds,
+                "forward_seconds": 0.0 if captured is None else captured.forward_seconds,
                 "wall_seconds": time.monotonic() - fit_started,
             },
         },
@@ -489,7 +512,28 @@ def cmd_run_model(args) -> None:
         if not args.allow_cpu and (not torch.cuda.is_available() or device.type != "cuda"):
             raise RuntimeError("Decision-binding model runs require CUDA")
         if stage == "discovery":
-            banks = _fit_or_load_banks(root, ledger, model, tokenizer, args)
+            banks = _fit_or_load_banks(root, ledger, model, tokenizer, args, stop=stop)
+            if set(banks) != set(_BANK_TARGETS):
+                _atomic_json(
+                    {
+                        "status": "interrupted",
+                        "stage": stage,
+                        "profile": args.profile,
+                        "semantic_identity": identity.as_dict(),
+                        "phase": "probe_fit",
+                        "completed_probe_banks": sorted(banks),
+                        "artifacts": {
+                            f"probe_bank_{target}_sha256": sha256_file(
+                                root / f"probe_bank_{target}.npz"
+                            )
+                            for target in banks
+                        },
+                        "wall_seconds": time.monotonic() - started,
+                        "stop_signal": stop.signal_name,
+                    },
+                    root / "run_manifest.json",
+                )
+                return
 
         def progress(phase: str, completed: int, total: int, shard: Path | None = None) -> None:
             elapsed = max(time.monotonic() - started, 1e-9)
@@ -565,6 +609,8 @@ def cmd_run_model(args) -> None:
         )
         write_table_atomic(readout_scores, root / "readout_scores.parquet")
         if readout_store.completed_work_keys() != {key for key, _ in readout_work}:
+            actual_tokens = int(readout_metrics["actual_tokens"])
+            padded_tokens = int(readout_metrics["padded_tokens"])
             _atomic_json(
                 {
                     "status": "interrupted",
@@ -574,9 +620,23 @@ def cmd_run_model(args) -> None:
                     "phase": "readout",
                     "expected_readout_chunks": len(readout_work),
                     "completed_readout_chunks": len(readout_store.completed_work_keys()),
+                    "readout_rows": len(readout_scores),
+                    "telemetry": {
+                        "readout": {
+                            **readout_metrics,
+                            "padding_ratio": padded_tokens / actual_tokens
+                            if actual_tokens else 0.0,
+                            "tokens_per_forward_second": actual_tokens
+                            / max(float(readout_metrics["forward_seconds"]), 1e-9),
+                            "write_seconds": float(prior_readout.get("write_seconds", 0.0))
+                            + readout_store.write_seconds,
+                        }
+                    },
                     "artifacts": {
                         "readout_scores_sha256": sha256_file(root / "readout_scores.parquet")
                     },
+                    "wall_seconds": time.monotonic() - started,
+                    "stop_signal": stop.signal_name,
                 },
                 root / "run_manifest.json",
             )
@@ -797,13 +857,43 @@ def _select_canary_items(
     return [str(row["item_id"]) for row in chosen]
 
 
-def _item_clustered_macro_accuracy(frame: pd.DataFrame, target: str) -> float:
-    item_class = frame[["item_id", target, "probe_pred_class"]].copy()
+def _item_clustered_macro_accuracy(
+    frame: pd.DataFrame, target: str, prediction: str = "probe_pred_class"
+) -> float:
+    item_class = frame[["item_id", target, prediction]].copy()
     item_class["correct"] = (
-        item_class[target].astype(int) == item_class["probe_pred_class"].astype(int)
+        item_class[target].astype(int) == item_class[prediction].astype(int)
     )
     item_equal = item_class.groupby(["item_id", target], sort=False)["correct"].mean()
     return float(item_equal.groupby(level=1).mean().mean())
+
+
+def _confirmation_selectivity(
+    frame: pd.DataFrame, *, reader: str, target_coordinate: str, nuisance: str
+) -> float:
+    target_columns = {
+        "content": "winner_content_id",
+        "position": "winner_position",
+        "label": "winner_label_index",
+    }
+    rows = np.arange(len(frame))
+
+    def values(coordinate: str) -> np.ndarray:
+        classes = frame[target_columns[coordinate]].to_numpy(dtype=int)
+        scores = frame[
+            [f"{reader}_log_prob_{class_id}" for class_id in range(4)]
+        ].to_numpy(float)
+        return scores[rows, classes]
+
+    differences = pd.DataFrame({
+        "item_id": frame["item_id"].astype(str),
+        "wrapper_name": frame.get("wrapper_name", "__single_wrapper__"),
+        "difference": values(target_coordinate) - values(nuisance),
+    })
+    per_item_wrapper = differences.groupby(
+        ["item_id", "wrapper_name"], sort=False
+    )["difference"].mean()
+    return float(per_item_wrapper.groupby(level="item_id", sort=False).mean().mean())
 
 
 def cmd_analyze(args) -> None:
@@ -871,7 +961,7 @@ def cmd_analyze(args) -> None:
             "selection"
         ]
         total_items = int(scores["item_id"].nunique())
-        ambiguous_items = int(
+        text_ambiguous_items = int(
             scores.loc[scores["text_identity_ambiguous"].astype(bool), "item_id"].nunique()
         )
         for mechanism, target in (
@@ -882,29 +972,51 @@ def cmd_analyze(args) -> None:
             subset = scores[
                 (scores["layer"].astype(int) == int(specification["selected_layer"]))
                 & (scores["checkpoint"].astype(str) == str(specification["checkpoint"]))
-                & (scores["manipulation"].astype(str) != "controlled_baseline")
-                & scores["winner_unique"].astype(bool)
-                & ~scores["text_identity_ambiguous"].astype(bool)
+                & scores["manipulation"].astype(str).isin(
+                    {"position_only", "label_only"}
+                    if mechanism == "content" else {"label_only"}
+                )
+                & scores[f"{mechanism}_evaluable"].astype(bool)
             ].copy()
             if subset.empty:
                 raise RuntimeError(f"Confirmation readout is missing frozen {mechanism} rows")
-            subset["correct"] = (
-                subset["probe_pred_class"].astype(int) == subset[target].astype(int)
-            )
-            macro_accuracy = _item_clustered_macro_accuracy(subset, target)
-            per_item = subset.groupby("item_id", sort=False).agg(
-                correct=("correct", "mean"),
-                target_log_prob=(f"{mechanism}_log_prob", "mean"),
-                content_log_prob=("content_log_prob", "mean"),
-                position_log_prob=("position_log_prob", "mean"),
-                label_log_prob=("label_log_prob", "mean"),
-            )
-            nuisance = [
-                f"{coordinate}_log_prob" for coordinate in ("content", "position", "label")
-                if coordinate != mechanism
+            selected_site = scores[
+                (scores["layer"].astype(int) == int(specification["selected_layer"]))
+                & (scores["checkpoint"].astype(str) == str(specification["checkpoint"]))
             ]
-            selectivity = per_item["target_log_prob"] - per_item[nuisance].max(axis=1)
-            item_values = per_item["correct"].to_numpy(float)
+            ambiguous_items_excluded = int(
+                selected_site.loc[
+                    selected_site["text_identity_ambiguous"].astype(bool)
+                    & ~selected_site[f"{mechanism}_evaluable"].astype(bool),
+                    "item_id",
+                ].nunique()
+            )
+            subset["correct"] = (
+                subset[f"{mechanism}_pred_class"].astype(int) == subset[target].astype(int)
+            )
+            macro_accuracy = _item_clustered_macro_accuracy(
+                subset, target, f"{mechanism}_pred_class"
+            )
+            per_item = subset.groupby("item_id", sort=False)["correct"].mean()
+            contrasts = (
+                (("position_only", "position"), ("label_only", "label"))
+                if mechanism == "content" else (("label_only", "content"),)
+            )
+            arm_metrics = {}
+            for manipulation, nuisance in contrasts:
+                arm = subset[subset["manipulation"].astype(str) == manipulation]
+                if arm.empty:
+                    raise RuntimeError(
+                        f"Confirmation readout is missing frozen {mechanism} {manipulation} rows"
+                    )
+                arm_metrics[f"{manipulation}_rows"] = int(len(arm))
+                arm_metrics[f"{manipulation}_selectivity"] = _confirmation_selectivity(
+                    arm,
+                    reader=mechanism,
+                    target_coordinate=mechanism,
+                    nuisance=nuisance,
+                )
+            item_values = per_item.to_numpy(float)
             draws = rng.choice(
                 item_values,
                 size=(args.bootstrap_samples, len(item_values)),
@@ -920,14 +1032,19 @@ def cmd_analyze(args) -> None:
                     "layer": int(specification["selected_layer"]),
                     "checkpoint": specification["checkpoint"],
                     "total_items": total_items,
-                    "ambiguous_items_retained_not_inferred": ambiguous_items,
+                    "text_ambiguous_items": text_ambiguous_items,
+                    "ambiguous_items_excluded": ambiguous_items_excluded,
                     "evaluable_items": int(len(per_item)),
                     "controlled_variant_rows": int(len(subset)),
                     "macro_accuracy": macro_accuracy,
                     "mean_item_accuracy": float(item_values.mean()),
                     "item_accuracy_ci_low": float(np.quantile(draws, 0.025)),
                     "item_accuracy_ci_high": float(np.quantile(draws, 0.975)),
-                    "coordinate_selectivity": float(selectivity.mean()),
+                    "coordinate_selectivity": min(
+                        value for key, value in arm_metrics.items()
+                        if key.endswith("_selectivity")
+                    ),
+                    **arm_metrics,
                 }
             )
     pd.DataFrame(confirmation_records).to_csv(output / "readout_confirmation.csv", index=False)

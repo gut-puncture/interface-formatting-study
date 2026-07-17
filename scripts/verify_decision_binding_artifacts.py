@@ -100,6 +100,7 @@ def _verify_merged(
 
 def _verify_readout_completion(
     root: Path,
+    identity: dict[str, object],
     manifest: dict[str, object],
     readout_keys: set[str],
     readout_frame: pd.DataFrame,
@@ -114,6 +115,16 @@ def _verify_readout_completion(
     structural_key = ["readout_work_key", "layer", "checkpoint"]
     if set(structural_key) - set(readout_frame.columns) or readout_frame.duplicated(structural_key).any():
         raise ValueError("readout artifact has missing or duplicate structural rows")
+    layers = {int(value) for value in readout_frame["layer"]}
+    checkpoints = {str(value) for value in readout_frame["checkpoint"]}
+    expected_structure = {(layer, checkpoint) for layer in layers for checkpoint in checkpoints}
+    work = readout_frame["readout_work_key"].astype(str)
+    if len(readout_frame) != work.nunique() * len(expected_structure):
+        raise ValueError("readout rows do not form a complete layer/checkpoint Cartesian product")
+    for _work_key, group in readout_frame.groupby(work, sort=False):
+        observed = set(zip(group["layer"].astype(int), group["checkpoint"].astype(str), strict=True))
+        if observed != expected_structure:
+            raise ValueError("readout rows do not form a complete layer/checkpoint Cartesian product")
 
     bank_paths = {name: root / f"probe_bank_{name}.npz" for name in BANK_NAMES}
     metadata_path = root / "probe_banks.json"
@@ -135,6 +146,12 @@ def _verify_readout_completion(
         raise ValueError("probe bank metadata is not bound to all coordinate banks")
     if frozen.get("probe_bank_sha256") != bank_hashes:
         raise ValueError("frozen selection is not bound to all coordinate banks")
+    frozen_identity = identity.get("experiment_config", {}).get("frozen")
+    if frozen_identity is not None and (
+        frozen_identity.get("selection_sha256") != _sha(selection_path)
+        or frozen_identity.get("probe_bank_sha256") != bank_hashes
+    ):
+        raise ValueError("confirmation artifact set does not match semantic identity frozen hashes")
     if manifest.get("stage") == "discovery" and frozen.get("readout_scores_sha256") != _sha(
         root / "readout_scores.parquet"
     ):
@@ -165,6 +182,8 @@ def _verify_patch_completion(
     structural_columns = {"pair_work_key", "mechanism", "layer", "condition"}
     if structural_columns - set(patch_frame.columns):
         raise ValueError("patch artifact is missing structural columns")
+    if not patch_frame["pair_work_key"].astype(str).equals(patch_frame["_work_key"].astype(str)):
+        raise ValueError("patch pair work key does not match shard work key")
     for pair_key, group in patch_frame.groupby("pair_work_key", sort=False):
         observed = set(
             zip(
@@ -215,7 +234,7 @@ def verify(root: Path, run_id: str, slug: str, mode: str) -> dict[str, object]:
         raise ValueError("decision-binding run is not complete")
     if strict_readout:
         assert readout_frame is not None
-        _verify_readout_completion(root, manifest, readout_keys, readout_frame)
+        _verify_readout_completion(root, identity, manifest, readout_keys, readout_frame)
     if mode == "complete":
         assert patch_frame is not None
         _verify_patch_completion(root, manifest, patch_keys, patch_frame)

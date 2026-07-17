@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -123,6 +124,54 @@ def _fixture(root: Path, *, status: str = "complete"):
         )
     )
     return identity.semantic_run_id, profile.slug
+
+
+def _rewrite_phase(root: Path, phase: str, artifact_name: str, frame: pd.DataFrame) -> None:
+    shard = next((root / "shards" / phase).glob("shard-*"))
+    frame.to_parquet(shard / "data.parquet", index=False)
+    metadata = json.loads((shard / "manifest.json").read_text())
+    metadata["row_count"] = len(frame)
+    metadata["data_sha256"] = sha256_file(shard / "data.parquet")
+    (shard / "manifest.json").write_text(json.dumps(metadata))
+    frame.to_parquet(root / artifact_name, index=False)
+    manifest = json.loads((root / "run_manifest.json").read_text())
+    manifest["artifacts"][f"{Path(artifact_name).stem}_sha256"] = sha256_file(
+        root / artifact_name
+    )
+    (root / "run_manifest.json").write_text(json.dumps(manifest))
+
+
+def _bind_confirmation_identity(root: Path) -> str:
+    identity = json.loads((root / "semantic_identity.json").read_text())
+    bank_hashes = {
+        name: sha256_file(root / f"probe_bank_{name}.npz") for name in BANK_NAMES
+    }
+    identity["experiment_config"]["stage"] = "confirmation"
+    identity["experiment_config"]["frozen"] = {
+        "selection_sha256": sha256_file(root / "frozen_selection.json"),
+        "probe_bank_sha256": bank_hashes,
+    }
+    payload = {
+        key: value
+        for key, value in identity.items()
+        if key not in {"semantic_run_id", "semantic_sha256"}
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    identity["semantic_run_id"] = digest[:20]
+    identity["semantic_sha256"] = digest
+    (root / "semantic_identity.json").write_text(json.dumps(identity))
+    manifest = json.loads((root / "run_manifest.json").read_text())
+    manifest["stage"] = "confirmation"
+    manifest["semantic_identity"] = identity
+    (root / "run_manifest.json").write_text(json.dumps(manifest))
+    for shard_manifest in (root / "shards").glob("*/shard-*/manifest.json"):
+        metadata = json.loads(shard_manifest.read_text())
+        metadata["semantic_run_id"] = digest[:20]
+        metadata["semantic_sha256"] = digest
+        shard_manifest.write_text(json.dumps(metadata))
+    return digest[:20]
 
 
 def test_decision_binding_verifier_reconciles_identity_shards_and_merged_outputs(tmp_path):
@@ -283,3 +332,73 @@ def test_partial_ignores_byte_identical_duplicate_shards_but_rejects_conflicts(t
     (duplicate / "manifest.json").write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="conflicting duplicate work keys"):
         MODULE.verify(root, run_id, slug, "partial")
+
+
+def test_readout_rejects_missing_and_phantom_layer_checkpoint_substitution(tmp_path):
+    root = tmp_path / "phantom-readout"
+    run_id, slug = _fixture(root, status="readout_complete")
+    first = pd.read_parquet(root / "readout_scores.parquet")
+    second = first.copy()
+    second["readout_work_key"] = "row-2"
+    second.loc[
+        (second["layer"] == 1) & (second["checkpoint"] == "answer_prefix_end"),
+        "layer",
+    ] = 2
+    combined = pd.concat([first, second], ignore_index=True)
+    _rewrite_phase(root, "readout", "readout_scores.parquet", combined)
+    manifest = json.loads((root / "run_manifest.json").read_text())
+    manifest["expected_readout_rows"] = 8
+    selection = json.loads((root / "frozen_selection.json").read_text())
+    selection["readout_scores_sha256"] = sha256_file(root / "readout_scores.parquet")
+    (root / "frozen_selection.json").write_text(json.dumps(selection))
+    manifest["artifacts"]["frozen_selection_sha256"] = sha256_file(
+        root / "frozen_selection.json"
+    )
+    (root / "run_manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="complete layer/checkpoint Cartesian product"):
+        MODULE.verify(root, run_id, slug, "readout")
+
+
+def test_complete_rejects_patch_pair_key_that_differs_from_shard_work_key(tmp_path):
+    root = tmp_path / "phantom-pair"
+    run_id, slug = _fixture(root)
+    patches = pd.read_parquet(root / "patch_results.parquet")
+    patches["pair_work_key"] = "pair-phantom"
+    _rewrite_phase(root, "patches", "patch_results.parquet", patches)
+
+    with pytest.raises(ValueError, match="pair work key does not match shard work key"):
+        MODULE.verify(root, run_id, slug, "complete")
+
+
+def test_confirmation_rejects_internally_consistent_artifact_set_not_bound_by_identity(tmp_path):
+    root = tmp_path / "confirmation-substitution"
+    _old_run_id, slug = _fixture(root, status="readout_complete")
+    run_id = _bind_confirmation_identity(root)
+
+    replacement_hashes = {}
+    for name in BANK_NAMES:
+        path = root / f"probe_bank_{name}.npz"
+        path.write_bytes(f"replacement-bank-{name}".encode())
+        replacement_hashes[name] = sha256_file(path)
+    (root / "probe_banks.json").write_text(
+        json.dumps({"probe_bank_sha256": replacement_hashes})
+    )
+    selection = json.loads((root / "frozen_selection.json").read_text())
+    selection["probe_bank_sha256"] = replacement_hashes
+    (root / "frozen_selection.json").write_text(json.dumps(selection))
+    manifest = json.loads((root / "run_manifest.json").read_text())
+    manifest["artifacts"].update(
+        {
+            **{
+                f"probe_bank_{name}_sha256": digest
+                for name, digest in replacement_hashes.items()
+            },
+            "probe_banks_sha256": sha256_file(root / "probe_banks.json"),
+            "frozen_selection_sha256": sha256_file(root / "frozen_selection.json"),
+        }
+    )
+    (root / "run_manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="does not match semantic identity frozen hashes"):
+        MODULE.verify(root, run_id, slug, "readout")

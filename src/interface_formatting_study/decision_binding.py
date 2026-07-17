@@ -1251,14 +1251,15 @@ def fit_probe_bank(
     )
 
 
-def fit_coordinate_probe_banks(
+def fit_coordinate_probe_bank(
     activations: np.ndarray | torch.Tensor,
     ledger: pd.DataFrame,
+    target_name: str,
     *,
     c: float = 1e-2,
     max_iter: int = 5000,
-) -> dict[str, ProbeBank]:
-    """Fit independent content, position, label, and legacy content readers."""
+) -> ProbeBank:
+    """Fit one coordinate reader so callers can checkpoint reader training."""
     values = np.asarray(activations)
     if len(values) != len(ledger):
         raise ValueError("Ledger and activation row counts differ")
@@ -1276,45 +1277,57 @@ def fit_coordinate_probe_banks(
     training = ledger["readout_role"].astype(str).eq("probe_train").to_numpy()
     if not training.any():
         raise ValueError("Probe ledger contains no probe_train rows")
-    banks: dict[str, ProbeBank] = {}
-    for name, target_column in (
-        ("content", "winner_content_id"),
-        ("position", "winner_position"),
-        ("label", "winner_label_index"),
-    ):
-        evaluable_column = f"{name}_evaluable"
+    targets = {
+        "content": "winner_content_id",
+        "position": "winner_position",
+        "label": "winner_label_index",
+        "legacy_content": "winner_content_id",
+    }
+    if target_name not in targets:
+        raise ValueError(f"Unknown coordinate reader: {target_name}")
+    if target_name == "legacy_content":
+        mask = (
+            training
+            & ledger["winner_unique"].astype(bool).to_numpy()
+            & ledger["manipulation"].astype(str).eq("controlled_baseline").to_numpy()
+        )
+        if "content_evaluable" in ledger:
+            mask &= ledger["content_evaluable"].astype(bool).to_numpy()
+        class_weight = None
+    else:
+        evaluable_column = f"{target_name}_evaluable"
         evaluable = (
             ledger[evaluable_column].astype(bool).to_numpy()
             if evaluable_column in ledger
             else ledger["winner_unique"].astype(bool).to_numpy()
         )
         mask = training & evaluable
-        banks[name] = fit_probe_bank(
-            values,
-            ledger[target_column].to_numpy(dtype=np.int64),
-            c=c,
-            max_iter=max_iter,
-            target_name=name,
-            row_mask=mask,
-            class_weight="balanced",
-        )
-    legacy_mask = (
-        training
-        & ledger["winner_unique"].astype(bool).to_numpy()
-        & ledger["manipulation"].astype(str).eq("controlled_baseline").to_numpy()
-    )
-    if "content_evaluable" in ledger:
-        legacy_mask &= ledger["content_evaluable"].astype(bool).to_numpy()
-    banks["legacy_content"] = fit_probe_bank(
+        class_weight = "balanced"
+    return fit_probe_bank(
         values,
-        ledger["winner_content_id"].to_numpy(dtype=np.int64),
+        ledger[targets[target_name]].to_numpy(dtype=np.int64),
         c=c,
         max_iter=max_iter,
-        target_name="legacy_content",
-        row_mask=legacy_mask,
-        class_weight=None,
+        target_name=target_name,
+        row_mask=mask,
+        class_weight=class_weight,
     )
-    return banks
+
+
+def fit_coordinate_probe_banks(
+    activations: np.ndarray | torch.Tensor,
+    ledger: pd.DataFrame,
+    *,
+    c: float = 1e-2,
+    max_iter: int = 5000,
+) -> dict[str, ProbeBank]:
+    """Fit independent content, position, label, and legacy content readers."""
+    return {
+        name: fit_coordinate_probe_bank(
+            activations, ledger, name, c=c, max_iter=max_iter
+        )
+        for name in ("content", "position", "label", "legacy_content")
+    }
 
 
 def save_probe_bank(path: str | Path, bank: ProbeBank) -> None:

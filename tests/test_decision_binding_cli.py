@@ -9,7 +9,12 @@ import numpy as np
 import torch
 
 from interface_formatting_study import decision_binding_cli
-from interface_formatting_study.decision_binding import CapturedReadouts, ProbeBank, save_probe_bank
+from interface_formatting_study.decision_binding import (
+    CapturedReadouts,
+    ProbeBank,
+    evaluate_probe_banks,
+    save_probe_bank,
+)
 from interface_formatting_study.run_identity import sha256_file
 
 
@@ -235,13 +240,18 @@ def test_analysis_keeps_discovery_and_confirmation_separate_and_reports_frozen_t
             {
                 "readout_work_key": f"row-{checkpoint}-{manipulation}",
                 "item_id": "item-1", "split": split, "manipulation": manipulation,
-                "layer": 1, "checkpoint": checkpoint, "probe_pred_class": prediction,
+                "layer": 1, "checkpoint": checkpoint,
+                "content_pred_class": prediction, "label_pred_class": prediction,
+                "content_evaluable": True, "label_evaluable": True,
                 "winner_content_id": 0, "winner_position": 1, "winner_label_index": 2,
                 "winner_unique": True, "text_identity_ambiguous": False,
-                "content_log_prob": -0.1, "position_log_prob": -2.0, "label_log_prob": -3.0,
+                **{f"content_log_prob_{index}": -float(index) for index in range(4)},
+                **{f"label_log_prob_{index}": -float(index) for index in range(4)},
             }
             for checkpoint in ("format_end", "answer_prefix_end")
-            for manipulation, prediction in (("controlled_baseline", 2), ("label_only", 0))
+            for manipulation, prediction in (
+                ("controlled_baseline", 2), ("position_only", 0), ("label_only", 0)
+            )
         ]).to_parquet(root / "readout_scores.parquet", index=False)
         (root / "frozen_selection.json").write_text(json.dumps({
             "selection": {
@@ -262,7 +272,84 @@ def test_analysis_keeps_discovery_and_confirmation_separate_and_reports_frozen_t
     readout = pd.read_csv(output / "readout_confirmation.csv")
     assert set(readout["stage"]) == {"confirmation"}
     assert readout.iloc[0]["split"] == "test"
-    assert set(readout["controlled_variant_rows"]) == {1}
+    assert set(readout["controlled_variant_rows"]) == {1, 2}
+
+
+def test_confirmation_analysis_consumes_coordinate_reader_schema_and_preserves_arm_masks(tmp_path):
+    root = tmp_path / "confirmation"
+    root.mkdir()
+    identity = {"semantic_run_id": "confirmation", "model": {"slug": "toy"}}
+    (root / "semantic_identity.json").write_text(json.dumps(identity))
+    (root / "run_manifest.json").write_text(json.dumps({
+        "status": "complete", "stage": "confirmation", "semantic_identity": identity
+    }))
+    pd.DataFrame([
+        {
+            "item_id": "item-1", "split": "test", "pair_work_key": "pair-1",
+            "mechanism": "content", "layer": 0, "pair_kind": "answer_conflict",
+            "condition": condition, "content_target_margin": value,
+            "symbol_target_margin": value,
+        }
+        for condition, value in (("unpatched", 0.0), ("probe", 1.0))
+    ]).to_parquet(root / "patch_results.parquet", index=False)
+    ledger = pd.DataFrame([
+        {
+            "readout_work_key": "position", "item_id": "item-1", "split": "test",
+            "readout_role": "confirmation", "manipulation": "position_only",
+            "winner_unique": True, "winner_content_id": 0, "winner_position": 1,
+            "winner_label_index": 0, "text_identity_ambiguous": False,
+            "content_evaluable": True, "position_evaluable": True, "label_evaluable": True,
+        },
+        {
+            "readout_work_key": "label", "item_id": "item-1", "split": "test",
+            "readout_role": "confirmation", "manipulation": "label_only",
+            "winner_unique": True, "winner_content_id": 0, "winner_position": 0,
+            "winner_label_index": 1, "text_identity_ambiguous": False,
+            "content_evaluable": True, "position_evaluable": True, "label_evaluable": True,
+        },
+        {
+            "readout_work_key": "duplicate-label", "item_id": "item-duplicate", "split": "test",
+            "readout_role": "confirmation", "manipulation": "label_only",
+            "winner_unique": True, "winner_content_id": 0, "winner_position": 0,
+            "winner_label_index": 1, "text_identity_ambiguous": True,
+            "content_evaluable": False, "position_evaluable": True, "label_evaluable": True,
+        },
+    ])
+    banks = {
+        name: ProbeBank(
+            np.zeros((1, 2, 4, 2)), np.zeros((1, 2, 4)), np.zeros((1, 2, 2)),
+            np.arange(4), 1e-2, name,
+        )
+        for name in ("content", "position", "label", "legacy_content")
+    }
+    evaluate_probe_banks(banks, np.zeros((3, 1, 2, 2)), ledger).to_parquet(
+        root / "readout_scores.parquet", index=False
+    )
+    (root / "frozen_selection.json").write_text(json.dumps({
+        "selection": {
+            "content": {"selected_layer": 0, "checkpoint": "format_end"},
+            "label": {"selected_layer": 0, "checkpoint": "format_end"},
+        }
+    }))
+    output = tmp_path / "analysis"
+
+    decision_binding_cli.cmd_analyze(SimpleNamespace(
+        run=[str(root)], output_dir=str(output), bootstrap_samples=20, seed=3
+    ))
+
+    result = pd.read_csv(output / "readout_confirmation.csv").set_index("mechanism")
+    assert result.loc["content", "controlled_variant_rows"] == 2
+    assert result.loc["label", "controlled_variant_rows"] == 2
+    assert result.loc["content", "position_only_rows"] == 1
+    assert result.loc["content", "label_only_rows"] == 1
+    assert result.loc["label", "label_only_rows"] == 2
+    assert result.loc["label", "evaluable_items"] == 2
+    assert result.loc["content", "evaluable_items"] == 1
+    assert result.loc["content", "ambiguous_items_excluded"] == 1
+    assert result.loc["label", "ambiguous_items_excluded"] == 0
+    assert result.loc["content", "position_only_selectivity"] == pytest.approx(0.0)
+    assert result.loc["content", "label_only_selectivity"] == pytest.approx(0.0)
+    assert result.loc["label", "label_only_selectivity"] == pytest.approx(0.0)
 
 
 def test_canary_selection_uses_eight_distinct_items_and_is_deterministic():
@@ -503,6 +590,69 @@ def test_frozen_mechanism_rejects_a_bank_with_the_wrong_coordinate_identity(tmp_
         decision_binding_cli._load_frozen(root, "qwen")
 
 
+def test_probe_fitting_persists_each_reader_and_resumes_only_missing_readers(
+    tmp_path, monkeypatch
+):
+    ledger = pd.DataFrame({
+        "readout_role": ["probe_train"] * 4,
+        "manipulation": ["controlled_baseline"] * 4,
+        "winner_unique": [True] * 4,
+        "winner_content_id": range(4),
+        "winner_position": range(4),
+        "winner_label_index": range(4),
+        "content_evaluable": [True] * 4,
+        "position_evaluable": [True] * 4,
+        "label_evaluable": [True] * 4,
+        "prompt": [f"prompt-{index}" for index in range(4)],
+    })
+    captures = []
+    monkeypatch.setattr(
+        decision_binding_cli,
+        "capture_layer_readouts",
+        lambda *_a, **_k: captures.append(True) or CapturedReadouts(
+            torch.zeros((4, 1, 2, 2)), torch.zeros((4, 4)),
+            batches=1, actual_tokens=4, padded_tokens=4,
+        ),
+    )
+    stop = SimpleNamespace(requested=False)
+    fitted = []
+
+    def fake_fit(_activations, _ledger, target_name, **_kwargs):
+        fitted.append(target_name)
+        if len(fitted) == 1:
+            stop.requested = True
+        return ProbeBank(
+            np.zeros((1, 2, 4, 2)), np.zeros((1, 2, 4)), np.zeros((1, 2, 2)),
+            np.arange(4), 1e-2, target_name,
+        )
+
+    monkeypatch.setattr(
+        decision_binding_cli, "fit_coordinate_probe_bank", fake_fit, raising=False
+    )
+    args = SimpleNamespace(batch_size=4, max_batch_tokens=100)
+
+    partial = decision_binding_cli._fit_or_load_banks(
+        tmp_path, ledger, object(), object(), args, stop=stop
+    )
+
+    assert set(partial) == {"content"}
+    assert fitted == ["content"]
+    assert len(captures) == 1
+    assert (tmp_path / "probe_bank_content.npz").exists()
+    assert not (tmp_path / "probe_banks.json").exists()
+
+    stop.requested = False
+    complete = decision_binding_cli._fit_or_load_banks(
+        tmp_path, ledger, object(), object(), args, stop=stop
+    )
+
+    assert set(complete) == {"content", "position", "label", "legacy_content"}
+    assert fitted == ["content", "position", "label", "legacy_content"]
+    assert len(captures) == 2
+    metadata = json.loads((tmp_path / "probe_banks.json").read_text())
+    assert set(metadata["probe_bank_sha256"]) == set(complete)
+
+
 def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -564,7 +714,7 @@ def test_run_model_resumes_readout_and_patch_shards_without_recomputing(tmp_path
         for target in ("content", "position", "label", "legacy_content")
     }
 
-    def fake_banks(root, *_args):
+    def fake_banks(root, *_args, **_kwargs):
         for target, bank in banks.items():
             save_probe_bank(root / f"probe_bank_{target}.npz", bank)
         (root / "probe_banks.json").write_text(json.dumps({
@@ -679,7 +829,7 @@ def test_readout_completion_stops_before_patching_when_requested_or_gate_fails(
                           np.zeros((1, 2, 2)), np.arange(4), 1e-2, target)
         for target in ("content", "position", "label", "legacy_content")
     }
-    def persist_banks(root, *_args):
+    def persist_banks(root, *_args, **_kwargs):
         for target, bank in banks.items():
             save_probe_bank(root / f"probe_bank_{target}.npz", bank)
         (root / "probe_banks.json").write_text(json.dumps({
@@ -728,3 +878,89 @@ def test_readout_completion_stops_before_patching_when_requested_or_gate_fails(
     assert result["status"] == "readout_complete"
     assert result["patch_eligible"] is patch_eligible
     assert not (run_root / "patch_results.parquet").exists()
+
+
+def test_interrupted_readout_manifest_keeps_resume_telemetry_and_signal(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    readout_path = bundle / "readout_ledger.parquet"
+    pairs_path = bundle / "patch_pair_ledger.parquet"
+    pd.DataFrame({
+        "readout_work_key": ["row-1", "row-2"],
+        "readout_role": ["layer_select", "reader_gate"],
+        "prompt": ["one", "two"], "item_id": ["item-1", "item-2"],
+        "winner_content_id": [0, 1], "winner_position": [1, 2],
+        "winner_label_index": [2, 3], "winner_unique": [True, True],
+        "manipulation": ["label_only", "position_only"],
+    }).to_parquet(readout_path, index=False)
+    pd.DataFrame({"pair_work_key": ["pair"], "selected_for_patching": [True]}).to_parquet(
+        pairs_path, index=False
+    )
+    manifest = {
+        "stage": "discovery", "model": {"id": None, "revision": None},
+        "readout": {"rows": 2, "sha256": sha256_file(readout_path)},
+        "pairs": {"rows": 1, "sha256": sha256_file(pairs_path)},
+    }
+    (bundle / "bundle_manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        decision_binding_cli, "_load_bundle",
+        lambda _root: (manifest, pd.read_parquet(readout_path), pd.read_parquet(pairs_path)),
+    )
+    monkeypatch.setattr(
+        decision_binding_cli, "load_model_and_tokenizer",
+        lambda *_a, **_k: (torch.nn.Linear(1, 1), object(), torch.device("cpu")),
+    )
+    banks = {
+        name: ProbeBank(
+            np.zeros((1, 2, 4, 2)), np.zeros((1, 2, 4)), np.zeros((1, 2, 2)),
+            np.arange(4), 1e-2, name,
+        )
+        for name in ("content", "position", "label", "legacy_content")
+    }
+    monkeypatch.setattr(decision_binding_cli, "_fit_or_load_banks", lambda *_a, **_k: banks)
+
+    class RequestedStop:
+        requested = False
+        signal_name = None
+
+        def request(self, *_args):
+            self.requested = True
+
+    stop = RequestedStop()
+    monkeypatch.setattr(decision_binding_cli, "StopState", lambda: stop)
+    captures = 0
+
+    def capture(_model, _tokenizer, prompts, **_kwargs):
+        nonlocal captures
+        captures += 1
+        stop.requested = True
+        stop.signal_name = "SIGTERM"
+        return CapturedReadouts(
+            torch.zeros((len(prompts), 1, 2, 2)), torch.zeros((len(prompts), 4)),
+            batches=1, actual_tokens=3, padded_tokens=4,
+            input_preparation_seconds=0.25, forward_seconds=0.5,
+        )
+
+    monkeypatch.setattr(decision_binding_cli, "capture_layer_readouts", capture)
+    args = SimpleNamespace(
+        bundle=str(bundle), profile="qwen", frozen_run=None,
+        output_base=str(tmp_path / "runs"), bootstrap_samples=10, permutation_samples=10,
+        stable_controls=96, label_binding_controls=96, max_readout_rows=None,
+        max_pairs=None, canary_items=None, local_files_only=True, allow_cpu=True,
+        batch_size=1, max_batch_tokens=100, readout_chunk_size=1,
+        patch_shard_size=1, seed=0, stop_after_readout=False,
+    )
+
+    decision_binding_cli.cmd_run_model(args)
+
+    run_root = next((tmp_path / "runs" / "qwen2.5-1.5b-instruct").iterdir())
+    result = json.loads((run_root / "run_manifest.json").read_text())
+    assert captures == 1
+    assert result["status"] == "interrupted"
+    assert result["stop_signal"] == "SIGTERM"
+    assert result["wall_seconds"] > 0
+    assert result["telemetry"]["readout"]["actual_tokens"] == 3
+    assert result["telemetry"]["readout"]["padded_tokens"] == 4
+    assert result["telemetry"]["readout"]["input_preparation_seconds"] == 0.25
+    assert result["telemetry"]["readout"]["forward_seconds"] == 0.5
+    assert result["telemetry"]["readout"]["write_seconds"] > 0
