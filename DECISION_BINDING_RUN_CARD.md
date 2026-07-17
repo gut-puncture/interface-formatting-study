@@ -113,3 +113,29 @@
 - All 599 test items remain untouched. The next step is an explicit scientific
   decision about whether the failed content-selectivity gate warrants a revised
   preregistered reader or readout-only replication on Phi and Qwen.
+
+## Phi And Qwen Readout Closeout (2026-07-17)
+
+- Completed pinned readout-only semantic runs `f7a4298f247d1231b48e` for Phi
+  and `0ecb8c9d7aa7a616e8ab` for Qwen. Both identity-bound manifests report
+  `readout_complete` and 295/295 work units. Phi produced 2,414,592 merged rows;
+  Qwen produced 2,112,768 because its pinned architecture has 28 rather than 32
+  transformer layers.
+- Held-out content / position / displayed-label macro accuracy was
+  50.1% / 75.7% / 98.6% for Phi and 50.1% / 70.5% / 95.9% for Qwen. Position
+  and label were usable for both models. Content failed its selectivity
+  lower-bound gate for both, so both manifests set `patch_eligible=false` and
+  no causal patching was run.
+- Verified artifacts are under
+  `gpu_artifacts/decision_binding/phi-3.5-mini-instruct/f7a4298f247d1231b48e/20260717T073119Z/`
+  and
+  `gpu_artifacts/decision_binding/qwen2.5-1.5b-instruct/0ecb8c9d7aa7a616e8ab/20260717T054758Z/`.
+  Strict structural verification passed, and each `LOCAL_SHA256SUMS.txt`
+  independently rechecked all 601 fetched files.
+- Provider-reported final compute cost was $5.9259 for Phi and $1.7903 for
+  Qwen. After both fetches and local verification, Prime reported `pods: []`
+  and `disks: []`.
+- Across all three models, the displayed-label and physical-position readers
+  are reliable but the answer-content reader is not independently identified.
+  All 599 test items remain untouched. Any revised reader must be designed and
+  validated before confirmation or causal patching.
