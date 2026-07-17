@@ -93,3 +93,23 @@
 - Update reproducibility/operator documentation after final validation. Do not edit the paper until confirmation findings are complete.
 - Stop for missing source truth, a user-owned scientific behavior decision, unapproved paid action, or an impossible faithful proof.
 - Rebuild rather than keep patching if round two finds another material defect in the same architecture/failure class.
+
+## Mistral Readout Closeout (2026-07-17)
+
+- Completed readout-only semantic run `da8ad9009c3a91841e96` for pinned
+  Mistral-7B-Instruct-v0.3. The identity-bound manifest reports
+  `readout_complete`, 295/295 shards, and 2,414,592/2,414,592 merged rows.
+- Held-out gate macro accuracy was 72.2% for content, 80.6% for position, and
+  97.6% for displayed label. Position and label were usable; content failed its
+  selectivity lower-bound gate (`-0.0135`) and was not usable. Consequently,
+  `patch_eligible=false`; no causal patch or other-model run was started.
+- The complete run is under
+  `gpu_artifacts/decision_binding/mistral-7b-instruct-v0.3/da8ad9009c3a91841e96/20260717T040748Z/`.
+  Strict local verification passed for all 295 readout work keys, and
+  `LOCAL_SHA256SUMS.txt` contains 601 independently rechecked file hashes.
+- Runtime was 1,990.97 seconds. The successful A100 pod cost $1.3153; including
+  the earlier aborted setup pod, this execution attempt cost $1.4501. Final
+  Prime inventory was `pods: []` and `disks: []`.
+- All 599 test items remain untouched. The next step is an explicit scientific
+  decision about whether the failed content-selectivity gate warrants a revised
+  preregistered reader or readout-only replication on Phi and Qwen.

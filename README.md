@@ -107,7 +107,7 @@ and design-identity bound, atomically sharded, signal-safe, resumable, and local
 checksum-verified before teardown. The paid-run gates and commands are in
 `CAUSAL_FOLLOWUP_RUN_CARD.md`.
 
-### Decision-binding mechanism (locally prepared; GPU proof pending)
+### Decision-binding mechanism (Mistral GPU proof complete)
 
 The next experiment asks where the model represents the winning answer content
 and where it binds that content to the displayed A-D label. It trains separate
@@ -122,10 +122,14 @@ Authenticated schema-3 discovery bundles for all three models are under
 prompt rows and preserves all 1,801 training and 600 validation items. A run
 refuses altered causal scores, mixed model identities, legacy bundles without
 scored-source attestation, and a limited canary presented as a complete
-discovery run. The first paid step is one complete Mistral readout-only run. It
-atomically saves each reader, resumes missing readers and readout shards, and
-must be fetched and checksum-verified before any patching or additional model
-run.
+discovery run. The first paid step, one complete Mistral readout-only run, is
+finished as semantic run `da8ad9009c3a91841e96`. Its 295 deterministic shards
+and 2,414,592 merged score rows were fetched and checksum-verified locally.
+Held-out macro accuracy was 72.2% for answer content, 80.6% for physical
+position, and 97.6% for the displayed label. Position and label passed their
+predeclared selectivity gates; content did not, so the manifest correctly sets
+`patch_eligible=false`. No patching or additional-model run should begin until
+that result is assessed explicitly. All 599 test items remain untouched.
 
 ```bash
 scripts/control_decision_binding_gpu.sh start mistral readout \
