@@ -55,6 +55,10 @@ _REQUIRED_APPLICABILITY_COLUMNS = {
     "source_prompt_sha256",
     "parse_provenance",
 }
+_OUTPUT_INSTRUCTIONS = (
+    "Return only the letter (A, B, C, or D).",
+    "Return only the exact answer text, not its letter.",
+)
 
 
 @dataclass(frozen=True)
@@ -208,8 +212,9 @@ def _last_complete_candidate_sequence(
 ) -> tuple[list[int], list[tuple[int, int]]]:
     if len(candidate_texts) != 4 or len(set(map(str, candidate_texts))) != 4:
         raise ValueError("candidate content identity is ambiguous")
-    marker = prompt.rfind("Return only the letter")
-    option_region = prompt[: marker if marker >= 0 else len(prompt)]
+    markers = [prompt.find(f"\n\n{instruction}") for instruction in _OUTPUT_INSTRUCTIONS]
+    option_end = min((marker for marker in markers if marker >= 0), default=len(prompt))
+    option_region = prompt[:option_end]
     occurrences = [
         [(match.start(), match.end()) for match in re.finditer(re.escape(str(text)), option_region)]
         for text in candidate_texts
@@ -259,11 +264,15 @@ def _legacy_candidate_sites(
     raw_labels = _raw_label_spans(prompt, wrapper_name)
     expected_labels = [str(value) for value in labels_by_position]
     if len(raw_labels) == 4 and [span.value for span in raw_labels] == expected_labels:
-        marker = prompt.rfind("Return only the letter")
-        option_end = marker if marker >= 0 else len(prompt)
+        markers = [prompt.find(f"\n\n{instruction}") for instruction in _OUTPUT_INSTRUCTIONS]
+        option_end = min((marker for marker in markers if marker >= 0), default=len(prompt))
         bounded_spans: list[tuple[int, int]] = []
         for position, label_span in enumerate(raw_labels):
-            region_end = raw_labels[position + 1].start if position + 1 < 4 else option_end
+            line_end = prompt.find("\n", label_span.end)
+            if line_end < 0:
+                line_end = option_end
+            next_label = raw_labels[position + 1].start if position + 1 < 4 else option_end
+            region_end = min(line_end, next_label, option_end)
             content_id = int(content_ids_by_position[position])
             candidate = str(candidate_texts[content_id])
             occurrences = list(
@@ -412,7 +421,7 @@ def locate_content_token_indices(
     prompt: str,
     char_spans: Sequence[tuple[int, int]],
 ) -> list[int]:
-    """Return the final unambiguous content token for each audited payload."""
+    """Return the token containing each payload's final content-bearing character."""
 
     try:
         encoded = tokenizer(prompt, add_special_tokens=False, return_offsets_mapping=True)
@@ -428,41 +437,25 @@ def locate_content_token_indices(
     for start, end in char_spans:
         if start < 0 or end <= start or end > len(prompt):
             raise ValueError("invalid candidate payload span")
-        overlapping = [
+        payload = prompt[start:end]
+        target_offsets = [
+            offset for offset, character in enumerate(payload) if not character.isspace()
+        ]
+        if not target_offsets:
+            raise ValueError("candidate payload has no content-bearing character")
+        target = start + target_offsets[-1]
+        containing = [
             index
             for index, (token_start, token_end) in enumerate(offsets)
-            if token_end > token_start and token_start < end and token_end > start
+            if token_end > token_start and token_start <= target < token_end
         ]
-        if not overlapping:
+        if len(containing) != 1:
             raise ValueError("candidate payload has no tokenizer token")
-        index = overlapping[-1]
+        index = containing[0]
         token_start, token_end = offsets[index]
-        if token_start < start or token_end > end:
-            leading_space_prefix = (
-                token_start < start
-                and token_end <= end
-                and bool(prompt[token_start:start])
-                and prompt[token_start:start].isspace()
-            )
-            contained = [
-                candidate
-                for candidate in overlapping
-                if offsets[candidate][0] >= start and offsets[candidate][1] <= end
-            ]
-            in_payload_suffix = prompt[max(token_start, start):end]
-            punctuation_only_suffix = (
-                token_start >= start
-                and token_end > end
-                and bool(in_payload_suffix)
-                and not any(character.isalnum() for character in in_payload_suffix)
-                and bool(contained)
-            )
-            if leading_space_prefix:
-                pass
-            elif punctuation_only_suffix:
-                index = contained[-1]
-            else:
-                raise ValueError("token crosses candidate payload boundary")
+        outside_payload = prompt[token_start:min(start, token_end)] + prompt[max(end, token_start):token_end]
+        if any(character.isalnum() for character in outside_payload):
+            raise ValueError("token crosses candidate payload boundary")
         indices.append(index)
     if len(indices) != len(char_spans):
         raise AssertionError("candidate token endpoint count drift")

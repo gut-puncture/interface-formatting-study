@@ -299,6 +299,95 @@ def test_prepare_candidate_sites_does_not_confuse_substring_answer_with_other_op
     assert [prompt[start:end] for start, end in observed.content_char_spans] == candidates
 
 
+def test_prepare_candidate_sites_bounds_last_short_answer_to_its_option_line():
+    candidates = ["2c", "c", "0.8c", "0.5c"]
+    source = (
+        'message MCQ {\n  repeated string options = 2 [\n'
+        '    "A) 2c",\n    "B) c",\n    "C) 0.8c",\n    "D) 0.5c"\n  ];\n'
+        '  required string answer_field = 3 [default = "Select the correct option letter"];}\n'
+        + _SUFFIX
+    )
+    prompt = (
+        'message MCQ {\n  repeated string options = 2 [\n'
+        '    "C) 0.8c",\n    "D) 0.5c",\n    "A) 2c",\n    "B) c"\n  ];\n'
+        '  required string answer_field = 3 [default = "Select the correct option letter"];}\n'
+        + _SUFFIX
+    )
+    baseline = _row(
+        source,
+        variant=0,
+        manipulation="controlled_baseline",
+        position_shift=0,
+        label_shift=0,
+        contents=[0, 1, 2, 3],
+        labels=list("ABCD"),
+        candidates=candidates,
+    )
+    row = _row(
+        prompt,
+        variant=2,
+        manipulation="position_only",
+        position_shift=2,
+        label_shift=0,
+        contents=[2, 3, 0, 1],
+        labels=list("CDAB"),
+        candidates=candidates,
+    )
+    source_sha = hashlib.sha256(source.encode()).hexdigest()
+    baseline.update(wrapper_name="protobuf_msg", source_prompt_sha256=source_sha)
+    row.update(wrapper_name="protobuf_msg", source_prompt_sha256=source_sha)
+    applicability = pd.DataFrame([{
+        "item_id": "item-1",
+        "wrapper_name": "protobuf_msg",
+        "split": "validation",
+        "source_prompt_sha256": source_sha,
+        "parse_provenance": "legacy_deterministic",
+    }])
+
+    sites = prepare_candidate_sites(
+        pd.DataFrame([baseline, row]), applicability, option_maps={}
+    )
+
+    observed = sites[sites["variant"] == 2].iloc[0]
+    assert [prompt[start:end] for start, end in observed.content_char_spans] == [
+        "0.8c", "0.5c", "2c", "c"
+    ]
+    assert observed.content_char_spans[-1][0] == prompt.index('"B) c"') + 4
+
+
+def test_prepare_candidate_sites_bounds_text_answers_before_output_instruction():
+    candidates = ["W", "Sb", "Fe", "An"]
+    prompt = (
+        "Question,Option A,Option B,Option C,Option D\n"
+        "The symbol for antimony is,W,Sb,Fe,An\n\n"
+        "Return only the exact answer text, not its letter.\nAnswer: "
+    )
+    row = _row(
+        prompt,
+        variant=0,
+        manipulation="controlled_baseline",
+        position_shift=0,
+        label_shift=0,
+        contents=[0, 1, 2, 3],
+        labels=list("ABCD"),
+        candidates=candidates,
+    )
+    row.update(wrapper_name="csv_inline", source_prompt_sha256=row["prompt_sha256"])
+    applicability = pd.DataFrame([{
+        "item_id": "item-1",
+        "wrapper_name": "csv_inline",
+        "split": "validation",
+        "source_prompt_sha256": row["prompt_sha256"],
+        "parse_provenance": "legacy_deterministic",
+    }])
+
+    sites = prepare_candidate_sites(pd.DataFrame([row]), applicability, option_maps={})
+
+    spans = sites.iloc[0].content_char_spans
+    assert [prompt[start:end] for start, end in spans] == candidates
+    assert spans[-1][0] == prompt.index(",An") + 1
+
+
 def test_locate_content_token_indices_uses_last_token_overlapping_payload():
     prompt = "A) alpha beta. B) gamma delta" + _SUFFIX
     spans = [(3, 14), (18, 29)]
@@ -312,17 +401,18 @@ def test_locate_content_token_indices_uses_last_token_overlapping_payload():
 
 
 def test_locate_content_token_indices_rejects_token_crossing_payload_boundary():
-    class CrossingTokenizer(CharacterTokenizer):
+    class CrossingTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [7]
+
         def __call__(self, text: str, *, add_special_tokens=False, return_offsets_mapping=False):
-            result = super().__call__(
-                text, add_special_tokens=add_special_tokens, return_offsets_mapping=return_offsets_mapping
-            )
+            result = {"input_ids": [7]}
             if return_offsets_mapping:
-                result["offset_mapping"][6] = (6, 8)
+                result["offset_mapping"] = [(0, len(text))]
             return result
 
     with pytest.raises(ValueError, match="crosses candidate payload boundary"):
-        locate_content_token_indices(CrossingTokenizer(), "xxalpha, yy", [(2, 7)])
+        locate_content_token_indices(CrossingTokenizer(), "correct", [(0, 1)])
 
 
 def test_locate_content_token_indices_allows_tokenizer_leading_space_prefix():
@@ -339,7 +429,7 @@ def test_locate_content_token_indices_allows_tokenizer_leading_space_prefix():
     assert locate_content_token_indices(LeadingSpaceTokenizer(), " alpha", [(1, 6)]) == [0]
 
 
-def test_locate_content_token_indices_skips_punctuation_fused_to_wrapper_delimiter():
+def test_locate_content_token_indices_keeps_terminal_answer_symbol():
     class SuffixTokenizer:
         def encode(self, text: str, add_special_tokens: bool = False):
             return [7, 8]
@@ -350,7 +440,35 @@ def test_locate_content_token_indices_skips_punctuation_fused_to_wrapper_delimit
                 result["offset_mapping"] = [(0, 5), (5, 7)]
             return result
 
-    assert locate_content_token_indices(SuffixTokenizer(), 'alpha."', [(0, 6)]) == [0]
+    assert locate_content_token_indices(SuffixTokenizer(), 'alpha."', [(0, 6)]) == [1]
+
+
+def test_locate_content_token_indices_keeps_meaningful_terminal_operator():
+    class OperatorTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [7, 8]
+
+        def __call__(self, text: str, *, add_special_tokens=False, return_offsets_mapping=False):
+            result = {"input_ids": [7, 8]}
+            if return_offsets_mapping:
+                result["offset_mapping"] = [(0, 2), (2, 4)]
+            return result
+
+    assert locate_content_token_indices(OperatorTokenizer(), 'Rb+"', [(0, 3)]) == [1]
+
+
+def test_locate_content_token_indices_accepts_symbol_payload_fused_to_punctuation():
+    class SymbolTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [7]
+
+        def __call__(self, text: str, *, add_special_tokens=False, return_offsets_mapping=False):
+            result = {"input_ids": [7]}
+            if return_offsets_mapping:
+                result["offset_mapping"] = [(0, 3)]
+            return result
+
+    assert locate_content_token_indices(SymbolTokenizer(), '"/"', [(1, 2)]) == [0]
 
 
 def test_prepare_candidate_sites_fails_closed_on_prompt_hash_drift():
