@@ -18,9 +18,11 @@ import torch
 from .causal_option_audit import load_causal_option_annotations
 from .decision_binding_cli import _load_bundle
 from .decision_binding_content import (
+    CANDIDATE_TARGET_STATE_COLUMNS,
     CandidateRanker,
     candidate_score_rows,
     capture_candidate_states,
+    classify_candidate_target_state,
     evaluate_candidate_ranker,
     fit_candidate_ranker,
     gate_candidate_reader,
@@ -44,6 +46,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROLE_ITEM_COUNTS = {"probe_train": 1801, "layer_select": 300, "reader_gate": 300}
 L2_GRID = (1e-4, 1e-3, 1e-2, 1e-1)
 CONTROL_READERS = ("position", "label", "position_label", "answer_length", "majority")
+TARGET_POLICY_VERSION = 1
+PARITY_MAX_DIFFERENCE = 2e-2
+PARITY_COMPARISON_EPSILON = 1e-12
 
 
 def _atomic_json(payload: object, path: Path) -> None:
@@ -181,41 +186,133 @@ def _chunks(frame: pd.DataFrame, size: int) -> list[tuple[str, pd.DataFrame]]:
     return work
 
 
-def _verify_raw_winners(chunk: pd.DataFrame, raw_log_probs: torch.Tensor) -> None:
-    predictions = np.asarray(raw_log_probs.float()).argmax(axis=1)
-    expected = chunk["raw_predicted_label"].astype(str).map(
-        {"A": 0, "B": 1, "C": 2, "D": 3}
-    ).to_numpy()
-    unique = chunk["winner_unique"].astype(bool).to_numpy()
-    if np.isnan(expected).any():
-        raise RuntimeError("stored raw winners contain an invalid label")
-    mismatch_indices = np.flatnonzero(unique & (predictions != expected.astype(int)))
-    if len(mismatch_indices):
-        labels = np.asarray(["A", "B", "C", "D"])
-        fresh_scores = np.asarray(raw_log_probs.float())
-        stored_scores = chunk[[
-            "raw_score_A", "raw_score_B", "raw_score_C", "raw_score_D",
-        ]].to_numpy(dtype=float)
-        details = []
-        for index in mismatch_indices[:10]:
-            stored_ordered = np.sort(stored_scores[index])
-            fresh_ordered = np.sort(fresh_scores[index])
-            details.append({
-                "work_key": str(chunk.iloc[index]["work_key"]),
-                "expected_label": str(labels[int(expected[index])]),
-                "fresh_label": str(labels[int(predictions[index])]),
-                "stored_scores": stored_scores[index].tolist(),
-                "fresh_scores": fresh_scores[index].tolist(),
-                "stored_top_two_gap": float(stored_ordered[-1] - stored_ordered[-2]),
-                "fresh_top_two_gap": float(fresh_ordered[-1] - fresh_ordered[-2]),
-                "max_abs_score_drift": float(
-                    np.max(np.abs(stored_scores[index] - fresh_scores[index]))
-                ),
-            })
-        raise RuntimeError(
-            f"captured forward pass changes {len(mismatch_indices)} stored raw winners: "
-            f"{json.dumps(details, sort_keys=True)}"
+def _verify_raw_winners(
+    chunk: pd.DataFrame, raw_log_probs: torch.Tensor
+) -> pd.DataFrame:
+    """Validate and classify a fresh forward without dropping unstable rows."""
+
+    return classify_candidate_target_state(chunk, raw_log_probs)
+
+
+def _eligibility_receipt(state: pd.DataFrame) -> dict[str, object]:
+    required = {
+        "work_key", "reader_target_evaluable", "reader_target_ineligibility_reason",
+    }
+    if missing := required - set(state.columns):
+        raise ValueError(f"candidate target state is missing columns: {sorted(missing)}")
+    if state["work_key"].duplicated().any():
+        raise ValueError("candidate target state has duplicate work keys")
+    allowed_reasons = {
+        "stored_raw_tie", "ambiguous_answer_content", "fresh_raw_tie",
+        "stored_fresh_content_mismatch", "eligible",
+    }
+    reasons = state["reader_target_ineligibility_reason"].astype(str)
+    evaluable = state["reader_target_evaluable"].astype(bool)
+    if not set(reasons).issubset(allowed_reasons) or not (evaluable == reasons.eq("eligible")).all():
+        raise ValueError("candidate target state has inconsistent eligibility reasons")
+    rows = sorted(
+        (
+            str(row.work_key),
+            bool(row.reader_target_evaluable),
+            str(row.reader_target_ineligibility_reason),
         )
+        for row in state.itertuples()
+    )
+    reason_counts = {
+        str(key): int(value)
+        for key, value in state["reader_target_ineligibility_reason"].astype(str)
+        .value_counts().sort_index().items()
+    }
+    canonical = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+    canonical_state = state[list(CANDIDATE_TARGET_STATE_COLUMNS)].sort_values(
+        "work_key", kind="mergesort"
+    ).to_json(orient="records", double_precision=15)
+    return {
+        "target_policy_version": TARGET_POLICY_VERSION,
+        "total_rows": int(len(state)),
+        "evaluable_rows": int(state["reader_target_evaluable"].astype(bool).sum()),
+        "reason_counts": reason_counts,
+        "eligibility_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "target_state_sha256": hashlib.sha256(
+            canonical_state.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _runtime_environment_receipt(*, attention_backend: str) -> dict[str, object]:
+    cuda = bool(torch.cuda.is_available())
+    return {
+        "device_type": "cuda" if cuda else "cpu",
+        "gpu_name": str(torch.cuda.get_device_name(0)) if cuda else None,
+        "gpu_compute_capability": (
+            ".".join(map(str, torch.cuda.get_device_capability(0))) if cuda else None
+        ),
+        "bf16_supported": bool(torch.cuda.is_bf16_supported()) if cuda else False,
+        "attention_backend": str(attention_backend),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "transformers_version": importlib.metadata.version("transformers"),
+        "tokenizers_version": importlib.metadata.version("tokenizers"),
+        "inference_dtype": "bfloat16" if cuda else "float32",
+        "fit_dtype": "float32",
+    }
+
+
+def _categorical_parity_receipt(
+    left: np.ndarray,
+    right: np.ndarray,
+    work_keys: Sequence[str],
+    *,
+    maximum_difference: float = PARITY_MAX_DIFFERENCE,
+) -> dict[str, object]:
+    left_values = np.asarray(left, dtype=float)
+    right_values = np.asarray(right, dtype=float)
+    if (
+        left_values.shape != right_values.shape
+        or left_values.ndim != 2
+        or left_values.shape[0] != len(work_keys)
+        or left_values.shape[1] != 4
+        or not np.isfinite(left_values).all()
+        or not np.isfinite(right_values).all()
+    ):
+        raise ValueError("categorical parity requires finite aligned four-way scores")
+    row_differences = np.max(np.abs(left_values - right_values), axis=1)
+    ambiguous: list[dict[str, object]] = []
+    resolvable: list[str] = []
+    for index, work_key in enumerate(map(str, work_keys)):
+        if int(left_values[index].argmax()) == int(right_values[index].argmax()):
+            continue
+        left_sorted = np.sort(left_values[index])
+        right_sorted = np.sort(right_values[index])
+        left_margin = float(left_sorted[-1] - left_sorted[-2])
+        right_margin = float(right_sorted[-1] - right_sorted[-2])
+        explained = (
+            left_margin <= 2.0 * row_differences[index]
+            and right_margin <= 2.0 * row_differences[index]
+        )
+        if explained:
+            ambiguous.append({
+                "work_key": work_key,
+                "left_margin": left_margin,
+                "right_margin": right_margin,
+                "max_coordinate_difference": float(row_differences[index]),
+            })
+        else:
+            resolvable.append(work_key)
+    observed = float(row_differences.max(initial=0.0))
+    return {
+        "passes": bool(
+            observed <= float(maximum_difference) + PARITY_COMPARISON_EPSILON
+            and not resolvable
+        ),
+        "maximum_difference": float(maximum_difference),
+        "observed_maximum_difference": observed,
+        "ambiguous_work_keys": [row["work_key"] for row in ambiguous],
+        "ambiguous_count": int(len(ambiguous)),
+        "ambiguous_rows": ambiguous,
+        "resolvable_disagreement_work_keys": resolvable,
+        "resolvable_disagreement_count": int(len(resolvable)),
+    }
 
 
 def _token_positions(tokenizer, chunk: pd.DataFrame) -> list[list[int]]:
@@ -229,22 +326,39 @@ def _save_activation_shard(
     path: Path,
     *,
     activations: torch.Tensor,
+    raw_log_probs: torch.Tensor,
+    target_state: pd.DataFrame,
     work_keys: Sequence[str],
     semantic_sha256: str,
 ) -> None:
+    normalized_keys = list(map(str, work_keys))
+    if list(target_state["work_key"].astype(str)) != normalized_keys:
+        raise ValueError("training activation target state is not work-key aligned")
+    if tuple(target_state.columns) != tuple(CANDIDATE_TARGET_STATE_COLUMNS):
+        raise ValueError("training activation target state has an unsupported schema")
+    raw = raw_log_probs.detach().float().cpu()
+    if raw.shape != (len(normalized_keys), 4) or not torch.isfinite(raw).all():
+        raise ValueError("training activation raw scores are malformed")
+    state_json = target_state.to_json(orient="split", index=False, double_precision=15)
+    state_sha256 = hashlib.sha256(state_json.encode("utf-8")).hexdigest()
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "schema_version": 1,
+        "schema_version": 2,
         "semantic_sha256": semantic_sha256,
-        "work_keys": list(map(str, work_keys)),
+        "work_keys": normalized_keys,
         "activations": activations.cpu(),
+        "raw_log_probs": raw,
+        "target_state_json": state_json,
+        "target_state_sha256": state_sha256,
     }, temporary)
     os.replace(temporary, path)
     _atomic_json({
-        "schema_version": 1,
+        "schema_version": 2,
         "semantic_sha256": semantic_sha256,
-        "work_keys": list(map(str, work_keys)),
+        "work_keys": normalized_keys,
+        "target_state_sha256": state_sha256,
+        "eligibility": _eligibility_receipt(target_state),
         "sha256": sha256_file(path),
         "bytes": path.stat().st_size,
     }, path.with_suffix(path.suffix + ".manifest.json"))
@@ -255,13 +369,13 @@ def _load_activation_shard(
     *,
     work_keys: Sequence[str],
     semantic_sha256: str,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, pd.DataFrame]:
     manifest_path = path.with_suffix(path.suffix + ".manifest.json")
     if not manifest_path.exists():
         raise RuntimeError(f"training activation shard checksum manifest is missing: {path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if (
-        manifest.get("schema_version") != 1
+        manifest.get("schema_version") != 2
         or manifest.get("semantic_sha256") != semantic_sha256
         or manifest.get("work_keys") != list(map(str, work_keys))
         or manifest.get("sha256") != sha256_file(path)
@@ -270,7 +384,7 @@ def _load_activation_shard(
         raise RuntimeError(f"training activation shard checksum mismatch: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if (
-        payload.get("schema_version") != 1
+        payload.get("schema_version") != 2
         or payload.get("semantic_sha256") != semantic_sha256
         or payload.get("work_keys") != list(map(str, work_keys))
     ):
@@ -278,7 +392,31 @@ def _load_activation_shard(
     values = payload.get("activations")
     if not isinstance(values, torch.Tensor) or values.ndim != 4 or values.shape[2] != 4:
         raise RuntimeError(f"training activation shard is malformed: {path}")
-    return values
+    raw = payload.get("raw_log_probs")
+    state_json = payload.get("target_state_json")
+    if (
+        not isinstance(raw, torch.Tensor)
+        or raw.shape != (len(work_keys), 4)
+        or not torch.isfinite(raw).all()
+        or not isinstance(state_json, str)
+        or hashlib.sha256(state_json.encode("utf-8")).hexdigest()
+        != payload.get("target_state_sha256")
+        or payload.get("target_state_sha256") != manifest.get("target_state_sha256")
+    ):
+        raise RuntimeError(f"training activation shard target state mismatch: {path}")
+    state_payload = json.loads(state_json)
+    state = pd.DataFrame(state_payload["data"], columns=state_payload["columns"])
+    if (
+        tuple(state.columns) != tuple(CANDIDATE_TARGET_STATE_COLUMNS)
+        or list(state["work_key"].astype(str)) != list(map(str, work_keys))
+        or _eligibility_receipt(state) != manifest.get("eligibility")
+        or not np.allclose(
+            state[[f"fresh_raw_score_{label}" for label in "ABCD"]].to_numpy(dtype=float),
+            raw.numpy(), atol=1e-7, rtol=0.0,
+        )
+    ):
+        raise RuntimeError(f"training activation shard target state mismatch: {path}")
+    return values, state
 
 
 def _capture_training(
@@ -293,13 +431,14 @@ def _capture_training(
     chunk_size: int,
     stop: StopState,
     progress,
-) -> torch.Tensor | None:
+) -> tuple[torch.Tensor, pd.DataFrame] | None:
     values: list[torch.Tensor] = []
+    states: list[pd.DataFrame] = []
     work = _chunks(training, chunk_size)
     for index, (key, chunk) in enumerate(work):
         path = root / "activation_shards" / "training" / f"{key}.pt"
         if path.exists():
-            captured = _load_activation_shard(
+            captured, target_state = _load_activation_shard(
                 path, work_keys=chunk["work_key"], semantic_sha256=identity.semantic_sha256
             )
         else:
@@ -313,17 +452,39 @@ def _capture_training(
                 batch_size=batch_size,
                 max_batch_tokens=max_batch_tokens,
             )
-            _verify_raw_winners(chunk, result.raw_log_probs)
+            target_state = _verify_raw_winners(chunk, result.raw_log_probs)
             captured = result.activations
             _save_activation_shard(
                 path,
                 activations=captured,
+                raw_log_probs=result.raw_log_probs,
+                target_state=target_state,
                 work_keys=chunk["work_key"],
                 semantic_sha256=identity.semantic_sha256,
             )
         values.append(captured)
+        states.append(target_state)
         progress("training_capture", index + 1, len(work))
-    return torch.cat(values, dim=0)
+    return torch.cat(values, dim=0), pd.concat(states, ignore_index=True)
+
+
+def _eligible_training_inputs(
+    training_pool: pd.DataFrame,
+    activations: torch.Tensor,
+    target_state: pd.DataFrame,
+) -> tuple[pd.DataFrame, torch.Tensor, np.ndarray]:
+    if len(activations) != len(training_pool):
+        raise RuntimeError("candidate training activations do not match the frozen pool")
+    training = _join_target_state(training_pool, target_state)
+    mask = training["reader_target_evaluable"].astype(bool).to_numpy(copy=True)
+    if not mask.any():
+        raise RuntimeError("candidate training pool has no runtime-eligible content targets")
+    eligible = training.loc[mask].reset_index(drop=True)
+    return (
+        eligible,
+        activations[torch.from_numpy(mask)],
+        eligible["winner_position"].to_numpy(dtype=int),
+    )
 
 
 def _fit_rankers(
@@ -387,11 +548,20 @@ def _score_model_phase(
             batch_size=batch_size,
             max_batch_tokens=max_batch_tokens,
         )
-        _verify_raw_winners(chunk, captured.raw_log_probs)
+        target_state = _verify_raw_winners(chunk, captured.raw_log_probs)
+        scored_sites = chunk.drop(
+            columns=[
+                column for column in CANDIDATE_TARGET_STATE_COLUMNS
+                if column != "work_key" and column in chunk
+            ],
+            errors="ignore",
+        ).merge(target_state, on="work_key", how="left", validate="one_to_one")
+        if len(scored_sites) != len(chunk):
+            raise RuntimeError("candidate score target state did not preserve every source row")
         rows = []
         for l2, ranker in rankers.items():
             scored = candidate_score_rows(
-                chunk,
+                scored_sites,
                 evaluate_candidate_ranker(ranker, captured.activations),
                 l2=l2,
                 reader_name="content",
@@ -401,7 +571,7 @@ def _score_model_phase(
             rows.append(scored)
         for name, ranker in (extra_rankers or {}).items():
             scored = candidate_score_rows(
-                chunk,
+                scored_sites,
                 evaluate_candidate_ranker(ranker, captured.activations),
                 l2=ranker.l2,
                 reader_name=name,
@@ -441,13 +611,56 @@ def _score_metadata_rankers(
     ], ignore_index=True)
 
 
+def _score_selected_metadata_controls(
+    sites: pd.DataFrame,
+    selected_controls: Mapping[str, pd.DataFrame],
+    fitted_controls: Mapping[str, Mapping[float, CandidateRanker]],
+) -> dict[str, pd.DataFrame]:
+    scored: dict[str, pd.DataFrame] = {}
+    for name, fitted in fitted_controls.items():
+        selected_l2 = float(selected_controls[name].iloc[0]["l2"])
+        scored[name] = _score_metadata_rankers(
+            sites, {selected_l2: fitted[selected_l2]}, name
+        )
+    return scored
+
+
+def _target_state_from_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    missing = set(CANDIDATE_TARGET_STATE_COLUMNS) - set(frame.columns)
+    if missing:
+        raise RuntimeError(f"candidate scores are missing target state: {sorted(missing)}")
+    state = frame[list(CANDIDATE_TARGET_STATE_COLUMNS)].drop_duplicates().copy()
+    if state["work_key"].duplicated().any():
+        raise RuntimeError("candidate scores disagree on repeated work-key target state")
+    return state.sort_values("work_key", kind="mergesort").reset_index(drop=True)
+
+
+def _join_target_state(sites: pd.DataFrame, state: pd.DataFrame) -> pd.DataFrame:
+    base = sites.drop(
+        columns=[
+            column for column in CANDIDATE_TARGET_STATE_COLUMNS
+            if column != "work_key" and column in sites
+        ],
+        errors="ignore",
+    )
+    joined = base.merge(state, on="work_key", how="left", validate="one_to_one")
+    if len(joined) != len(sites) or joined["reader_target_evaluable"].isna().any():
+        raise RuntimeError("candidate target state did not cover every source row")
+    return joined
+
+
 def _best_control(frame: pd.DataFrame) -> pd.DataFrame:
     candidates = []
     for l2, group in frame.groupby("l2", sort=True):
-        probabilities = group[[f"content_prob_{value}" for value in range(4)]].to_numpy()
-        target = group["actual_winner_content_id"].to_numpy(dtype=int)
+        if "reader_target_evaluable" not in group:
+            raise ValueError("control selection requires runtime target eligibility")
+        eligible = group[group["reader_target_evaluable"].astype(bool)]
+        if eligible.empty:
+            raise ValueError("control selection has no runtime-eligible rows")
+        probabilities = eligible[[f"content_prob_{value}" for value in range(4)]].to_numpy()
+        target = eligible["actual_winner_content_id"].to_numpy(dtype=int)
         correct = probabilities.argmax(axis=1) == target
-        scored = group.assign(_correct=correct)
+        scored = eligible.assign(_correct=correct)
         arms = []
         for manipulation in ("position_only", "label_only"):
             arm = scored[scored["manipulation"].astype(str) == manipulation]
@@ -471,6 +684,7 @@ def _run_parity_checks(
     max_iter: int,
     fit_device,
     seed: int,
+    selected_layer: int,
 ) -> dict[str, object]:
     sample = activations[: min(32, len(activations))]
     expected = evaluate_candidate_ranker(ranker, sample)
@@ -505,7 +719,10 @@ def _run_parity_checks(
         and seed_difference <= 1e-5
     )
 
-    batch_sites = gate_sites.sort_values("work_key", kind="mergesort").iloc[:4].copy()
+    eligible_gate = gate_sites[gate_sites["reader_target_evaluable"].astype(bool)]
+    batch_sites = eligible_gate.sort_values("work_key", kind="mergesort").iloc[:4].copy()
+    if batch_sites.empty:
+        raise RuntimeError("batch parity has no runtime-eligible reader-gate rows")
     positions = _token_positions(tokenizer, batch_sites)
     batched = capture_candidate_states(
         model, tokenizer, batch_sites["prompt"].astype(str).tolist(), positions,
@@ -521,20 +738,28 @@ def _run_parity_checks(
     scalar_activations = torch.cat([capture.activations for capture in scalar])
     scalar_raw = torch.cat([capture.raw_log_probs for capture in scalar])
     activation_difference = float(
-        (batched.activations.float() - scalar_activations.float()).abs().max()
+        (batched.activations[:, selected_layer].float()
+         - scalar_activations[:, selected_layer].float()).abs().max()
     )
     raw_difference = float((batched.raw_log_probs - scalar_raw).abs().max())
+    batched_reader = evaluate_candidate_ranker(ranker, batched.activations)[:, selected_layer]
+    scalar_reader = evaluate_candidate_ranker(ranker, scalar_activations)[:, selected_layer]
+    reader_receipt = _categorical_parity_receipt(
+        batched_reader, scalar_reader, batch_sites["work_key"],
+    )
+    raw_receipt = _categorical_parity_receipt(
+        batched.raw_log_probs.float().cpu().numpy(),
+        scalar_raw.float().cpu().numpy(),
+        batch_sites["work_key"],
+    )
     batch_parity = bool(
-        np.array_equal(
-            evaluate_candidate_ranker(ranker, batched.activations).argmax(axis=2),
-            evaluate_candidate_ranker(ranker, scalar_activations).argmax(axis=2),
-        )
-        and torch.equal(batched.raw_log_probs.argmax(dim=1), scalar_raw.argmax(dim=1))
-        and activation_difference <= 2e-2
-        and raw_difference <= 2e-2
+        reader_receipt["passes"]
+        and raw_receipt["passes"]
+        and activation_difference <= PARITY_MAX_DIFFERENCE
+        and raw_difference <= PARITY_MAX_DIFFERENCE
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "semantic_sha256": identity.semantic_sha256,
         "save_load": save_load,
         "batch": batch_parity,
@@ -543,6 +768,13 @@ def _run_parity_checks(
         "max_seed_probability_difference": seed_difference,
         "max_batch_activation_difference": activation_difference,
         "max_batch_raw_log_probability_difference": raw_difference,
+        "max_batch_reader_probability_difference": reader_receipt[
+            "observed_maximum_difference"
+        ],
+        "batch_reader_categorical": reader_receipt,
+        "batch_raw_categorical": raw_receipt,
+        "selected_layer": int(selected_layer),
+        "batch_work_keys": batch_sites["work_key"].astype(str).tolist(),
         "batch_rows": int(len(batch_sites)),
     }
 
@@ -558,6 +790,13 @@ def _manifest_artifacts(root: Path, names: Sequence[str]) -> dict[str, dict[str,
             frame = read_table(path)
             metadata["rows"] = int(len(frame))
             metadata["work_keys"] = int(frame["work_key"].nunique()) if "work_key" in frame else 0
+            if {
+                "reader_target_evaluable", "reader_target_ineligibility_reason",
+            }.issubset(frame.columns):
+                metadata["eligibility"] = _eligibility_receipt(
+                    _target_state_from_scores(frame)
+                    if "reader_name" in frame else frame
+                )
         artifacts[name] = metadata
     return artifacts
 
@@ -584,7 +823,7 @@ def verify_run_root(
     required = {
         "semantic_identity.json", "frozen_selection.json", "gate_report.json",
         "ranker_manifest.json", "work_plan.json", "layer_select_scores.parquet",
-        "layer_select_control_scores.parquet",
+        "layer_select_control_scores.parquet", "training_target_state.parquet",
     }
     if bool(manifest.get("reader_gate_opened")):
         required.update({
@@ -604,6 +843,15 @@ def verify_run_root(
             frame = read_table(path)
             if len(frame) != int(metadata.get("rows", -1)):
                 raise RuntimeError(f"candidate artifact row count mismatch: {name}")
+            if name == "training_target_state.parquet":
+                if (
+                    tuple(frame.columns) != tuple(CANDIDATE_TARGET_STATE_COLUMNS)
+                    or frame["work_key"].duplicated().any()
+                    or not frame["work_key"].astype(str).is_monotonic_increasing
+                    or _eligibility_receipt(frame) != metadata.get("eligibility")
+                ):
+                    raise RuntimeError("candidate training target state mismatch")
+                continue
             identity_columns = [
                 column for column in ("reader_name", "l2", "layer", "work_key")
                 if column in frame
@@ -618,6 +866,9 @@ def verify_run_root(
                 raise RuntimeError(f"candidate artifact role mismatch: {name}")
             if int(frame["work_key"].nunique()) != int(metadata.get("work_keys", -1)):
                 raise RuntimeError(f"candidate artifact work-key count mismatch: {name}")
+            state = _target_state_from_scores(frame)
+            if _eligibility_receipt(state) != metadata.get("eligibility"):
+                raise RuntimeError(f"candidate artifact target state mismatch: {name}")
     plan_path = run_root / "work_plan.json"
     if not plan_path.is_file():
         raise RuntimeError("candidate work plan is missing")
@@ -625,7 +876,7 @@ def verify_run_root(
     selection = json.loads((run_root / "frozen_selection.json").read_text(encoding="utf-8"))
     config_l2 = [float(value) for value in identity.get("experiment_config", {}).get("l2_grid", [])]
     if (
-        plan.get("schema_version") != 1
+        plan.get("schema_version") != 2
         or plan.get("semantic_sha256") != identity.get("semantic_sha256")
         or bool(plan.get("reader_gate_opened")) != bool(manifest.get("reader_gate_opened"))
         or plan.get("role_items") != manifest.get("role_items")
@@ -633,8 +884,41 @@ def verify_run_root(
         or [float(value) for value in plan.get("l2_grid", [])] != config_l2
         or int(plan.get("selected_layer", -1)) != int(selection.get("selected_layer", -2))
         or not np.isclose(float(plan.get("selected_l2", -1)), float(selection.get("selected_l2", -2)))
+        or plan.get("training_eligibility") != manifest.get("training_eligibility")
+        or plan.get("training_eligibility") != selection.get("training_eligibility")
+        or plan.get("role_eligibility") != manifest.get("target_evaluability_by_role")
     ):
         raise RuntimeError("candidate work plan identity mismatch")
+    training_state = read_table(run_root / "training_target_state.parquet")
+    training_receipt = _eligibility_receipt(training_state)
+    if (
+        training_receipt != plan.get("training_eligibility")
+        or int(training_receipt["total_rows"]) != int(manifest.get("training_pool_items", -1))
+        or int(training_receipt["evaluable_rows"])
+        != int(manifest.get("training_evaluable_items", -1))
+    ):
+        raise RuntimeError("candidate training eligibility does not match expected work")
+    environment = identity.get("experiment_config", {}).get("runtime_environment", {})
+    required_environment = {
+        "device_type", "gpu_name", "gpu_compute_capability", "bf16_supported",
+        "attention_backend", "torch_version", "cuda_version", "transformers_version",
+        "tokenizers_version", "inference_dtype", "fit_dtype",
+    }
+    if (
+        set(environment) != required_environment
+        or environment.get("attention_backend") != "sdpa"
+        or environment.get("fit_dtype") != "float32"
+        or (
+            environment.get("device_type") == "cuda"
+            and (
+                not environment.get("gpu_name")
+                or not environment.get("gpu_compute_capability")
+                or environment.get("bf16_supported") is not True
+                or environment.get("inference_dtype") != "bfloat16"
+            )
+        )
+    ):
+        raise RuntimeError("candidate runtime environment identity mismatch")
     expected_frames = {
         "layer_select_scores.parquet": {
             "role": "layer_select", "readers": {"content"},
@@ -670,6 +954,9 @@ def verify_run_root(
             or set(frame["reader_name"].astype(str)) != expectation["readers"]
         ):
             raise RuntimeError(f"candidate artifact does not match expected work: {name}")
+        observed_eligibility = _eligibility_receipt(_target_state_from_scores(frame))
+        if observed_eligibility != plan["role_eligibility"].get(expectation["role"]):
+            raise RuntimeError(f"candidate artifact eligibility does not match expected work: {name}")
     ranker_manifest_path = run_root / "ranker_manifest.json"
     if ranker_manifest_path.exists():
         ranker_manifest = json.loads(ranker_manifest_path.read_text(encoding="utf-8"))
@@ -682,6 +969,67 @@ def verify_run_root(
             path = run_root / "rankers" / str(name)
             if not path.is_file() or sha256_file(path) != digest:
                 raise RuntimeError(f"candidate ranker checksum mismatch: {name}")
+        if selection.get("ranker_sha256") != ranker_receipts:
+            raise RuntimeError("candidate frozen selection ranker hashes mismatch")
+    expected_parity_policy = {
+        "schema_version": 2,
+        "maximum_activation_difference": PARITY_MAX_DIFFERENCE,
+        "maximum_raw_log_probability_difference": PARITY_MAX_DIFFERENCE,
+        "maximum_reader_probability_difference": PARITY_MAX_DIFFERENCE,
+        "categorical_disagreement_rule": "both_margins_lte_twice_observed_coordinate_difference",
+    }
+    expected_source_keys = {
+        "source_bundle_manifest_sha256", "source_readout_sha256",
+        "source_applicability_sha256", "option_audit_manifest_sha256",
+    }
+    if (
+        selection.get("target_policy_version") != TARGET_POLICY_VERSION
+        or set(selection.get("selected_control_l2", {}))
+        != {reader for reader in CONTROL_READERS if reader != "majority"}
+        or len(selection.get("majority_training_distribution", [])) != 4
+        or not np.isclose(sum(selection.get("majority_training_distribution", [])), 1.0)
+        or selection.get("random_reader_seeds") != [
+            int(identity.get("experiment_config", {}).get("seed", 0)) + 1000 + index
+            for index in range(3)
+        ]
+        or set(selection.get("prepared_source_hashes", {})) != expected_source_keys
+        or selection.get("prepared_source_hashes")
+        != identity.get("experiment_config", {}).get("prepared_source_hashes")
+        or selection.get("layer_select_eligibility")
+        != plan.get("role_eligibility", {}).get("layer_select")
+        or (
+            bool(manifest.get("reader_gate_opened"))
+            and selection.get("reader_gate_eligibility")
+            != plan.get("role_eligibility", {}).get("reader_gate")
+        )
+        or (
+            bool(manifest.get("reader_gate_opened"))
+            and selection.get("parity_policy") != expected_parity_policy
+        )
+    ):
+        raise RuntimeError("candidate frozen selection policy mismatch")
+    if bool(manifest.get("reader_gate_opened")):
+        parity = json.loads((run_root / "parity_report.json").read_text(encoding="utf-8"))
+        if (
+            parity.get("schema_version") != 2
+            or parity.get("semantic_sha256") != identity.get("semantic_sha256")
+            or int(parity.get("selected_layer", -1)) != int(selection.get("selected_layer", -2))
+            or any(
+                not np.isclose(
+                    float(parity.get(key, {}).get("maximum_difference", -1)),
+                    PARITY_MAX_DIFFERENCE,
+                )
+                for key in ("batch_reader_categorical", "batch_raw_categorical")
+            )
+            or bool(parity.get("batch"))
+            != bool(
+                parity.get("batch_reader_categorical", {}).get("passes")
+                and parity.get("batch_raw_categorical", {}).get("passes")
+                and float(parity.get("max_batch_activation_difference", float("inf")))
+                <= PARITY_MAX_DIFFERENCE
+            )
+        ):
+            raise RuntimeError("candidate parity report violates the frozen policy")
     gate = json.loads((run_root / "gate_report.json").read_text(encoding="utf-8"))
     if mode == "canary" and not bool(manifest.get("reader_gate_opened")):
         raise RuntimeError("candidate canary did not reach the reader gate")
@@ -756,6 +1104,8 @@ def _write_work_plan(
     reader_gate_opened: bool,
     selected_layer: int | None,
     selected_l2: float | None,
+    training_eligibility: Mapping[str, object],
+    role_eligibility: Mapping[str, Mapping[str, object]],
 ) -> None:
     roles = {
         role: _work_key_summary(
@@ -764,7 +1114,7 @@ def _write_work_plan(
         for role in ("layer_select", "reader_gate")
     }
     _atomic_json({
-        "schema_version": 1,
+        "schema_version": 2,
         "semantic_sha256": semantic_sha256,
         "reader_gate_opened": bool(reader_gate_opened),
         "role_items": _role_items(sites),
@@ -773,6 +1123,10 @@ def _write_work_plan(
         "l2_grid": [float(value) for value in l2_grid],
         "selected_layer": selected_layer,
         "selected_l2": selected_l2,
+        "training_eligibility": dict(training_eligibility),
+        "role_eligibility": {
+            str(role): dict(receipt) for role, receipt in role_eligibility.items()
+        },
     }, root / "work_plan.json")
 
 
@@ -807,9 +1161,20 @@ def cmd_run_model(args) -> None:
         _select_canary_sites(all_sites, items_per_role=args.canary_items, seed=args.seed)
         if canary else all_sites
     )
+    runtime_environment = _runtime_environment_receipt(
+        attention_backend=profile.attention_backend
+    )
+    prepared_source_hashes = {
+        key: prepared_manifest[key]
+        for key in (
+            "source_bundle_manifest_sha256", "source_readout_sha256",
+            "source_applicability_sha256", "option_audit_manifest_sha256",
+        )
+    }
     config = {
         "experiment": "decision_binding_candidate_local_content_v3",
         "prepared_manifest_sha256": sha256_file(Path(args.bundle) / "prepared_manifest.json"),
+        "prepared_source_hashes": prepared_source_hashes,
         "token_position": "final_full_token_within_audited_candidate_payload",
         "l2_grid": list(map(float, args.l2_grid)),
         "seed": int(args.seed),
@@ -820,11 +1185,8 @@ def cmd_run_model(args) -> None:
         "max_batch_tokens": int(args.max_batch_tokens),
         "capture_chunk_size": int(args.capture_chunk_size),
         "max_iter": int(args.max_iter),
-        "inference_dtype": "bfloat16",
-        "fit_dtype": "float32",
-        "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda,
-        "transformers_version": importlib.metadata.version("transformers"),
+        "target_policy_version": TARGET_POLICY_VERSION,
+        "runtime_environment": runtime_environment,
     }
     identity = build_semantic_identity(
         profile,
@@ -879,6 +1241,8 @@ def cmd_run_model(args) -> None:
         )
         if not args.allow_cpu and device.type != "cuda":
             raise RuntimeError("candidate-local model runs require CUDA")
+        if device.type != runtime_environment["device_type"]:
+            raise RuntimeError("candidate-local loaded device differs from bound runtime identity")
         if device.type == "cuda" and (
             not torch.cuda.is_bf16_supported()
             or next(model.parameters()).dtype != torch.bfloat16
@@ -893,11 +1257,8 @@ def cmd_run_model(args) -> None:
             not canary and len(training_pool) != 1801
         ):
             raise RuntimeError("candidate training rows do not match the frozen plain baseline")
-        training = training_pool[training_pool["content_target_evaluable"].astype(bool)].copy()
-        if training.empty:
-            raise RuntimeError("candidate training pool has no unique content targets")
-        activations = _capture_training(
-            root, training, model, tokenizer,
+        captured_training = _capture_training(
+            root, training_pool, model, tokenizer,
             identity=identity,
             batch_size=args.batch_size,
             max_batch_tokens=args.max_batch_tokens,
@@ -905,13 +1266,21 @@ def cmd_run_model(args) -> None:
             stop=stop,
             progress=progress,
         )
-        if activations is None:
+        if captured_training is None:
             _atomic_json({
                 "status": "interrupted", "phase": "training_capture",
                 "semantic_identity": identity.as_dict(), "stop_signal": stop.signal_name,
             }, previous_manifest)
             return
-        targets = training["winner_position"].to_numpy(dtype=int)
+        all_activations, training_state = captured_training
+        training_eligibility_receipt = _eligibility_receipt(training_state)
+        write_table_atomic(
+            training_state.sort_values("work_key", kind="mergesort").reset_index(drop=True),
+            root / "training_target_state.parquet",
+        )
+        training, activations, targets = _eligible_training_inputs(
+            training_pool, all_activations, training_state
+        )
         rankers = _fit_rankers(
             root, activations, targets,
             l2_grid=args.l2_grid,
@@ -969,12 +1338,15 @@ def cmd_run_model(args) -> None:
             }, previous_manifest)
             return
         layer_scores = _stable_score_frame(layer_scores)
+        layer_state = _target_state_from_scores(layer_scores)
+        layer_eligibility_receipt = _eligibility_receipt(layer_state)
+        layer_sites_with_state = _join_target_state(layer_sites, layer_state)
         layer_controls = {
-            name: _best_control(_score_metadata_rankers(layer_sites, fitted, name))
+            name: _best_control(_score_metadata_rankers(layer_sites_with_state, fitted, name))
             for name, fitted in control_rankers.items()
         }
         layer_controls["majority"] = majority_candidate_scores(
-            layer_sites, training["actual_winner_content_id"].to_numpy(dtype=int)
+            layer_sites_with_state, training["actual_winner_content_id"].to_numpy(dtype=int)
         )
         selection_stop = False
         try:
@@ -998,6 +1370,21 @@ def cmd_run_model(args) -> None:
             "token_position": config["token_position"],
             "l2_grid": config["l2_grid"],
             "seed": args.seed,
+            "target_policy_version": TARGET_POLICY_VERSION,
+            "training_eligibility": training_eligibility_receipt,
+            "layer_select_eligibility": layer_eligibility_receipt,
+            "selected_control_l2": {
+                name: float(frame.iloc[0]["l2"])
+                for name, frame in layer_controls.items()
+                if name != "majority"
+            },
+            "majority_training_distribution": (
+                np.bincount(
+                    training["actual_winner_content_id"].to_numpy(dtype=int), minlength=4
+                ) / len(training)
+            ).tolist(),
+            "random_reader_seeds": [args.seed + 1000 + index for index in range(3)],
+            "prepared_source_hashes": prepared_source_hashes,
             "final_confirmation_opened": False,
             "ranker_sha256": {
                 path.name: sha256_file(path) for path in sorted((root / "rankers").glob("*.npz"))
@@ -1013,6 +1400,8 @@ def cmd_run_model(args) -> None:
             reader_gate_opened=not selection_stop,
             selected_layer=int(selection["selected_layer"]),
             selected_l2=float(selection["selected_l2"]),
+            training_eligibility=training_eligibility_receipt,
+            role_eligibility={"layer_select": layer_eligibility_receipt},
         )
 
         if selection_stop:
@@ -1047,7 +1436,7 @@ def cmd_run_model(args) -> None:
             artifact_names = (
                 "semantic_identity.json", "frozen_selection.json", "gate_report.json",
                 "ranker_manifest.json", "work_plan.json", "layer_select_scores.parquet",
-                "layer_select_control_scores.parquet",
+                "layer_select_control_scores.parquet", "training_target_state.parquet",
             )
             _atomic_json({
                 "status": "content_readout_complete",
@@ -1057,6 +1446,10 @@ def cmd_run_model(args) -> None:
                 "role_items": _role_items(sites),
                 "training_pool_items": int(training_pool["item_id"].nunique()),
                 "training_evaluable_items": int(training["item_id"].nunique()),
+                "training_eligibility": training_eligibility_receipt,
+                "target_evaluability_by_role": {
+                    "layer_select": layer_eligibility_receipt,
+                },
                 "tier_1_pass": False,
                 "tier_2_pass": False,
                 "content_reader_usable": False,
@@ -1098,28 +1491,6 @@ def cmd_run_model(args) -> None:
                 "semantic_identity": identity.as_dict(), "stop_signal": stop.signal_name,
             }, previous_manifest)
             return
-        parity_report = _run_parity_checks(
-            root,
-            rankers[selected_l2],
-            activations,
-            targets,
-            model,
-            tokenizer,
-            gate_sites,
-            identity=identity,
-            batch_size=args.batch_size,
-            max_batch_tokens=args.max_batch_tokens,
-            max_iter=args.max_iter,
-            fit_device=device,
-            seed=args.seed,
-        )
-        _atomic_json(parity_report, root / "parity_report.json")
-        if stop.requested:
-            _atomic_json({
-                "status": "interrupted", "phase": "parity",
-                "semantic_identity": identity.as_dict(), "stop_signal": stop.signal_name,
-            }, previous_manifest)
-            return
         all_gate_scores, complete = _score_model_phase(
             root, "reader_gate", gate_sites, {selected_l2: rankers[selected_l2]}, model, tokenizer,
             identity=identity,
@@ -1138,21 +1509,71 @@ def cmd_run_model(args) -> None:
             }, previous_manifest)
             return
         all_gate_scores = _stable_score_frame(all_gate_scores)
+        gate_state = _target_state_from_scores(all_gate_scores)
+        gate_eligibility_receipt = _eligibility_receipt(gate_state)
+        gate_sites_with_state = _join_target_state(gate_sites, gate_state)
+        parity_report = _run_parity_checks(
+            root,
+            rankers[selected_l2],
+            activations,
+            targets,
+            model,
+            tokenizer,
+            gate_sites_with_state,
+            identity=identity,
+            batch_size=args.batch_size,
+            max_batch_tokens=args.max_batch_tokens,
+            max_iter=args.max_iter,
+            fit_device=device,
+            seed=args.seed,
+            selected_layer=selected_layer,
+        )
+        _atomic_json(parity_report, root / "parity_report.json")
+        selection_payload.update({
+            "reader_gate_eligibility": gate_eligibility_receipt,
+            "parity_policy": {
+                "schema_version": 2,
+                "maximum_activation_difference": PARITY_MAX_DIFFERENCE,
+                "maximum_raw_log_probability_difference": PARITY_MAX_DIFFERENCE,
+                "maximum_reader_probability_difference": PARITY_MAX_DIFFERENCE,
+                "categorical_disagreement_rule": "both_margins_lte_twice_observed_coordinate_difference",
+            },
+            "ranker_sha256": {
+                path.name: sha256_file(path) for path in sorted((root / "rankers").glob("*.npz"))
+            },
+        })
+        _atomic_json(selection_payload, root / "frozen_selection.json")
+        _write_work_plan(
+            root,
+            sites,
+            semantic_sha256=identity.semantic_sha256,
+            layer_count=profile.expected_layers,
+            l2_grid=args.l2_grid,
+            reader_gate_opened=True,
+            selected_layer=selected_layer,
+            selected_l2=selected_l2,
+            training_eligibility=training_eligibility_receipt,
+            role_eligibility={
+                "layer_select": layer_eligibility_receipt,
+                "reader_gate": gate_eligibility_receipt,
+            },
+        )
+        if stop.requested:
+            _atomic_json({
+                "status": "interrupted", "phase": "parity",
+                "semantic_identity": identity.as_dict(), "stop_signal": stop.signal_name,
+            }, previous_manifest)
+            return
         gate_scores = all_gate_scores[all_gate_scores["reader_name"].astype(str) == "content"].copy()
         random_frames = [
             all_gate_scores[all_gate_scores["reader_name"].astype(str) == name].copy()
             for name in sorted(random_rankers)
         ]
-        gate_controls = {
-            name: _score_metadata_rankers(
-                gate_sites, {float(control.iloc[0]["l2"]): fitted[float(control.iloc[0]["l2"])]}, name
-            )
-            for name, (control, fitted) in {
-                key: (layer_controls[key], control_rankers[key]) for key in layer_controls
-            }.items()
-        }
+        gate_controls = _score_selected_metadata_controls(
+            gate_sites_with_state, layer_controls, control_rankers
+        )
         gate_controls["majority"] = majority_candidate_scores(
-            gate_sites, training["actual_winner_content_id"].to_numpy(dtype=int)
+            gate_sites_with_state, training["actual_winner_content_id"].to_numpy(dtype=int)
         )
         bootstrap = min(args.bootstrap_samples, 300) if canary else args.bootstrap_samples
         permutations = min(args.permutation_samples, 100) if canary else args.permutation_samples
@@ -1198,7 +1619,7 @@ def cmd_run_model(args) -> None:
             "semantic_identity.json", "frozen_selection.json", "gate_report.json",
             "ranker_manifest.json", "work_plan.json", "parity_report.json", "layer_select_scores.parquet", "reader_gate_scores.parquet",
             "layer_select_control_scores.parquet", "reader_gate_control_scores.parquet",
-            "reader_gate_random_scores.parquet",
+            "reader_gate_random_scores.parquet", "training_target_state.parquet",
         )
         _atomic_json({
             "status": "canary_complete" if canary else "content_readout_complete",
@@ -1208,12 +1629,10 @@ def cmd_run_model(args) -> None:
             "role_items": _role_items(sites),
             "training_pool_items": int(training_pool["item_id"].nunique()),
             "training_evaluable_items": int(training["item_id"].nunique()),
-            "target_evaluable_rows_by_role": {
-                role: int(sites.loc[
-                    sites["readout_role"].astype(str).eq(role)
-                    & sites["content_target_evaluable"].astype(bool)
-                ].shape[0])
-                for role in ROLE_ITEM_COUNTS
+            "training_eligibility": training_eligibility_receipt,
+            "target_evaluability_by_role": {
+                "layer_select": layer_eligibility_receipt,
+                "reader_gate": gate_eligibility_receipt,
             },
             "tier_1_pass": bool(report["tier_1_pass"]),
             "tier_2_pass": bool(report["tier_2_pass"]),

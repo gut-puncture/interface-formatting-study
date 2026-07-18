@@ -1,20 +1,54 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
+import torch
 
+from interface_formatting_study.decision_binding_content import (
+    CANDIDATE_TARGET_STATE_COLUMNS,
+    majority_candidate_scores,
+    metadata_candidate_features,
+)
 from interface_formatting_study.decision_binding_content_cli import (
+    _best_control,
+    _categorical_parity_receipt,
+    _capture_training,
+    _eligible_training_inputs,
+    _eligibility_receipt,
     _load_activation_shard,
     _load_prepared_bundle,
+    _runtime_environment_receipt,
     _save_activation_shard,
+    _score_selected_metadata_controls,
     _select_canary_sites,
     _verify_raw_winners,
     build_parser,
     verify_run_root,
 )
 from interface_formatting_study.run_identity import sha256_file
+
+
+def _target_state_for_keys(work_keys: list[str]) -> pd.DataFrame:
+    records = []
+    for work_key in work_keys:
+        records.append({
+            "work_key": work_key,
+            **{f"stored_raw_score_{label}": value for label, value in zip("ABCD", (-0.1, -1.0, -2.0, -3.0), strict=True)},
+            **{f"fresh_raw_score_{label}": value for label, value in zip("ABCD", (-0.1, -1.0, -2.0, -3.0), strict=True)},
+            "stored_winner_label": "A", "stored_winner_position": 0,
+            "stored_winner_content_id": 0, "fresh_winner_label": "A",
+            "fresh_winner_position": 0, "fresh_winner_content_id": 0,
+            "stored_winner_unique": True, "fresh_winner_unique": True,
+            "stored_winner_margin": 0.9, "fresh_winner_margin": 0.9,
+            "max_abs_raw_score_drift": 0.0, "stored_fresh_content_agree": True,
+            "reader_target_evaluable": True,
+            "reader_target_ineligibility_reason": "eligible",
+        })
+    return pd.DataFrame.from_records(records, columns=CANDIDATE_TARGET_STATE_COLUMNS)
 
 
 def test_content_cli_exposes_preparation_model_run_and_verification():
@@ -41,7 +75,7 @@ def test_content_cli_exposes_preparation_model_run_and_verification():
         parser.parse_args(["run-model", "--profile", "mistral", "--bundle", "x", "--stage", "confirmation"])
 
 
-def test_raw_winner_mismatch_reports_exact_row_and_scores():
+def test_raw_winner_instability_is_classified_instead_of_aborting():
     rows = pd.DataFrame({
         "work_key": ["stable", "unstable"],
         "raw_predicted_label": ["A", "A"],
@@ -50,21 +84,25 @@ def test_raw_winner_mismatch_reports_exact_row_and_scores():
         "raw_score_B": [-1.0, -1.0625],
         "raw_score_C": [-2.0, -2.0],
         "raw_score_D": [-3.0, -3.0],
+        "winner_position": [0, 0],
+        "text_identity_ambiguous": [False, False],
+        "content_target_evaluable": [True, True],
+        "labels_by_position": [list("ABCD"), list("ABCD")],
+        "actual_content_ids_by_position": [[0, 1, 2, 3], [0, 1, 2, 3]],
+        "actual_winner_content_id": [0, 0],
     })
     fresh = __import__("torch").tensor([
         [-0.5, -1.0, -2.0, -3.0],
         [-1.0625, -1.0, -2.0, -3.0],
     ])
 
-    with pytest.raises(RuntimeError) as error:
-        _verify_raw_winners(rows, fresh)
+    classified = _verify_raw_winners(rows, fresh)
 
-    message = str(error.value)
-    assert "unstable" in message
-    assert '"expected_label": "A"' in message
-    assert '"fresh_label": "B"' in message
-    assert '"stored_scores": [-1.0, -1.0625, -2.0, -3.0]' in message
-    assert '"fresh_scores": [-1.0625, -1.0, -2.0, -3.0]' in message
+    assert classified["work_key"].tolist() == ["stable", "unstable"]
+    assert classified["reader_target_evaluable"].tolist() == [True, False]
+    assert classified["reader_target_ineligibility_reason"].tolist() == [
+        "eligible", "stored_fresh_content_mismatch",
+    ]
 
 
 def test_prepared_bundle_is_checksum_and_role_bound(tmp_path):
@@ -128,21 +166,288 @@ def test_canary_sampling_is_role_balanced_and_never_changes_source_rows():
 def test_activation_shards_are_identity_and_checksum_bound(tmp_path):
     path = tmp_path / "capture.pt"
     values = __import__("torch").arange(24).reshape(1, 2, 4, 3)
+    raw = torch.tensor([[-1.0, -1.0, -2.0, -3.0]])
+    source = pd.DataFrame({
+        "work_key": ["work"], "raw_predicted_label": ["A"],
+        "winner_position": [0], "winner_unique": [True],
+        "text_identity_ambiguous": [False], "content_target_evaluable": [True],
+        "labels_by_position": [list("ABCD")],
+        "actual_content_ids_by_position": [[0, 1, 2, 3]],
+        "actual_winner_content_id": [0],
+        "raw_score_A": [-0.5], "raw_score_B": [-1.0],
+        "raw_score_C": [-2.0], "raw_score_D": [-3.0],
+    })
+    state = _verify_raw_winners(source, raw)
     _save_activation_shard(
-        path, activations=values, work_keys=["work"], semantic_sha256="a" * 64
+        path, activations=values, raw_log_probs=raw, target_state=state,
+        work_keys=["work"], semantic_sha256="a" * 64
     )
 
-    loaded = _load_activation_shard(
+    loaded, loaded_state = _load_activation_shard(
         path, work_keys=["work"], semantic_sha256="a" * 64
     )
 
     assert loaded.equal(values)
+    pd.testing.assert_frame_equal(loaded_state, state)
     path.write_bytes(path.read_bytes() + b"corrupt")
     with pytest.raises(RuntimeError, match="checksum"):
         _load_activation_shard(path, work_keys=["work"], semantic_sha256="a" * 64)
 
 
+def test_activation_shard_rejects_target_state_tampering(tmp_path):
+    path = tmp_path / "capture.pt"
+    source = pd.DataFrame({
+        "work_key": ["work"], "raw_predicted_label": ["A"],
+        "winner_position": [0], "winner_unique": [True],
+        "text_identity_ambiguous": [False], "content_target_evaluable": [True],
+        "labels_by_position": [list("ABCD")],
+        "actual_content_ids_by_position": [[0, 1, 2, 3]],
+        "actual_winner_content_id": [0],
+        "raw_score_A": [-0.1], "raw_score_B": [-1.0],
+        "raw_score_C": [-2.0], "raw_score_D": [-3.0],
+    })
+    state = _verify_raw_winners(source, torch.tensor([[-0.1, -1.0, -2.0, -3.0]]))
+    _save_activation_shard(
+        path, activations=torch.zeros(1, 2, 4, 3),
+        raw_log_probs=torch.tensor([[-0.1, -1.0, -2.0, -3.0]]),
+        target_state=state, work_keys=["work"], semantic_sha256="a" * 64,
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    state_payload = json.loads(payload["target_state_json"])
+    column = state_payload["columns"].index("reader_target_evaluable")
+    state_payload["data"][0][column] = False
+    payload["target_state_json"] = json.dumps(state_payload, separators=(",", ":"))
+    payload["target_state_sha256"] = __import__("hashlib").sha256(
+        payload["target_state_json"].encode()
+    ).hexdigest()
+    torch.save(payload, path)
+    manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    manifest["sha256"] = sha256_file(path)
+    manifest["bytes"] = path.stat().st_size
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="target state"):
+        _load_activation_shard(path, work_keys=["work"], semantic_sha256="a" * 64)
+
+
+def test_training_capture_resume_reuses_persisted_target_state(monkeypatch, tmp_path):
+    training = pd.DataFrame({
+        "work_key": ["a", "b"], "prompt": ["prompt-a", "prompt-b"],
+        "raw_predicted_label": ["A", "A"], "winner_position": [0, 0],
+        "winner_unique": [True, True], "text_identity_ambiguous": [False, False],
+        "content_target_evaluable": [True, True],
+        "labels_by_position": [list("ABCD"), list("ABCD")],
+        "actual_content_ids_by_position": [[0, 1, 2, 3], [0, 1, 2, 3]],
+        "actual_winner_content_id": [0, 0],
+        "raw_score_A": [-0.1, -0.1], "raw_score_B": [-1.0, -1.0],
+        "raw_score_C": [-2.0, -2.0], "raw_score_D": [-3.0, -3.0],
+    })
+    activations = torch.arange(48).reshape(2, 2, 4, 3)
+    raw = torch.tensor([[-0.1, -1.0, -2.0, -3.0]] * 2)
+    calls = []
+
+    def capture(*_args, **_kwargs):
+        calls.append(True)
+        return SimpleNamespace(activations=activations, raw_log_probs=raw)
+
+    monkeypatch.setattr(
+        "interface_formatting_study.decision_binding_content_cli.capture_candidate_states",
+        capture,
+    )
+    monkeypatch.setattr(
+        "interface_formatting_study.decision_binding_content_cli._token_positions",
+        lambda _tokenizer, frame: [[0, 1, 2, 3] for _ in range(len(frame))],
+    )
+    kwargs = dict(
+        root=tmp_path, training=training, model=object(), tokenizer=object(),
+        identity=SimpleNamespace(semantic_sha256="a" * 64), batch_size=2,
+        max_batch_tokens=100, chunk_size=2,
+        stop=SimpleNamespace(requested=False), progress=lambda *_args: None,
+    )
+    first_activations, first_state = _capture_training(**kwargs)
+    monkeypatch.setattr(
+        "interface_formatting_study.decision_binding_content_cli.capture_candidate_states",
+        lambda *_args, **_kwargs: pytest.fail("resume repeated a completed forward"),
+    )
+    resumed_activations, resumed_state = _capture_training(**kwargs)
+
+    assert len(calls) == 1
+    assert resumed_activations.equal(first_activations)
+    pd.testing.assert_frame_equal(resumed_state, first_state)
+
+
+def test_one_runtime_eligibility_index_drives_every_training_consumer():
+    training = pd.DataFrame({
+        "work_key": ["eligible", "tie", "eligible-2"],
+        "item_id": ["eligible", "tie", "eligible-2"],
+        "wrapper_name": ["plain"] * 3,
+        "readout_role": ["probe_train"] * 3,
+        "manipulation": ["controlled_baseline"] * 3,
+        "winner_position": [0, 0, 2],
+        "actual_winner_content_id": [0, 0, 2],
+        "raw_predicted_label": ["A", "A", "C"],
+        "winner_unique": [True, True, True],
+        "text_identity_ambiguous": [False, False, False],
+        "content_target_evaluable": [True, True, True],
+        "labels_by_position": [list("ABCD")] * 3,
+        "actual_content_ids_by_position": [[0, 1, 2, 3]] * 3,
+        "candidate_texts": [["a", "bb", "ccc", "dddd"]] * 3,
+        "raw_score_A": [-0.1, -0.1, -1.0],
+        "raw_score_B": [-1.0, -1.0, -2.0],
+        "raw_score_C": [-2.0, -2.0, -0.1],
+        "raw_score_D": [-3.0, -3.0, -3.0],
+    })
+    fresh = torch.tensor([
+        [-0.1, -1.0, -2.0, -3.0],
+        [-0.1, -0.1, -2.0, -3.0],
+        [-1.0, -2.0, -0.1, -3.0],
+    ])
+    state = _verify_raw_winners(training, fresh)
+    all_activations = torch.arange(72).reshape(3, 2, 4, 3)
+
+    eligible, activations, targets = _eligible_training_inputs(
+        training, all_activations, state
+    )
+    features = metadata_candidate_features(eligible)
+    random_targets = (targets + np.random.default_rng(1000).integers(0, 4, len(targets))) % 4
+    majority = majority_candidate_scores(eligible, eligible["actual_winner_content_id"])
+
+    assert eligible["work_key"].tolist() == ["eligible", "eligible-2"]
+    assert activations.shape[0] == len(targets) == len(random_targets) == 2
+    assert all(values.shape[0] == 2 for values in features.values())
+    assert majority["work_key"].nunique() == 2
+
+
+def test_best_control_uses_only_runtime_eligible_rows():
+    rows = []
+    for l2 in (0.01, 0.1):
+        for manipulation in ("position_only", "label_only"):
+            for item in range(2):
+                target = 0
+                prediction = 0 if l2 == 0.01 else 1
+                evaluable = True
+                if item == 1:
+                    evaluable = False
+                    prediction = 1 if l2 == 0.01 else 0
+                probability = [0.01] * 4
+                probability[prediction] = 0.97
+                rows.append({
+                    "l2": l2, "item_id": f"{manipulation}-{item}",
+                    "manipulation": manipulation,
+                    "actual_winner_content_id": target,
+                    "reader_target_evaluable": evaluable,
+                    **{f"content_prob_{index}": probability[index] for index in range(4)},
+                })
+
+    selected = _best_control(pd.DataFrame(rows))
+
+    assert selected["l2"].unique().tolist() == [0.01]
+    assert len(selected) == 4  # selection filters, returned artifact retains every row
+
+
+def test_gate_metadata_controls_never_treat_majority_as_a_fitted_ranker(monkeypatch):
+    selected = {
+        "position": pd.DataFrame({"l2": [0.1]}),
+        "label": pd.DataFrame({"l2": [0.01]}),
+        "majority": pd.DataFrame({"l2": [1.0]}),
+    }
+    fitted = {"position": {0.1: "position-model"}, "label": {0.01: "label-model"}}
+    calls = []
+    monkeypatch.setattr(
+        "interface_formatting_study.decision_binding_content_cli._score_metadata_rankers",
+        lambda _sites, models, name: calls.append((name, models)) or pd.DataFrame(),
+    )
+
+    observed = _score_selected_metadata_controls(pd.DataFrame(), selected, fitted)
+
+    assert set(observed) == {"position", "label"}
+    assert calls == [
+        ("position", {0.1: "position-model"}),
+        ("label", {0.01: "label-model"}),
+    ]
+
+
+def test_eligibility_receipt_is_order_independent_and_reason_bound():
+    state = _target_state_for_keys(["b", "a"])
+    state.loc[state["work_key"].eq("b"), "reader_target_evaluable"] = False
+    state.loc[
+        state["work_key"].eq("b"), "reader_target_ineligibility_reason"
+    ] = "fresh_raw_tie"
+    state.loc[state["work_key"].eq("b"), "fresh_winner_unique"] = False
+    state.loc[state["work_key"].eq("b"), "fresh_winner_margin"] = 0.0
+    first = _eligibility_receipt(state)
+    second = _eligibility_receipt(state.iloc[::-1].reset_index(drop=True))
+    changed = state.copy()
+    changed.loc[0, "reader_target_ineligibility_reason"] = "stored_fresh_content_mismatch"
+
+    assert first == second
+    assert first["total_rows"] == 2
+    assert first["evaluable_rows"] == 1
+    assert first["reason_counts"] == {"eligible": 1, "fresh_raw_tie": 1}
+    assert _eligibility_receipt(changed)["eligibility_sha256"] != first["eligibility_sha256"]
+
+
+def test_categorical_parity_allows_only_drift_explainable_near_ties():
+    near_left = np.array([[0.51, 0.49, 0.0, 0.0]])
+    near_right = np.array([[0.49, 0.51, 0.0, 0.0]])
+    near = _categorical_parity_receipt(near_left, near_right, ["near"])
+    assert near["passes"] is True
+    assert near["ambiguous_work_keys"] == ["near"]
+    assert near["ambiguous_count"] == 1
+
+    resolved_left = np.array([[0.8, 0.2, 0.0, 0.0]])
+    resolved_right = np.array([[0.49, 0.51, 0.0, 0.0]])
+    resolved = _categorical_parity_receipt(resolved_left, resolved_right, ["resolved"])
+    assert resolved["passes"] is False
+
+    too_far = _categorical_parity_receipt(
+        np.array([[0.51, 0.49, 0.0, 0.0]]),
+        np.array([[0.48, 0.52, 0.0, 0.0]]),
+        ["far"], maximum_difference=0.02,
+    )
+    assert too_far["passes"] is False
+
+    just_above = _categorical_parity_receipt(
+        np.array([[0.50, 0.50, 0.0, 0.0]]),
+        np.array([[0.5200001, 0.4799999, 0.0, 0.0]]),
+        ["boundary"], maximum_difference=0.02,
+    )
+    assert just_above["observed_maximum_difference"] > 0.02
+    assert just_above["passes"] is False
+
+
+def test_runtime_environment_receipt_binds_gpu_class(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _index=0: "NVIDIA A100-SXM4-80GB")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _index=0: (8, 0))
+    a100 = _runtime_environment_receipt(attention_backend="sdpa")
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _index=0: "NVIDIA H100 80GB HBM3")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _index=0: (9, 0))
+    h100 = _runtime_environment_receipt(attention_backend="sdpa")
+
+    assert a100["gpu_name"] != h100["gpu_name"]
+    assert a100["gpu_compute_capability"] == "8.0"
+    assert h100["gpu_compute_capability"] == "9.0"
+    assert a100["attention_backend"] == h100["attention_backend"] == "sdpa"
+
+
 def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
+    environment = {
+        "device_type": "cuda", "gpu_name": "NVIDIA H100 80GB HBM3",
+        "gpu_compute_capability": "9.0", "bf16_supported": True,
+        "attention_backend": "sdpa", "torch_version": "2.7.1",
+        "cuda_version": "12.6", "transformers_version": "4.53.0",
+        "tokenizers_version": "0.21.0", "inference_dtype": "bfloat16",
+        "fit_dtype": "float32",
+    }
+    prepared_source_hashes = {
+        "source_bundle_manifest_sha256": "b" * 64,
+        "source_readout_sha256": "c" * 64,
+        "source_applicability_sha256": "d" * 64,
+        "option_audit_manifest_sha256": "e" * 64,
+    }
     identity = {
         "semantic_run_id": "run-id",
         "semantic_sha256": "a" * 64,
@@ -150,7 +455,10 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
             "id": "model", "revision": "revision", "slug": "slug",
             "expected_layers": 1,
         },
-        "experiment_config": {"l2_grid": [0.1]},
+        "experiment_config": {
+            "l2_grid": [0.1], "seed": 0, "runtime_environment": environment,
+            "prepared_source_hashes": prepared_source_hashes,
+        },
     }
     (tmp_path / "semantic_identity.json").write_text(json.dumps(identity))
     gate = {
@@ -166,17 +474,32 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         "opens_final_confirmation": False,
     }
     (tmp_path / "gate_report.json").write_text(json.dumps(gate))
-    (tmp_path / "frozen_selection.json").write_text(json.dumps({
+    work_keys = [f"work-{index:03d}" for index in range(300)]
+    training_keys = [f"train-{index:04d}" for index in range(1801)]
+    layer_state = _target_state_for_keys(work_keys)
+    training_state = _target_state_for_keys(training_keys)
+    training_state.to_parquet(tmp_path / "training_target_state.parquet", index=False)
+    training_receipt = _eligibility_receipt(training_state)
+    layer_receipt = _eligibility_receipt(layer_state)
+    frozen_selection = {
         "selection_eligible": False,
         "stop_reason": "no_reader_beat_both_isolated_nuisance_controls",
         "selected_layer": 0,
         "selected_l2": 0.1,
-    }))
-    work_keys = [f"work-{index:03d}" for index in range(300)]
+        "target_policy_version": 1,
+        "training_eligibility": training_receipt,
+        "layer_select_eligibility": layer_receipt,
+        "selected_control_l2": {
+            name: 0.1 for name in ("position", "label", "position_label", "answer_length")
+        },
+        "majority_training_distribution": [1.0, 0.0, 0.0, 0.0],
+        "random_reader_seeds": [1000, 1001, 1002],
+        "prepared_source_hashes": prepared_source_hashes,
+    }
     scores = pd.DataFrame({
         "work_key": work_keys, "reader_name": "content", "l2": 0.1,
         "layer": 0, "readout_role": "layer_select",
-    })
+    }).merge(layer_state, on="work_key", validate="one_to_one")
     scores.to_parquet(tmp_path / "layer_select_scores.parquet", index=False)
     control_names = ["position", "label", "position_label", "answer_length", "majority"]
     controls = pd.concat(
@@ -196,13 +519,15 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         path = tmp_path / "rankers" / name
         path.write_bytes(name.encode())
         ranker_receipts[name] = sha256_file(path)
+    frozen_selection["ranker_sha256"] = ranker_receipts
+    (tmp_path / "frozen_selection.json").write_text(json.dumps(frozen_selection))
     (tmp_path / "ranker_manifest.json").write_text(json.dumps({
         "schema_version": 1, "semantic_sha256": "a" * 64, "rankers": ranker_receipts,
     }))
     names = [
         "semantic_identity.json", "frozen_selection.json", "gate_report.json",
         "ranker_manifest.json", "layer_select_scores.parquet",
-        "layer_select_control_scores.parquet",
+        "layer_select_control_scores.parquet", "training_target_state.parquet",
     ]
     artifacts = {}
     for name in names:
@@ -212,6 +537,10 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
             artifact_frame = pd.read_parquet(path)
             artifacts[name]["rows"] = len(artifact_frame)
             artifacts[name]["work_keys"] = artifact_frame["work_key"].nunique()
+            artifacts[name]["eligibility"] = _eligibility_receipt(
+                artifact_frame if name == "training_target_state.parquet"
+                else artifact_frame[list(CANDIDATE_TARGET_STATE_COLUMNS)].drop_duplicates()
+            )
     manifest = {
         "status": "canary_complete",
         "semantic_identity": identity,
@@ -222,6 +551,10 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         "patch_eligible": False,
         "final_confirmation_opened": False,
         "reader_gate_opened": False,
+        "training_pool_items": 1801,
+        "training_evaluable_items": 1801,
+        "training_eligibility": training_receipt,
+        "target_evaluability_by_role": {"layer_select": layer_receipt},
         "artifacts": artifacts,
     }
     (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
@@ -230,7 +563,7 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         verify_run_root(tmp_path, expected_run_id="run-id", mode="canary")
 
     (tmp_path / "work_plan.json").write_text(json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "semantic_sha256": "a" * 64,
         "reader_gate_opened": False,
         "role_items": {"probe_train": 1801, "layer_select": 300, "reader_gate": 300},
@@ -242,6 +575,8 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         "l2_grid": [0.1],
         "selected_layer": 0,
         "selected_l2": 0.1,
+        "training_eligibility": training_receipt,
+        "role_eligibility": {"layer_select": layer_receipt},
     }))
     manifest["artifacts"]["work_plan.json"] = {
         "sha256": sha256_file(tmp_path / "work_plan.json"),
