@@ -53,11 +53,12 @@
 - Canonically identical displayed answers remain in artifacts and are excluded only from content-identity metrics, with explicit counts.
 - Each option endpoint is the final tokenizer token whose offset overlaps the selected audited content representation. Token crossing an adjacent delimiter is rejected rather than silently accepted.
 - For formats with symbolic aliases, select the actual content-bearing representation (for example, protobuf answer text rather than enum number, shell assignment text rather than `$OPTION_A`). If multiple complete content-bearing representations remain, use the last one in prompt order; ambiguity outside that rule is fatal.
-- New forward passes must reproduce the stored raw categorical winner for every unique-winner prompt used with prior artifacts. A mismatch stops the run; rows are not dropped.
-- Reproduction and activation capture use the source scoring geometry (batch size 32, 40,000-token cap); both values and the capture chunk size are semantic-identity fields.
+- Every source row remains represented. A row is eligible for hard-target fitting and metrics only when the stored winner is unique, its answer content is unambiguous, the fresh winner is unique, and the stored and fresh winners identify the same answer content. Otherwise it is retained with exactly one reason: `stored_raw_tie`, `ambiguous_answer_content`, `fresh_raw_tie`, or `stored_fresh_content_mismatch`. Rows are never relabeled to the fresh winner.
+- The same persisted eligibility state drives content-reader training, layer/L2 selection, nuisance and random controls, majority baselines, gates, strata, and parity. Activation and score shards bind that state so uninterrupted and resumed runs use the same population.
+- Batch size, token cap, and capture chunk size are runtime configuration recorded in semantic identity. They are not model-profile logic, and historical co-batch composition is not replayed.
 - Prompt hash, audit/source hash, tokenizer identity, model revision, split hash, selected specification, and work key are validated on prepare, resume, merge, fetch, and confirmation.
 - Duplicate identical shards merge once; conflicting duplicates fail. SIGINT/SIGTERM finishes the current shard, writes progress atomically, and resumes by deterministic work key.
-- Fail closed on missing spans, missing tokenizer offsets, padding/index mismatch, malformed option maps, stale identity, non-finite loss/weights, failed convergence, or attempted final-set access before freeze.
+- Fail closed on missing spans, missing tokenizer offsets, padding/index mismatch, malformed option maps, stale identity, non-finite activations/loss/weights, failed convergence, or attempted final-set access before freeze.
 
 ## Reader And Controls
 
@@ -83,10 +84,10 @@
 
 ## Operator And Cost Preflight
 
-- Lifecycle: local prepare -> thin code/data sync -> remote import/CUDA/model/tokenizer/endpoint micro-check -> small Mistral changed-surface canary -> verified canary artifacts -> full Mistral discovery capture/fit/select/gate -> compact fetch/checksum verification -> stop/go decision -> immediate task-owned teardown or unchanged Phi/Qwen continuation.
-- Target hardware: one non-spot 80 GB A100-class GPU on Ubuntu, BF16 and SDPA. H100 is out of scope unless A100 supply is unavailable and a live cost/throughput comparison justifies it.
-- Canary: about 32 items spanning wrappers, transformations, formats, multi-token/escaped/Unicode/repeated content, exact winner reproduction, shard/resume, and artifact verification. It proves functionality, not scientific efficacy.
-- Telemetry: phase, work completed/total, throughput, padding, preparation/forward/write time, peak VRAM, fitting time, last shard, ETA, errors, provider spend, and stop reason.
+- Lifecycle: local prepare -> thin code/data sync -> remote import/CUDA/model/tokenizer/endpoint micro-check -> one eight-item Mistral changed-surface startup/stop/resume check -> verified compact artifacts -> full Mistral discovery capture/fit/select/gate -> compact fetch/checksum verification -> stop/go decision -> immediate task-owned teardown or unchanged Phi/Qwen continuation.
+- Target hardware: one non-spot H100 80 GB GPU on Ubuntu, Torch 2.7.1/CUDA 12.6, BF16, and SDPA. The runtime receipt binds GPU name and compute capability, so A100 and H100 numerical shards cannot be mixed or resumed together. No H100-specific model code is permitted.
+- Startup check: eight items per frozen role through the production entrypoint, with capture chunk size one so a completed activation shard can be stopped, resumed, and strictly verified. It proves only changed runtime surfaces, not scientific efficacy; do not run a chain of repetitive canaries.
+- Telemetry: canonical status/log output shows phase, completed/total work, elapsed time, throughput, and peak VRAM. Errors remain in the operator log; interruption/failure reason and final timing remain in the identity-bound manifest used by strict verification.
 - Cost forecast before launch: Mistral target 15-30 paid minutes and under $1; all three discovery runs about $2-3; eligible confirmations about $1-2 more. Pause if the measured forecast materially exceeds this or implementation needs new architecture.
 - No scale run begins until the exact command, checkpoints, monitor, stop/resume, fetch, strict verifier, and task-owned pod/disk teardown are locally proven.
 
