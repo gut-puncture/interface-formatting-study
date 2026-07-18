@@ -634,6 +634,29 @@ def test_gate_reports_tier_one_only_for_held_out_decodability():
     )
     assert failed["tier_1_pass"] is False
 
+    unknown_baseline = gate.copy()
+    baseline = (
+        unknown_baseline["item_id"].eq("item-0")
+        & unknown_baseline["manipulation"].eq("controlled_baseline")
+    )
+    transformed = (
+        unknown_baseline["item_id"].eq("item-0")
+        & unknown_baseline["manipulation"].eq("position_only")
+    )
+    unknown_baseline.loc[baseline, "content_target_evaluable"] = False
+    unknown_baseline.loc[transformed, "actual_winner_content_id"] = 1
+    unknown_report = gate_candidate_reader(
+        unknown_baseline,
+        selected,
+        controls,
+        random_readers,
+        bootstrap_samples=100,
+        permutation_samples=50,
+        seed=9,
+        parity={"save_load": True, "batch": True, "seed": True},
+    )
+    assert unknown_report["metrics"]["conflicts"]["items"] == 0
+
 
 def test_tier_two_requires_all_bound_parity_receipts():
     gate = _synthetic_candidate_scores(role="reader_gate")

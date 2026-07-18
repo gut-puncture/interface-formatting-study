@@ -43,6 +43,7 @@ from .utils import read_table, write_table_atomic
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROLE_ITEM_COUNTS = {"probe_train": 1801, "layer_select": 300, "reader_gate": 300}
 L2_GRID = (1e-4, 1e-3, 1e-2, 1e-1)
+CONTROL_READERS = ("position", "label", "position_label", "answer_length", "majority")
 
 
 def _atomic_json(payload: object, path: Path) -> None:
@@ -556,7 +557,7 @@ def verify_run_root(
         raise RuntimeError("candidate run mode mismatch")
     required = {
         "semantic_identity.json", "frozen_selection.json", "gate_report.json",
-        "ranker_manifest.json", "layer_select_scores.parquet",
+        "ranker_manifest.json", "work_plan.json", "layer_select_scores.parquet",
         "layer_select_control_scores.parquet",
     }
     if bool(manifest.get("reader_gate_opened")):
@@ -591,18 +592,75 @@ def verify_run_root(
                 raise RuntimeError(f"candidate artifact role mismatch: {name}")
             if int(frame["work_key"].nunique()) != int(metadata.get("work_keys", -1)):
                 raise RuntimeError(f"candidate artifact work-key count mismatch: {name}")
+    plan_path = run_root / "work_plan.json"
+    if not plan_path.is_file():
+        raise RuntimeError("candidate work plan is missing")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    config_l2 = [float(value) for value in identity.get("experiment_config", {}).get("l2_grid", [])]
+    if (
+        plan.get("schema_version") != 1
+        or plan.get("semantic_sha256") != identity.get("semantic_sha256")
+        or bool(plan.get("reader_gate_opened")) != bool(manifest.get("reader_gate_opened"))
+        or plan.get("role_items") != manifest.get("role_items")
+        or int(plan.get("layer_count", -1)) != int(identity.get("model", {}).get("expected_layers", -2))
+        or [float(value) for value in plan.get("l2_grid", [])] != config_l2
+    ):
+        raise RuntimeError("candidate work plan identity mismatch")
+    expected_frames = {
+        "layer_select_scores.parquet": {
+            "role": "layer_select", "readers": {"content"},
+            "rows_per_work": int(plan["layer_count"]) * len(config_l2),
+        },
+        "layer_select_control_scores.parquet": {
+            "role": "layer_select", "readers": set(CONTROL_READERS),
+            "rows_per_work": len(CONTROL_READERS),
+        },
+    }
+    if bool(plan["reader_gate_opened"]):
+        expected_frames.update({
+            "reader_gate_scores.parquet": {
+                "role": "reader_gate", "readers": {"content"}, "rows_per_work": 1,
+            },
+            "reader_gate_control_scores.parquet": {
+                "role": "reader_gate", "readers": set(CONTROL_READERS),
+                "rows_per_work": len(CONTROL_READERS),
+            },
+            "reader_gate_random_scores.parquet": {
+                "role": "reader_gate", "readers": {f"random_{index}" for index in range(3)},
+                "rows_per_work": 3,
+            },
+        })
+    for name, expectation in expected_frames.items():
+        frame = read_table(run_root / name)
+        role_plan = plan.get("roles", {}).get(expectation["role"], {})
+        observed_summary = _work_key_summary(frame)
+        if (
+            observed_summary["work_keys"] != int(role_plan.get("work_keys", -1))
+            or observed_summary["work_keys_sha256"] != role_plan.get("work_keys_sha256")
+            or len(frame) != int(role_plan.get("rows", -1)) * int(expectation["rows_per_work"])
+            or set(frame["reader_name"].astype(str)) != expectation["readers"]
+        ):
+            raise RuntimeError(f"candidate artifact does not match expected work: {name}")
     ranker_manifest_path = run_root / "ranker_manifest.json"
     if ranker_manifest_path.exists():
         ranker_manifest = json.loads(ranker_manifest_path.read_text(encoding="utf-8"))
         if ranker_manifest.get("semantic_sha256") != identity.get("semantic_sha256"):
             raise RuntimeError("candidate ranker manifest identity mismatch")
-        for name, digest in ranker_manifest.get("rankers", {}).items():
+        ranker_receipts = ranker_manifest.get("rankers", {})
+        if set(map(str, ranker_receipts)) != _expected_ranker_names(plan):
+            raise RuntimeError("candidate ranker set does not match expected work")
+        for name, digest in ranker_receipts.items():
             path = run_root / "rankers" / str(name)
             if not path.is_file() or sha256_file(path) != digest:
                 raise RuntimeError(f"candidate ranker checksum mismatch: {name}")
     gate = json.loads((run_root / "gate_report.json").read_text(encoding="utf-8"))
     if (
         gate.get("claim") != "candidate_local_linear_decodability"
+        or bool(gate.get("reader_gate_opened", True)) != bool(manifest.get("reader_gate_opened"))
+        or (
+            not bool(manifest.get("reader_gate_opened"))
+            and (gate.get("selection_eligible") is not False or not gate.get("stop_reason"))
+        )
         or bool(gate.get("patch_eligible"))
         or bool(manifest.get("patch_eligible"))
         or bool(gate.get("opens_final_confirmation")) != bool(gate.get("tier_2_pass"))
@@ -634,6 +692,61 @@ def _stable_score_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if missing := set(columns) - set(frame.columns):
         raise ValueError(f"candidate score frame is missing sort columns: {sorted(missing)}")
     return frame.sort_values(columns, kind="mergesort").reset_index(drop=True)
+
+
+def _work_key_summary(frame: pd.DataFrame) -> dict[str, object]:
+    keys = sorted(frame["work_key"].astype(str).unique())
+    return {
+        "rows": int(len(frame)),
+        "work_keys": int(len(keys)),
+        "work_keys_sha256": hashlib.sha256("\n".join(keys).encode()).hexdigest(),
+    }
+
+
+def _write_work_plan(
+    root: Path,
+    sites: pd.DataFrame,
+    *,
+    semantic_sha256: str,
+    layer_count: int,
+    l2_grid: Sequence[float],
+    reader_gate_opened: bool,
+    selected_layer: int | None,
+    selected_l2: float | None,
+) -> None:
+    roles = {
+        role: _work_key_summary(
+            sites[sites["readout_role"].astype(str).eq(role)]
+        )
+        for role in ("layer_select", "reader_gate")
+    }
+    _atomic_json({
+        "schema_version": 1,
+        "semantic_sha256": semantic_sha256,
+        "reader_gate_opened": bool(reader_gate_opened),
+        "role_items": _role_items(sites),
+        "roles": roles,
+        "layer_count": int(layer_count),
+        "l2_grid": [float(value) for value in l2_grid],
+        "selected_layer": selected_layer,
+        "selected_l2": selected_l2,
+    }, root / "work_plan.json")
+
+
+def _ranker_name(prefix: str, l2: float) -> str:
+    return f"{prefix}-l2-{float(l2):.0e}.npz"
+
+
+def _expected_ranker_names(plan: Mapping[str, object]) -> set[str]:
+    l2_grid = [float(value) for value in plan["l2_grid"]]
+    names = {_ranker_name("content", l2) for l2 in l2_grid}
+    for reader in CONTROL_READERS:
+        if reader != "majority":
+            names.update(_ranker_name(f"control-{reader}", l2) for l2 in l2_grid)
+    if bool(plan["reader_gate_opened"]):
+        selected_l2 = float(plan["selected_l2"])
+        names.update(_ranker_name(f"random-{index}", selected_l2) for index in range(3))
+    return names
 
 
 def cmd_run_model(args) -> None:
@@ -845,6 +958,16 @@ def cmd_run_model(args) -> None:
             },
         }
         _atomic_json(selection_payload, root / "frozen_selection.json")
+        _write_work_plan(
+            root,
+            sites,
+            semantic_sha256=identity.semantic_sha256,
+            layer_count=profile.expected_layers,
+            l2_grid=args.l2_grid,
+            reader_gate_opened=not selection_stop,
+            selected_layer=None if selection_stop else int(selection["selected_layer"]),
+            selected_l2=None if selection_stop else float(selection["selected_l2"]),
+        )
 
         if selection_stop:
             report = {
@@ -875,7 +998,7 @@ def cmd_run_model(args) -> None:
             }, root / "ranker_manifest.json")
             artifact_names = (
                 "semantic_identity.json", "frozen_selection.json", "gate_report.json",
-                "ranker_manifest.json", "layer_select_scores.parquet",
+                "ranker_manifest.json", "work_plan.json", "layer_select_scores.parquet",
                 "layer_select_control_scores.parquet",
             )
             _atomic_json({
@@ -1025,7 +1148,7 @@ def cmd_run_model(args) -> None:
         }, root / "ranker_manifest.json")
         artifact_names = (
             "semantic_identity.json", "frozen_selection.json", "gate_report.json",
-            "ranker_manifest.json", "parity_report.json", "layer_select_scores.parquet", "reader_gate_scores.parquet",
+            "ranker_manifest.json", "work_plan.json", "parity_report.json", "layer_select_scores.parquet", "reader_gate_scores.parquet",
             "layer_select_control_scores.parquet", "reader_gate_control_scores.parquet",
             "reader_gate_random_scores.parquet",
         )

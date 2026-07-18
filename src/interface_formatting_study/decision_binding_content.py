@@ -908,6 +908,7 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
         )
 
     stable: list[bool] = []
+    baseline_evaluable_rows: list[bool] = []
     nuisance_ids: list[int | None] = []
     preferences: list[bool | None] = []
     for row, scores in zip(scored.to_dict("records"), probabilities, strict=True):
@@ -917,6 +918,7 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
         target = int(row["actual_winner_content_id"])
         row_evaluable = bool(row.get("content_target_evaluable", True))
         is_stable = baseline_evaluable and row_evaluable and target == baseline_target
+        baseline_evaluable_rows.append(baseline_evaluable)
         contents = [int(value) for value in _sequence(
             row["actual_content_ids_by_position"], name="actual_content_ids_by_position"
         )]
@@ -936,6 +938,7 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
         nuisance_ids.append(nuisance)
         preferences.append(preference)
     scored["baseline_content_stable"] = stable
+    scored["baseline_target_evaluable"] = baseline_evaluable_rows
     scored["nuisance_content_id"] = nuisance_ids
     scored["stable_content_preference"] = preferences
     return scored
@@ -1141,6 +1144,7 @@ def gate_candidate_reader(
         "incorrect_decisions": analyzed[~analyzed.get("raw_correct", pd.Series(True, index=analyzed.index)).astype(bool)],
         "conflicts": analyzed[
             analyzed["manipulation"].astype(str).isin(("position_only", "label_only"))
+            & analyzed["baseline_target_evaluable"].astype(bool)
             & ~analyzed["baseline_content_stable"].astype(bool)
         ],
     }
