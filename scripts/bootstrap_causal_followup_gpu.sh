@@ -22,27 +22,26 @@ ensure_uv() {
 }
 
 PYTHON_BIN=""
-for candidate in .venv/bin/python python; do
-  if command -v "$candidate" >/dev/null 2>&1 && runtime_is_ready "$candidate"; then
-    PYTHON_BIN="$candidate"
-    break
+if [[ -x .venv/bin/python ]] && runtime_is_ready .venv/bin/python; then
+  PYTHON_BIN=.venv/bin/python
+else
+  SYSTEM_PYTHON_BIN=""
+  if command -v python >/dev/null 2>&1 && runtime_is_ready python; then
+    SYSTEM_PYTHON_BIN="$(command -v python)"
   fi
-done
-
-if [[ -z "$PYTHON_BIN" ]]; then
   ensure_uv
-  "$UV_BIN" python install 3.11
-  "$UV_BIN" venv --python 3.11 .venv
-  "$UV_BIN" pip install --python .venv/bin/python \
-    torch==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+  if [[ -n "$SYSTEM_PYTHON_BIN" ]]; then
+    "$UV_BIN" venv --system-site-packages --python "$SYSTEM_PYTHON_BIN" --clear .venv
+  else
+    "$UV_BIN" python install 3.11
+    "$UV_BIN" venv --python 3.11 --clear .venv
+    "$UV_BIN" pip install --python .venv/bin/python \
+      torch==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+  fi
   PYTHON_BIN=.venv/bin/python
 fi
-if [[ "$PYTHON_BIN" == .venv/bin/python ]]; then
-  ensure_uv
-  PIP=("$UV_BIN" pip install --python "$PYTHON_BIN")
-else
-  PIP=("$PYTHON_BIN" -m pip install)
-fi
+ensure_uv
+PIP=("$UV_BIN" pip install --python "$PYTHON_BIN")
 
 # Preserve the image's CUDA-matched Torch. The small non-Torch environment is
 # exact so resumed shards cannot silently mix numerical stacks.

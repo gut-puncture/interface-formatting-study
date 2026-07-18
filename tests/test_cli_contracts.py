@@ -256,6 +256,50 @@ def test_gpu_bootstrap_rerun_uses_uv_for_an_existing_uv_environment(tmp_path):
     assert uv_log.read_text(encoding="utf-8").count("pip install --python .venv/bin/python") == 2
 
 
+def test_gpu_bootstrap_wraps_a_compatible_system_runtime_in_a_venv(tmp_path):
+    project = tmp_path / "project"
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    python_log = tmp_path / "python.log"
+    uv_log = tmp_path / "uv.log"
+    project.mkdir()
+    fake_bin.mkdir()
+    (home / ".local/bin").mkdir(parents=True)
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{python_log}"\ncat >/dev/null\n',
+        encoding="utf-8",
+    )
+    fake_uv = home / ".local/bin/uv"
+    fake_uv.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{uv_log}"\n'
+        'if [[ "$1" == "venv" ]]; then\n'
+        '  mkdir -p .venv/bin\n'
+        '  cp "$FAKE_SYSTEM_PYTHON" .venv/bin/python\n'
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_uv.chmod(0o755)
+
+    subprocess.run(
+        ["bash", os.path.abspath("scripts/bootstrap_causal_followup_gpu.sh")],
+        cwd=project,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FAKE_SYSTEM_PYTHON": str(fake_python),
+        },
+        check=True,
+    )
+
+    assert (project / ".venv/bin/python").is_file()
+    assert "venv --system-site-packages --python" in uv_log.read_text(encoding="utf-8")
+    assert "-m pip" not in python_log.read_text(encoding="utf-8")
+
+
 def test_decision_binding_operator_is_thin_resumable_and_fetch_verified():
     run = open("scripts/run_decision_binding_gpu.sh", encoding="utf-8").read()
     control = open("scripts/control_decision_binding_gpu.sh", encoding="utf-8").read()
