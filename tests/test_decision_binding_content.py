@@ -325,6 +325,34 @@ def test_locate_content_token_indices_rejects_token_crossing_payload_boundary():
         locate_content_token_indices(CrossingTokenizer(), "xxalpha, yy", [(2, 7)])
 
 
+def test_locate_content_token_indices_allows_tokenizer_leading_space_prefix():
+    class LeadingSpaceTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [7]
+
+        def __call__(self, text: str, *, add_special_tokens=False, return_offsets_mapping=False):
+            result = {"input_ids": [7]}
+            if return_offsets_mapping:
+                result["offset_mapping"] = [(0, 6)]
+            return result
+
+    assert locate_content_token_indices(LeadingSpaceTokenizer(), " alpha", [(1, 6)]) == [0]
+
+
+def test_locate_content_token_indices_skips_punctuation_fused_to_wrapper_delimiter():
+    class SuffixTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [7, 8]
+
+        def __call__(self, text: str, *, add_special_tokens=False, return_offsets_mapping=False):
+            result = {"input_ids": [7, 8]}
+            if return_offsets_mapping:
+                result["offset_mapping"] = [(0, 5), (5, 7)]
+            return result
+
+    assert locate_content_token_indices(SuffixTokenizer(), 'alpha."', [(0, 6)]) == [0]
+
+
 def test_prepare_candidate_sites_fails_closed_on_prompt_hash_drift():
     candidates = ["a", "b", "c", "d"]
     prompt = "A) a\nB) b\nC) c\nD) d" + _SUFFIX

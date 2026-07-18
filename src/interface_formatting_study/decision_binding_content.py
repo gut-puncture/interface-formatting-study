@@ -412,7 +412,7 @@ def locate_content_token_indices(
     prompt: str,
     char_spans: Sequence[tuple[int, int]],
 ) -> list[int]:
-    """Return the final full token contained in each audited candidate payload."""
+    """Return the final unambiguous content token for each audited payload."""
 
     try:
         encoded = tokenizer(prompt, add_special_tokens=False, return_offsets_mapping=True)
@@ -438,7 +438,31 @@ def locate_content_token_indices(
         index = overlapping[-1]
         token_start, token_end = offsets[index]
         if token_start < start or token_end > end:
-            raise ValueError("token crosses candidate payload boundary")
+            leading_space_prefix = (
+                token_start < start
+                and token_end <= end
+                and bool(prompt[token_start:start])
+                and prompt[token_start:start].isspace()
+            )
+            contained = [
+                candidate
+                for candidate in overlapping
+                if offsets[candidate][0] >= start and offsets[candidate][1] <= end
+            ]
+            in_payload_suffix = prompt[max(token_start, start):end]
+            punctuation_only_suffix = (
+                token_start >= start
+                and token_end > end
+                and bool(in_payload_suffix)
+                and not any(character.isalnum() for character in in_payload_suffix)
+                and bool(contained)
+            )
+            if leading_space_prefix:
+                pass
+            elif punctuation_only_suffix:
+                index = contained[-1]
+            else:
+                raise ValueError("token crosses candidate payload boundary")
         indices.append(index)
     if len(indices) != len(char_spans):
         raise AssertionError("candidate token endpoint count drift")
