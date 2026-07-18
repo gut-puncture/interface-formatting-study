@@ -129,16 +129,24 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         "selection_eligible": False,
         "stop_reason": "no_reader_beat_both_isolated_nuisance_controls",
         "reader_gate_opened": False,
+        "selected_layer": 0,
+        "selected_l2": 0.1,
         "tier_1_pass": False,
         "tier_2_pass": False,
         "patch_eligible": False,
         "opens_final_confirmation": False,
     }
     (tmp_path / "gate_report.json").write_text(json.dumps(gate))
-    (tmp_path / "frozen_selection.json").write_text("{}")
+    (tmp_path / "frozen_selection.json").write_text(json.dumps({
+        "selection_eligible": False,
+        "stop_reason": "no_reader_beat_both_isolated_nuisance_controls",
+        "selected_layer": 0,
+        "selected_l2": 0.1,
+    }))
+    work_keys = [f"work-{index:03d}" for index in range(300)]
     scores = pd.DataFrame({
-        "work_key": ["a"], "reader_name": ["content"], "l2": [0.1],
-        "layer": [0], "readout_role": ["layer_select"],
+        "work_key": work_keys, "reader_name": "content", "l2": 0.1,
+        "layer": 0, "readout_role": "layer_select",
     })
     scores.to_parquet(tmp_path / "layer_select_scores.parquet", index=False)
     control_names = ["position", "label", "position_label", "answer_length", "majority"]
@@ -172,13 +180,14 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         path = tmp_path / name
         artifacts[name] = {"sha256": sha256_file(path), "bytes": path.stat().st_size}
         if path.suffix == ".parquet":
-            artifacts[name]["rows"] = len(pd.read_parquet(path))
-            artifacts[name]["work_keys"] = 1
+            artifact_frame = pd.read_parquet(path)
+            artifacts[name]["rows"] = len(artifact_frame)
+            artifacts[name]["work_keys"] = artifact_frame["work_key"].nunique()
     manifest = {
         "status": "canary_complete",
         "semantic_identity": identity,
         "canary": True,
-        "role_items": {"probe_train": 1, "layer_select": 1, "reader_gate": 1},
+        "role_items": {"probe_train": 1801, "layer_select": 300, "reader_gate": 300},
         "tier_1_pass": False,
         "tier_2_pass": False,
         "patch_eligible": False,
@@ -195,15 +204,15 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         "schema_version": 1,
         "semantic_sha256": "a" * 64,
         "reader_gate_opened": False,
-        "role_items": {"probe_train": 1, "layer_select": 1, "reader_gate": 1},
+        "role_items": {"probe_train": 1801, "layer_select": 300, "reader_gate": 300},
         "roles": {
-            "layer_select": {"rows": 1, "work_keys": 1, "work_keys_sha256": "placeholder"},
-            "reader_gate": {"rows": 1, "work_keys": 1, "work_keys_sha256": "placeholder"},
+            "layer_select": {"rows": 300, "work_keys": 300, "work_keys_sha256": "placeholder"},
+            "reader_gate": {"rows": 300, "work_keys": 300, "work_keys_sha256": "placeholder"},
         },
         "layer_count": 1,
         "l2_grid": [0.1],
-        "selected_layer": None,
-        "selected_l2": None,
+        "selected_layer": 0,
+        "selected_l2": 0.1,
     }))
     manifest["artifacts"]["work_plan.json"] = {
         "sha256": sha256_file(tmp_path / "work_plan.json"),
@@ -214,7 +223,7 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
     with pytest.raises(RuntimeError, match="expected work"):
         verify_run_root(tmp_path, expected_run_id="run-id", mode="canary")
 
-    work_digest = __import__("hashlib").sha256(b"a").hexdigest()
+    work_digest = __import__("hashlib").sha256("\n".join(work_keys).encode()).hexdigest()
     plan = json.loads((tmp_path / "work_plan.json").read_text())
     plan["roles"]["layer_select"]["work_keys_sha256"] = work_digest
     (tmp_path / "work_plan.json").write_text(json.dumps(plan))
@@ -224,9 +233,15 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
     }
     (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
 
-    verified = verify_run_root(tmp_path, expected_run_id="run-id", mode="canary")
+    with pytest.raises(RuntimeError, match="canary.*reader gate"):
+        verify_run_root(tmp_path, expected_run_id="run-id", mode="canary")
 
-    assert verified["status"] == "canary_complete"
+    manifest["status"] = "content_readout_complete"
+    manifest["canary"] = False
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+    verified = verify_run_root(tmp_path, expected_run_id="run-id", mode="complete")
+
+    assert verified["status"] == "content_readout_complete"
     complete_artifacts = dict(manifest["artifacts"])
     manifest["artifacts"] = {
         name: receipt
@@ -235,9 +250,9 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
     }
     (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(RuntimeError, match="required artifacts"):
-        verify_run_root(tmp_path, expected_run_id="run-id", mode="canary")
+        verify_run_root(tmp_path, expected_run_id="run-id", mode="complete")
     manifest["artifacts"] = complete_artifacts
     (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
     (tmp_path / "gate_report.json").write_text("{}")
     with pytest.raises(RuntimeError, match="checksum"):
-        verify_run_root(tmp_path, expected_run_id="run-id", mode="canary")
+        verify_run_root(tmp_path, expected_run_id="run-id", mode="complete")

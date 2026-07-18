@@ -596,6 +596,7 @@ def verify_run_root(
     if not plan_path.is_file():
         raise RuntimeError("candidate work plan is missing")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    selection = json.loads((run_root / "frozen_selection.json").read_text(encoding="utf-8"))
     config_l2 = [float(value) for value in identity.get("experiment_config", {}).get("l2_grid", [])]
     if (
         plan.get("schema_version") != 1
@@ -604,6 +605,8 @@ def verify_run_root(
         or plan.get("role_items") != manifest.get("role_items")
         or int(plan.get("layer_count", -1)) != int(identity.get("model", {}).get("expected_layers", -2))
         or [float(value) for value in plan.get("l2_grid", [])] != config_l2
+        or int(plan.get("selected_layer", -1)) != int(selection.get("selected_layer", -2))
+        or not np.isclose(float(plan.get("selected_l2", -1)), float(selection.get("selected_l2", -2)))
     ):
         raise RuntimeError("candidate work plan identity mismatch")
     expected_frames = {
@@ -654,12 +657,26 @@ def verify_run_root(
             if not path.is_file() or sha256_file(path) != digest:
                 raise RuntimeError(f"candidate ranker checksum mismatch: {name}")
     gate = json.loads((run_root / "gate_report.json").read_text(encoding="utf-8"))
+    if mode == "canary" and not bool(manifest.get("reader_gate_opened")):
+        raise RuntimeError("candidate canary did not reach the reader gate")
     if (
         gate.get("claim") != "candidate_local_linear_decodability"
         or bool(gate.get("reader_gate_opened", True)) != bool(manifest.get("reader_gate_opened"))
         or (
             not bool(manifest.get("reader_gate_opened"))
-            and (gate.get("selection_eligible") is not False or not gate.get("stop_reason"))
+            and (
+                mode != "complete"
+                or gate.get("selection_eligible") is not False
+                or selection.get("selection_eligible") is not False
+                or not gate.get("stop_reason")
+                or gate.get("stop_reason") != selection.get("stop_reason")
+            )
+        )
+        or int(gate.get("selected_layer", selection.get("selected_layer", -1)))
+        != int(selection.get("selected_layer", -2))
+        or not np.isclose(
+            float(gate.get("selected_l2", selection.get("selected_l2", -1))),
+            float(selection.get("selected_l2", -2)),
         )
         or bool(gate.get("patch_eligible"))
         or bool(manifest.get("patch_eligible"))
@@ -965,8 +982,8 @@ def cmd_run_model(args) -> None:
             layer_count=profile.expected_layers,
             l2_grid=args.l2_grid,
             reader_gate_opened=not selection_stop,
-            selected_layer=None if selection_stop else int(selection["selected_layer"]),
-            selected_l2=None if selection_stop else float(selection["selected_l2"]),
+            selected_layer=int(selection["selected_layer"]),
+            selected_l2=float(selection["selected_l2"]),
         )
 
         if selection_stop:
@@ -981,6 +998,8 @@ def cmd_run_model(args) -> None:
                 "patch_eligible": False,
                 "opens_final_confirmation": False,
                 "reader_gate_opened": False,
+                "selected_layer": int(selection["selected_layer"]),
+                "selected_l2": float(selection["selected_l2"]),
             }
             write_table_atomic(layer_scores, root / "layer_select_scores.parquet")
             write_table_atomic(
