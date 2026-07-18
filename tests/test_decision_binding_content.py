@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,7 @@ from interface_formatting_study.decision_binding_content import (
     CandidateRanker,
     candidate_score_rows,
     capture_candidate_states,
+    classify_candidate_target_state,
     evaluate_candidate_ranker,
     fit_candidate_ranker,
     gate_candidate_reader,
@@ -497,6 +499,103 @@ def test_prepare_candidate_sites_fails_closed_on_prompt_hash_drift():
         prepare_candidate_sites(pd.DataFrame([row]), applicability, option_maps={})
 
 
+def _target_state_rows() -> pd.DataFrame:
+    return pd.DataFrame({
+        "work_key": ["stable"],
+        "raw_predicted_label": ["B"],
+        "raw_score_A": [-1.0],
+        "raw_score_B": [-0.25],
+        "raw_score_C": [-2.0],
+        "raw_score_D": [-3.0],
+        "winner_position": [2],
+        "winner_unique": [True],
+        "text_identity_ambiguous": [False],
+        "content_target_evaluable": [True],
+        "labels_by_position": [["D", "A", "B", "C"]],
+        "actual_content_ids_by_position": [[3, 0, 2, 1]],
+        "actual_winner_content_id": [2],
+    })
+
+
+def test_candidate_target_state_classifies_stability_and_expected_ineligibility():
+    stable = _target_state_rows()
+    fresh = np.asarray([[-1.0, -0.25, -2.0, -3.0]], dtype=np.float32)
+
+    receipt = classify_candidate_target_state(stable, fresh)
+
+    row = receipt.iloc[0]
+    assert row.work_key == "stable"
+    assert row.stored_winner_label == "B"
+    assert row.stored_winner_position == 2
+    assert row.stored_winner_content_id == 2
+    assert row.fresh_winner_label == "B"
+    assert row.fresh_winner_position == 2
+    assert row.fresh_winner_content_id == 2
+    assert row.stored_winner_unique
+    assert row.fresh_winner_unique
+    assert row.stored_winner_margin == pytest.approx(0.75)
+    assert row.fresh_winner_margin == pytest.approx(0.75)
+    assert row.max_abs_raw_score_drift == pytest.approx(0.0)
+    assert row.stored_fresh_content_agree
+    assert row.reader_target_evaluable
+    assert row.reader_target_ineligibility_reason == "eligible"
+    assert [row[f"stored_raw_score_{label}"] for label in "ABCD"] == pytest.approx(
+        [-1.0, -0.25, -2.0, -3.0]
+    )
+    assert [row[f"fresh_raw_score_{label}"] for label in "ABCD"] == pytest.approx(
+        [-1.0, -0.25, -2.0, -3.0]
+    )
+
+    cases = []
+    stored_tie = stable.copy()
+    stored_tie.loc[0, ["raw_score_A", "raw_score_B"]] = -0.25
+    stored_tie.loc[0, "raw_predicted_label"] = "A"
+    stored_tie.loc[0, "winner_position"] = 1
+    stored_tie.loc[0, "winner_unique"] = False
+    stored_tie.loc[0, "text_identity_ambiguous"] = True
+    stored_tie.loc[0, "content_target_evaluable"] = False
+    stored_tie.loc[0, "actual_winner_content_id"] = 0
+    cases.append((stored_tie, fresh, "stored_raw_tie"))
+    ambiguous = stable.copy()
+    ambiguous.loc[0, "text_identity_ambiguous"] = True
+    ambiguous.loc[0, "content_target_evaluable"] = False
+    cases.append((ambiguous, fresh, "ambiguous_answer_content"))
+    cases.append((stable, np.asarray([[-1.0, -0.25, -0.25, -3.0]]), "fresh_raw_tie"))
+    cases.append((stable, np.asarray([[-1.0, -0.5, -0.25, -3.0]]), "stored_fresh_content_mismatch"))
+    for frame, scores, reason in cases:
+        observed = classify_candidate_target_state(frame, scores).iloc[0]
+        assert not bool(observed.reader_target_evaluable)
+        assert observed.reader_target_ineligibility_reason == reason
+
+
+def test_candidate_target_state_does_not_exclude_an_unchanged_near_tie():
+    rows = _target_state_rows()
+    rows.loc[0, "raw_score_A"] = -0.250001
+    fresh = np.asarray([[-0.2500005, -0.25, -2.0, -3.0]])
+
+    receipt = classify_candidate_target_state(rows, fresh)
+
+    assert bool(receipt.iloc[0].reader_target_evaluable) is True
+    assert receipt.iloc[0].fresh_winner_margin == pytest.approx(0.0000005)
+
+
+@pytest.mark.parametrize(
+    "mutate,scores,match",
+    [
+        (lambda rows: rows.assign(raw_predicted_label="Z"), [[-1.0, -0.25, -2.0, -3.0]], "label"),
+        (lambda rows: rows.assign(labels_by_position=[["A", "A", "C", "D"]]), [[-1.0, -0.25, -2.0, -3.0]], "permutation"),
+        (lambda rows: rows.assign(actual_content_ids_by_position=[[0, 0, 2, 3]]), [[-1.0, -0.25, -2.0, -3.0]], "permutation"),
+        (lambda rows: rows.assign(actual_content_ids_by_position=[[0.0, 1, 2, 3]]), [[-1.0, -0.25, -2.0, -3.0]], "malformed"),
+        (lambda rows: rows.assign(actual_winner_content_id=8), [[-1.0, -0.25, -2.0, -3.0]], "target"),
+        (lambda rows: rows, [[-1.0, float("nan"), -2.0, -3.0]], "non-finite"),
+        (lambda rows: rows, [[-1.0, -0.25, -2.0]], "shape"),
+    ],
+)
+def test_candidate_target_state_fails_closed_on_malformed_inputs(mutate, scores, match):
+    with pytest.raises(ValueError, match=match):
+        classify_candidate_target_state(mutate(_target_state_rows()), np.asarray(scores))
+
+
 def test_shared_candidate_ranker_recovers_known_direction_without_position_identity():
     generator = np.random.default_rng(7)
     items, layers, hidden = 96, 3, 8
@@ -516,6 +615,17 @@ def test_shared_candidate_ranker_recovers_known_direction_without_position_ident
     assert ranker.weights.shape == (layers, hidden)
     assert ranker.rms.shape == (layers,)
     assert np.isfinite(ranker.weights).all()
+    assert 0 < ranker.outer_iterations < 80
+    assert ranker.function_evaluations >= ranker.outer_iterations
+
+
+def test_candidate_ranker_rejects_an_exhausted_optimizer_budget():
+    generator = np.random.default_rng(8)
+    values = generator.normal(size=(24, 2, 4, 6)).astype(np.float32)
+    targets = generator.integers(0, 4, size=24)
+
+    with pytest.raises(ValueError, match="optimization budget"):
+        fit_candidate_ranker(values, targets, l2=1e-2, max_iter=1, device="cpu")
 
 
 def test_shared_candidate_ranker_is_invariant_to_per_item_common_activation_shift():
@@ -559,8 +669,42 @@ def test_candidate_ranker_save_load_preserves_scores_and_identity(tmp_path):
         evaluate_candidate_ranker(ranker, values),
         evaluate_candidate_ranker(loaded, values),
     )
+    assert loaded.outer_iterations == ranker.outer_iterations
+    assert loaded.function_evaluations == ranker.function_evaluations
     with pytest.raises(ValueError, match="semantic identity"):
         load_candidate_ranker(path, semantic_sha256="b" * 64)
+
+
+def test_candidate_ranker_load_rejects_an_exhausted_optimizer_receipt(tmp_path):
+    generator = np.random.default_rng(20)
+    values = generator.normal(size=(24, 2, 4, 5)).astype(np.float32)
+    targets = generator.integers(0, 4, size=24)
+    ranker = fit_candidate_ranker(values, targets, l2=0.01, max_iter=30)
+    path = tmp_path / "ranker.npz"
+    save_candidate_ranker(path, ranker, semantic_sha256="a" * 64)
+    with np.load(path, allow_pickle=False) as stored:
+        metadata = json.loads(str(stored["metadata"].item()))
+        weights = stored["weights"].copy()
+        rms = stored["rms"].copy()
+    metadata["outer_iterations"] = metadata["max_iterations"]
+    np.savez(path, weights=weights, rms=rms, metadata=json.dumps(metadata))
+
+    with pytest.raises(ValueError, match="malformed"):
+        load_candidate_ranker(path, semantic_sha256="a" * 64)
+
+
+def test_candidate_ranker_persists_immediate_gradient_convergence(tmp_path):
+    values = np.zeros((8, 1, 4, 2), dtype=np.float32)
+    targets = np.tile(np.arange(4), 2)
+
+    ranker = fit_candidate_ranker(values, targets, l2=0.01, max_iter=10)
+    path = tmp_path / "ranker.npz"
+    save_candidate_ranker(path, ranker, semantic_sha256="a" * 64)
+    loaded = load_candidate_ranker(path, semantic_sha256="a" * 64)
+
+    assert ranker.outer_iterations == 0
+    assert ranker.function_evaluations == 1
+    assert loaded.outer_iterations == 0
 
 
 def test_metadata_controls_encode_only_the_declared_nuisance():
@@ -653,6 +797,8 @@ def _synthetic_candidate_scores(*, role: str, weak: bool = False) -> pd.DataFram
                     "raw_correct": item % 3 != 0,
                     "raw_margin": 0.5,
                     "content_target_evaluable": True,
+                    "reader_target_evaluable": True,
+                    "reader_target_ineligibility_reason": "eligible",
                     **{f"content_prob_{index}": float(probability[index]) for index in range(4)},
                 })
     return pd.DataFrame(rows)
@@ -670,6 +816,11 @@ def test_candidate_score_rows_maps_physical_candidates_back_to_content_identity(
         "labels_by_position": [list("DABC")],
         "raw_correct": [False],
         "raw_margin": [0.2],
+        "reader_target_evaluable": [False],
+        "reader_target_ineligibility_reason": ["fresh_raw_tie"],
+        "stored_winner_label": ["B"],
+        "fresh_winner_label": ["B"],
+        "fresh_winner_margin": [0.0],
     })
     probabilities = np.asarray([[[0.1, 0.2, 0.6, 0.1]]], dtype=np.float32)
 
@@ -678,6 +829,10 @@ def test_candidate_score_rows_maps_physical_candidates_back_to_content_identity(
     assert scored.iloc[0].content_predicted_id == 2
     assert scored.iloc[0].content_prob_2 == pytest.approx(0.6)
     assert scored.iloc[0].content_target_probability == pytest.approx(0.6)
+    assert not bool(scored.iloc[0].reader_target_evaluable)
+    assert scored.iloc[0].reader_target_ineligibility_reason == "fresh_raw_tie"
+    assert scored.iloc[0].stored_winner_label == "B"
+    assert scored.iloc[0].fresh_winner_margin == pytest.approx(0.0)
 
 
 def test_majority_control_uses_training_targets_without_position_leakage():
@@ -691,6 +846,8 @@ def test_majority_control_uses_training_targets_without_position_leakage():
         "actual_content_ids_by_position": [[0, 1, 2, 3], [2, 3, 0, 1]],
         "labels_by_position": [list("ABCD"), list("CDAB")],
         "content_target_evaluable": [True, True],
+        "reader_target_evaluable": [True, True],
+        "reader_target_ineligibility_reason": ["eligible", "eligible"],
     })
 
     scored = majority_candidate_scores(sites, [2, 2, 1])
@@ -732,7 +889,7 @@ def test_selection_uses_only_layer_select_and_prefers_invariant_reader():
 
     mixed = selection.copy()
     baseline = mixed["manipulation"].eq("controlled_baseline") & mixed["item_id"].eq("item-0")
-    mixed.loc[baseline, "content_target_evaluable"] = False
+    mixed.loc[baseline, "reader_target_evaluable"] = False
     assert select_candidate_reader(mixed, controls)["selected_layer"] == 1
 
 
@@ -792,7 +949,7 @@ def test_gate_reports_tier_one_only_for_held_out_decodability():
         unknown_baseline["item_id"].eq("item-0")
         & unknown_baseline["manipulation"].eq("position_only")
     )
-    unknown_baseline.loc[baseline, "content_target_evaluable"] = False
+    unknown_baseline.loc[baseline, "reader_target_evaluable"] = False
     unknown_baseline.loc[transformed, "actual_winner_content_id"] = 1
     unknown_report = gate_candidate_reader(
         unknown_baseline,
@@ -805,6 +962,30 @@ def test_gate_reports_tier_one_only_for_held_out_decodability():
         parity={"save_load": True, "batch": True, "seed": True},
     )
     assert unknown_report["metrics"]["conflicts"]["items"] == 0
+
+
+def test_analysis_requires_runtime_eligibility_and_uses_it_for_baseline_stability():
+    selection = _synthetic_candidate_scores(role="layer_select")
+    controls = {
+        name: selection.assign(**{
+            "content_prob_0": 0.25,
+            "content_prob_1": 0.25,
+            "content_prob_2": 0.25,
+            "content_prob_3": 0.25,
+        })
+        for name in ("position", "label")
+    }
+    missing = selection.drop(columns=["reader_target_evaluable"])
+    with pytest.raises(ValueError, match="reader_target_evaluable"):
+        select_candidate_reader(missing, controls)
+
+    masked = selection.copy()
+    baseline = masked["item_id"].eq("item-0") & masked["manipulation"].eq(
+        "controlled_baseline"
+    )
+    masked.loc[baseline, "reader_target_evaluable"] = False
+    selected = select_candidate_reader(masked, controls)
+    assert selected["selected_layer"] == 1
 
 
 def test_tier_two_requires_all_bound_parity_receipts():

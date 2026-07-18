@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -59,6 +60,25 @@ _OUTPUT_INSTRUCTIONS = (
     "Return only the letter (A, B, C, or D).",
     "Return only the exact answer text, not its letter.",
 )
+CANDIDATE_TARGET_STATE_COLUMNS = (
+    "work_key",
+    *(f"stored_raw_score_{label}" for label in LETTERS),
+    *(f"fresh_raw_score_{label}" for label in LETTERS),
+    "stored_winner_label",
+    "stored_winner_position",
+    "stored_winner_content_id",
+    "fresh_winner_label",
+    "fresh_winner_position",
+    "fresh_winner_content_id",
+    "stored_winner_unique",
+    "fresh_winner_unique",
+    "stored_winner_margin",
+    "fresh_winner_margin",
+    "max_abs_raw_score_drift",
+    "stored_fresh_content_agree",
+    "reader_target_evaluable",
+    "reader_target_ineligibility_reason",
+)
 
 
 @dataclass(frozen=True)
@@ -75,7 +95,10 @@ class CandidateRanker:
     rms: np.ndarray
     l2: float
     training_loss: float
-    iterations: int
+    outer_iterations: int
+    function_evaluations: int
+    max_iterations: int
+    max_function_evaluations: int
 
 
 @dataclass(frozen=True)
@@ -416,6 +439,148 @@ def prepare_candidate_sites(
     return pd.DataFrame(output).sort_values("work_key", kind="mergesort").reset_index(drop=True)
 
 
+def classify_candidate_target_state(
+    sites: pd.DataFrame,
+    fresh_raw_log_probs: np.ndarray | torch.Tensor,
+) -> pd.DataFrame:
+    """Classify whether each stored answer-content target survived a fresh forward pass."""
+
+    required = {
+        "work_key",
+        "raw_predicted_label",
+        "winner_position",
+        "winner_unique",
+        "text_identity_ambiguous",
+        "content_target_evaluable",
+        "labels_by_position",
+        "actual_content_ids_by_position",
+        "actual_winner_content_id",
+        *(f"raw_score_{label}" for label in LETTERS),
+    }
+    if missing := required - set(sites.columns):
+        raise ValueError(f"candidate target state is missing columns: {sorted(missing)}")
+    if sites.empty or sites["work_key"].duplicated().any():
+        raise ValueError("candidate target state requires non-empty unique work keys")
+    fresh = (
+        fresh_raw_log_probs.detach().float().cpu().numpy()
+        if isinstance(fresh_raw_log_probs, torch.Tensor)
+        else np.asarray(fresh_raw_log_probs, dtype=np.float64)
+    )
+    if fresh.shape != (len(sites), 4):
+        raise ValueError("candidate target state fresh score shape mismatch")
+    if not np.isfinite(fresh).all():
+        raise ValueError("candidate target state contains non-finite fresh scores")
+
+    records: list[dict[str, object]] = []
+    for row_index, row in enumerate(sites.to_dict("records")):
+        work_key = str(row["work_key"])
+        stored_label = str(row["raw_predicted_label"])
+        if stored_label not in LETTERS:
+            raise ValueError(f"{work_key} has an invalid stored winner label")
+        labels = [
+            str(value) for value in _sequence(row["labels_by_position"], name="labels_by_position")
+        ]
+        raw_contents = _sequence(
+            row["actual_content_ids_by_position"],
+            name="actual_content_ids_by_position",
+        )
+        if any(
+            isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral)
+            for value in raw_contents
+        ):
+            raise ValueError(f"{work_key} content mapping is malformed")
+        contents = [int(value) for value in raw_contents]
+        if sorted(labels) != list(LETTERS) or sorted(contents) != [0, 1, 2, 3]:
+            raise ValueError(f"{work_key} label/content mappings are not permutations")
+        if (
+            isinstance(row["winner_position"], (bool, np.bool_))
+            or not isinstance(row["winner_position"], Integral)
+            or isinstance(row["actual_winner_content_id"], (bool, np.bool_))
+            or not isinstance(row["actual_winner_content_id"], Integral)
+        ):
+            raise ValueError(f"{work_key} stored winner coordinates are malformed")
+        stored_position = int(row["winner_position"])
+        target_content = int(row["actual_winner_content_id"])
+        if target_content not in range(4):
+            raise ValueError(f"{work_key} has an invalid content target")
+        if (
+            stored_position not in range(4)
+            or labels[stored_position] != stored_label
+            or contents[stored_position] != target_content
+        ):
+            raise ValueError(f"{work_key} has inconsistent stored winner coordinates")
+
+        stored = np.asarray(
+            [float(row[f"raw_score_{label}"]) for label in LETTERS], dtype=np.float64
+        )
+        if not np.isfinite(stored).all():
+            raise ValueError(f"{work_key} contains non-finite stored scores")
+        stored_maximum = float(stored.max())
+        stored_unique = bool(np.count_nonzero(stored == stored_maximum) == 1)
+        if stored[LETTERS.index(stored_label)] != stored_maximum:
+            raise ValueError(f"{work_key} stored winner label disagrees with stored scores")
+        if not isinstance(row["winner_unique"], (bool, np.bool_)):
+            raise ValueError(f"{work_key} stored winner uniqueness is malformed")
+        if bool(row["winner_unique"]) != stored_unique:
+            raise ValueError(f"{work_key} stored winner uniqueness disagrees with stored scores")
+        if not isinstance(row["text_identity_ambiguous"], (bool, np.bool_)) or not isinstance(
+            row["content_target_evaluable"], (bool, np.bool_)
+        ):
+            raise ValueError(f"{work_key} source content eligibility is malformed")
+        ambiguous = bool(row["text_identity_ambiguous"])
+        source_evaluable = bool(row["content_target_evaluable"])
+        if source_evaluable != (stored_unique and not ambiguous):
+            raise ValueError(f"{work_key} source content eligibility is inconsistent")
+
+        fresh_scores = fresh[row_index]
+        fresh_maximum = float(fresh_scores.max())
+        fresh_unique = bool(np.count_nonzero(fresh_scores == fresh_maximum) == 1)
+        fresh_label = LETTERS[int(fresh_scores.argmax())]
+        fresh_position = labels.index(fresh_label)
+        fresh_content = contents[fresh_position]
+        stored_margin = float(np.sort(stored)[-1] - np.sort(stored)[-2])
+        fresh_margin = float(np.sort(fresh_scores)[-1] - np.sort(fresh_scores)[-2])
+        content_agrees = fresh_content == target_content
+        if not stored_unique:
+            reason = "stored_raw_tie"
+        elif ambiguous:
+            reason = "ambiguous_answer_content"
+        elif not fresh_unique:
+            reason = "fresh_raw_tie"
+        elif not content_agrees:
+            reason = "stored_fresh_content_mismatch"
+        else:
+            reason = "eligible"
+        reader_evaluable = bool(source_evaluable and fresh_unique and content_agrees)
+
+        records.append({
+            "work_key": work_key,
+            **{
+                f"stored_raw_score_{label}": float(stored[index])
+                for index, label in enumerate(LETTERS)
+            },
+            **{
+                f"fresh_raw_score_{label}": float(fresh_scores[index])
+                for index, label in enumerate(LETTERS)
+            },
+            "stored_winner_label": stored_label,
+            "stored_winner_position": stored_position,
+            "stored_winner_content_id": target_content,
+            "fresh_winner_label": fresh_label,
+            "fresh_winner_position": fresh_position,
+            "fresh_winner_content_id": fresh_content,
+            "stored_winner_unique": stored_unique,
+            "fresh_winner_unique": fresh_unique,
+            "stored_winner_margin": stored_margin,
+            "fresh_winner_margin": fresh_margin,
+            "max_abs_raw_score_drift": float(np.max(np.abs(stored - fresh_scores))),
+            "stored_fresh_content_agree": content_agrees,
+            "reader_target_evaluable": reader_evaluable,
+            "reader_target_ineligibility_reason": reason,
+        })
+    return pd.DataFrame.from_records(records, columns=CANDIDATE_TARGET_STATE_COLUMNS)
+
+
 def locate_content_token_indices(
     tokenizer,
     prompt: str,
@@ -624,14 +789,13 @@ def fit_candidate_ranker(
         [weights],
         lr=1.0,
         max_iter=max_iter,
+        max_eval=max_iter,
         tolerance_grad=1e-7,
         tolerance_change=1e-9,
         line_search_fn="strong_wolfe",
     )
-    iterations = 0
 
     def closure() -> torch.Tensor:
-        nonlocal iterations
         optimizer.zero_grad()
         scores = torch.einsum("nlch,lh->nlc", normalized, weights)
         repeated_targets = targets[:, None].expand(-1, values.shape[1]).reshape(-1)
@@ -640,10 +804,17 @@ def fit_candidate_ranker(
         if not bool(torch.isfinite(loss)):
             raise ValueError("candidate-ranker loss became non-finite")
         loss.backward()
-        iterations += 1
         return loss
 
     optimizer.step(closure)
+    optimizer_state = optimizer.state[weights]
+    outer_iterations = int(optimizer_state.get("n_iter", 0))
+    function_evaluations = int(optimizer_state.get("func_evals", 0))
+    max_evaluations = int(optimizer.defaults["max_eval"])
+    if outer_iterations >= max_iter or function_evaluations >= max_evaluations:
+        raise ValueError(
+            "candidate-ranker exhausted its optimization budget before convergence"
+        )
     with torch.no_grad():
         scores = torch.einsum("nlch,lh->nlc", normalized, weights)
         repeated_targets = targets[:, None].expand(-1, values.shape[1]).reshape(-1)
@@ -652,14 +823,17 @@ def fit_candidate_ranker(
             + 0.5 * float(l2) * weights.square().sum(dim=1).mean()
         )
     learned = weights.detach().cpu().numpy()
-    if not np.isfinite(learned).all():
-        raise ValueError("candidate-ranker weights are non-finite")
+    if not np.isfinite(learned).all() or not np.isfinite(final_loss):
+        raise ValueError("candidate-ranker result is non-finite")
     return CandidateRanker(
         weights=learned,
         rms=rms.detach().cpu().numpy(),
         l2=float(l2),
         training_loss=final_loss,
-        iterations=iterations,
+        outer_iterations=outer_iterations,
+        function_evaluations=function_evaluations,
+        max_iterations=int(max_iter),
+        max_function_evaluations=max_evaluations,
     )
 
 
@@ -700,11 +874,14 @@ def save_candidate_ranker(
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     metadata = json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "semantic_sha256": semantic_sha256,
         "l2": ranker.l2,
         "training_loss": ranker.training_loss,
-        "iterations": ranker.iterations,
+        "outer_iterations": ranker.outer_iterations,
+        "function_evaluations": ranker.function_evaluations,
+        "max_iterations": ranker.max_iterations,
+        "max_function_evaluations": ranker.max_function_evaluations,
     }, sort_keys=True)
     with temporary.open("wb") as handle:
         np.savez(handle, weights=ranker.weights, rms=ranker.rms, metadata=metadata)
@@ -721,24 +898,42 @@ def load_candidate_ranker(
         weights = np.asarray(stored["weights"], dtype=np.float32)
         rms = np.asarray(stored["rms"], dtype=np.float32)
     if (
-        metadata.get("schema_version") != 1
+        metadata.get("schema_version") != 2
         or metadata.get("semantic_sha256") != semantic_sha256
     ):
         raise ValueError("candidate ranker semantic identity mismatch")
+    try:
+        l2 = float(metadata["l2"])
+        training_loss = float(metadata["training_loss"])
+        outer_iterations = int(metadata["outer_iterations"])
+        function_evaluations = int(metadata["function_evaluations"])
+        max_iterations = int(metadata["max_iterations"])
+        max_function_evaluations = int(metadata["max_function_evaluations"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("candidate ranker artifact is malformed") from exc
     if (
         weights.ndim != 2
         or rms.shape != (weights.shape[0],)
         or not np.isfinite(weights).all()
         or not np.isfinite(rms).all()
         or np.any(rms <= 0)
+        or not np.isfinite(training_loss)
+        or l2 <= 0
+        or outer_iterations < 0
+        or function_evaluations < max(outer_iterations, 1)
+        or outer_iterations >= max_iterations
+        or function_evaluations >= max_function_evaluations
     ):
         raise ValueError("candidate ranker artifact is malformed")
     return CandidateRanker(
         weights=weights,
         rms=rms,
-        l2=float(metadata["l2"]),
-        training_loss=float(metadata["training_loss"]),
-        iterations=int(metadata["iterations"]),
+        l2=l2,
+        training_loss=training_loss,
+        outer_iterations=outer_iterations,
+        function_evaluations=function_evaluations,
+        max_iterations=max_iterations,
+        max_function_evaluations=max_function_evaluations,
     )
 
 
@@ -812,12 +1007,13 @@ def candidate_score_rows(
             raise ValueError("candidate score content mapping is not a permutation")
         metadata = {
             key: row[key]
-            for key in (
+            for key in dict.fromkeys((
                 "work_key", "item_id", "subject", "wrapper_name", "readout_role",
                 "manipulation", "variant", "actual_winner_content_id",
                 "actual_content_ids_by_position", "labels_by_position", "raw_correct",
                 "raw_margin", "content_target_evaluable",
-            )
+                *CANDIDATE_TARGET_STATE_COLUMNS,
+            ))
             if key in row
         }
         for layer in range(values.shape[1]):
@@ -873,6 +1069,7 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
     required = {
         "work_key", "item_id", "wrapper_name", "readout_role", "manipulation",
         "actual_winner_content_id", "actual_content_ids_by_position", "labels_by_position",
+        "reader_target_evaluable",
         *_PROBABILITY_COLUMNS,
     }
     if missing := required - set(frame.columns):
@@ -887,11 +1084,7 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
     if np.any((targets < 0) | (targets > 3)):
         raise ValueError("candidate analysis targets are invalid")
     predictions = probabilities.argmax(axis=1)
-    evaluable = (
-        scored["content_target_evaluable"].astype(bool).to_numpy()
-        if "content_target_evaluable" in scored
-        else np.ones(len(scored), dtype=bool)
-    )
+    evaluable = scored["reader_target_evaluable"].astype(bool).to_numpy()
     scored["content_predicted_id"] = predictions
     scored["content_correct"] = np.where(evaluable, predictions == targets, np.nan)
     target_probability = probabilities[np.arange(len(scored)), targets]
@@ -920,7 +1113,7 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
             target,
             target_position,
             labels[target_position],
-            bool(row.get("content_target_evaluable", True)),
+            bool(row["reader_target_evaluable"]),
         )
 
     stable: list[bool] = []
@@ -932,7 +1125,7 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
             (str(row["item_id"]), str(row["wrapper_name"]))
         ]
         target = int(row["actual_winner_content_id"])
-        row_evaluable = bool(row.get("content_target_evaluable", True))
+        row_evaluable = bool(row["reader_target_evaluable"])
         is_stable = baseline_evaluable and row_evaluable and target == baseline_target
         baseline_evaluable_rows.append(baseline_evaluable)
         contents = [int(value) for value in _sequence(
