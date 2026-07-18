@@ -689,3 +689,444 @@ def metadata_candidate_features(frame: pd.DataFrame) -> dict[str, np.ndarray]:
         "position_label": np.concatenate((position, label), axis=2)[:, None],
         "answer_length": lengths[:, None],
     }
+
+
+def candidate_score_rows(
+    sites: pd.DataFrame,
+    probabilities: np.ndarray,
+    *,
+    l2: float,
+    reader_name: str,
+) -> pd.DataFrame:
+    """Map physical candidate scores back to item-local content identities."""
+
+    values = np.asarray(probabilities, dtype=np.float64)
+    if (
+        not reader_name
+        or l2 <= 0
+        or values.ndim != 3
+        or values.shape[0] != len(sites)
+        or values.shape[2] != 4
+        or not np.isfinite(values).all()
+        or not np.allclose(values.sum(axis=2), 1.0, atol=1e-5)
+    ):
+        raise ValueError("invalid candidate score rows")
+    required = {
+        "work_key", "item_id", "wrapper_name", "readout_role", "manipulation",
+        "actual_winner_content_id", "actual_content_ids_by_position", "labels_by_position",
+    }
+    if missing := required - set(sites.columns):
+        raise ValueError(f"candidate score sites are missing columns: {sorted(missing)}")
+    records: list[dict[str, object]] = []
+    for row_index, row in enumerate(sites.to_dict("records")):
+        contents = [
+            int(value)
+            for value in _sequence(
+                row["actual_content_ids_by_position"], name="actual_content_ids_by_position"
+            )
+        ]
+        if sorted(contents) != [0, 1, 2, 3]:
+            raise ValueError("candidate score content mapping is not a permutation")
+        for layer in range(values.shape[1]):
+            content_probabilities = np.empty(4, dtype=np.float64)
+            for position, content_id in enumerate(contents):
+                content_probabilities[content_id] = values[row_index, layer, position]
+            target = int(row["actual_winner_content_id"])
+            if target not in range(4):
+                raise ValueError("candidate score target is outside [0, 3]")
+            records.append({
+                **row,
+                "reader_name": str(reader_name),
+                "layer": int(layer),
+                "l2": float(l2),
+                "content_predicted_id": int(content_probabilities.argmax()),
+                "content_target_probability": float(content_probabilities[target]),
+                **{
+                    f"content_prob_{content_id}": float(content_probabilities[content_id])
+                    for content_id in range(4)
+                },
+            })
+    return pd.DataFrame(records).sort_values(
+        ["layer", "work_key"], kind="mergesort"
+    ).reset_index(drop=True)
+
+
+_PROBABILITY_COLUMNS = tuple(f"content_prob_{content_id}" for content_id in range(4))
+
+
+def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    required = {
+        "work_key", "item_id", "wrapper_name", "readout_role", "manipulation",
+        "actual_winner_content_id", "actual_content_ids_by_position", "labels_by_position",
+        *_PROBABILITY_COLUMNS,
+    }
+    if missing := required - set(frame.columns):
+        raise ValueError(f"candidate analysis is missing columns: {sorted(missing)}")
+    scored = frame.copy()
+    probabilities = scored[list(_PROBABILITY_COLUMNS)].to_numpy(dtype=float)
+    if not np.isfinite(probabilities).all() or not np.allclose(
+        probabilities.sum(axis=1), 1.0, atol=1e-5
+    ):
+        raise ValueError("candidate analysis probabilities are invalid")
+    targets = scored["actual_winner_content_id"].to_numpy(dtype=int)
+    if np.any((targets < 0) | (targets > 3)):
+        raise ValueError("candidate analysis targets are invalid")
+    predictions = probabilities.argmax(axis=1)
+    scored["content_predicted_id"] = predictions
+    scored["content_correct"] = predictions == targets
+    target_probability = probabilities[np.arange(len(scored)), targets]
+    pairwise = np.empty(len(scored), dtype=float)
+    for index, (scores, target) in enumerate(zip(probabilities, targets, strict=True)):
+        comparisons = [
+            1.0 if scores[target] > scores[other] else 0.5 if scores[target] == scores[other] else 0.0
+            for other in range(4) if other != target
+        ]
+        pairwise[index] = float(np.mean(comparisons))
+    scored["within_question_auc"] = pairwise
+
+    baseline_columns: dict[tuple[str, str], tuple[int, int, str]] = {}
+    for key, group in scored.groupby(["item_id", "wrapper_name"], sort=False):
+        baseline = group[group["manipulation"].astype(str) == "controlled_baseline"]
+        if len(baseline) != 1:
+            raise ValueError(f"candidate analysis requires one baseline per block: {key}")
+        row = baseline.iloc[0]
+        target = int(row["actual_winner_content_id"])
+        contents = [int(value) for value in _sequence(
+            row["actual_content_ids_by_position"], name="actual_content_ids_by_position"
+        )]
+        labels = [str(value) for value in _sequence(row["labels_by_position"], name="labels")]
+        target_position = contents.index(target)
+        baseline_columns[(str(key[0]), str(key[1]))] = (
+            target, target_position, labels[target_position]
+        )
+
+    stable: list[bool] = []
+    nuisance_ids: list[int | None] = []
+    preferences: list[bool | None] = []
+    for row, scores in zip(scored.to_dict("records"), probabilities, strict=True):
+        baseline_target, baseline_position, baseline_label = baseline_columns[
+            (str(row["item_id"]), str(row["wrapper_name"]))
+        ]
+        target = int(row["actual_winner_content_id"])
+        is_stable = target == baseline_target
+        contents = [int(value) for value in _sequence(
+            row["actual_content_ids_by_position"], name="actual_content_ids_by_position"
+        )]
+        labels = [str(value) for value in _sequence(row["labels_by_position"], name="labels")]
+        manipulation = str(row["manipulation"])
+        nuisance: int | None = None
+        if manipulation == "position_only":
+            nuisance = contents[baseline_position]
+        elif manipulation == "label_only":
+            nuisance = contents[labels.index(baseline_label)]
+        preference = (
+            bool(scores[target] > scores[nuisance])
+            if is_stable and nuisance is not None and nuisance != target
+            else None
+        )
+        stable.append(is_stable)
+        nuisance_ids.append(nuisance)
+        preferences.append(preference)
+    scored["baseline_content_stable"] = stable
+    scored["nuisance_content_id"] = nuisance_ids
+    scored["stable_content_preference"] = preferences
+    return scored
+
+
+def _item_metric(frame: pd.DataFrame, column: str) -> tuple[float, np.ndarray]:
+    eligible = frame.dropna(subset=[column])
+    if eligible.empty:
+        return float("nan"), np.empty(0, dtype=float)
+    per_item = eligible.groupby("item_id", sort=False)[column].mean().to_numpy(dtype=float)
+    return float(per_item.mean()), per_item
+
+
+def _arm_accuracy(frame: pd.DataFrame, manipulation: str) -> float:
+    return _item_metric(
+        frame[frame["manipulation"].astype(str) == manipulation], "content_correct"
+    )[0]
+
+
+def _control_accuracy(control: pd.DataFrame, role: str, manipulation: str) -> float:
+    subset = control[
+        control["readout_role"].astype(str).eq(role)
+    ].drop_duplicates("work_key", keep="first")
+    analyzed = _analysis_rows(subset)
+    return _item_metric(
+        analyzed[analyzed["manipulation"].astype(str) == manipulation], "content_correct"
+    )[0]
+
+
+def select_candidate_reader(
+    scored: pd.DataFrame,
+    controls: Mapping[str, pd.DataFrame],
+) -> dict[str, object]:
+    """Select layer/L2 on layer_select only; reader_gate rows are never inspected."""
+
+    if not {"position", "label"}.issubset(controls):
+        raise ValueError("candidate selection requires position and label controls")
+    selection = scored[scored["readout_role"].astype(str) == "layer_select"].copy()
+    if selection.empty or not {"layer", "l2"}.issubset(selection.columns):
+        raise ValueError("candidate selection has no layer_select candidates")
+    candidates: list[dict[str, object]] = []
+    position_control = _control_accuracy(controls["position"], "layer_select", "position_only")
+    label_control = _control_accuracy(controls["label"], "layer_select", "label_only")
+    for (layer, l2), group in selection.groupby(["layer", "l2"], sort=True):
+        analyzed = _analysis_rows(group)
+        position_accuracy = _arm_accuracy(analyzed, "position_only")
+        label_accuracy = _arm_accuracy(analyzed, "label_only")
+        position_preference = _item_metric(
+            analyzed[analyzed["manipulation"].astype(str) == "position_only"],
+            "stable_content_preference",
+        )[0]
+        label_preference = _item_metric(
+            analyzed[analyzed["manipulation"].astype(str) == "label_only"],
+            "stable_content_preference",
+        )[0]
+        auc = _item_metric(analyzed, "within_question_auc")[0]
+        eligible = bool(
+            position_accuracy > position_control
+            and label_accuracy > label_control
+            and position_preference > 0.5
+            and label_preference > 0.5
+        )
+        candidates.append({
+            "layer": int(layer),
+            "l2": float(l2),
+            "eligible": eligible,
+            "worst_arm_accuracy": float(min(position_accuracy, label_accuracy)),
+            "position_accuracy": float(position_accuracy),
+            "label_accuracy": float(label_accuracy),
+            "position_preference": float(position_preference),
+            "label_preference": float(label_preference),
+            "within_question_auc": float(auc),
+        })
+    eligible = [candidate for candidate in candidates if candidate["eligible"]]
+    if not eligible:
+        raise ValueError("no candidate reader beats both isolated nuisance controls")
+    selected = max(
+        eligible,
+        key=lambda candidate: (
+            candidate["worst_arm_accuracy"],
+            candidate["within_question_auc"],
+            candidate["l2"],
+            -candidate["layer"],
+        ),
+    )
+    return {
+        "selected_layer": selected["layer"],
+        "selected_l2": selected["l2"],
+        "selection_items": int(selection["item_id"].nunique()),
+        "position_control_accuracy": float(position_control),
+        "label_control_accuracy": float(label_control),
+        "selected_metrics": selected,
+        "candidates": candidates,
+        "claim": "candidate_local_linear_decodability",
+    }
+
+
+def _bootstrap_metric(
+    values: np.ndarray,
+    *,
+    samples: int,
+    rng: np.random.Generator,
+) -> dict[str, float | int]:
+    if not len(values):
+        return {"point": float("nan"), "lower_95": float("nan"), "upper_95": float("nan"), "items": 0}
+    draws = values[rng.integers(0, len(values), size=(samples, len(values)))].mean(axis=1)
+    return {
+        "point": float(values.mean()),
+        "lower_95": float(np.quantile(draws, 0.025)),
+        "upper_95": float(np.quantile(draws, 0.975)),
+        "items": int(len(values)),
+    }
+
+
+def _metric_report(
+    frame: pd.DataFrame,
+    column: str,
+    *,
+    bootstrap_samples: int,
+    rng: np.random.Generator,
+) -> dict[str, float | int]:
+    _, values = _item_metric(frame, column)
+    return _bootstrap_metric(values, samples=bootstrap_samples, rng=rng)
+
+
+def _permutation_99(
+    frame: pd.DataFrame,
+    *,
+    samples: int,
+    rng: np.random.Generator,
+) -> float:
+    if frame.empty:
+        return float("nan")
+    rows = frame[["item_id", "actual_winner_content_id", "content_predicted_id"]].copy()
+    item_ids = rows["item_id"].astype(str).unique().tolist()
+    values: list[float] = []
+    for _ in range(samples):
+        offsets = dict(zip(item_ids, rng.integers(0, 4, size=len(item_ids)), strict=True))
+        permuted = (
+            rows["actual_winner_content_id"].to_numpy(dtype=int)
+            + rows["item_id"].astype(str).map(offsets).to_numpy(dtype=int)
+        ) % 4
+        correct = rows["content_predicted_id"].to_numpy(dtype=int) == permuted
+        per_item = pd.Series(correct.astype(float)).groupby(
+            rows["item_id"].astype(str).reset_index(drop=True), sort=False
+        ).mean()
+        values.append(float(per_item.mean()))
+    return float(np.quantile(values, 0.99))
+
+
+def gate_candidate_reader(
+    scored: pd.DataFrame,
+    selected: Mapping[str, object],
+    controls: Mapping[str, pd.DataFrame],
+    random_readers: Sequence[pd.DataFrame],
+    *,
+    bootstrap_samples: int = 5000,
+    permutation_samples: int = 1000,
+    seed: int = 0,
+) -> dict[str, object]:
+    """Apply the predeclared internal gate without reading the final 599 items."""
+
+    if bootstrap_samples <= 0 or permutation_samples <= 0 or len(random_readers) != 3:
+        raise ValueError("invalid candidate-reader gate configuration")
+    layer, l2 = int(selected["selected_layer"]), float(selected["selected_l2"])
+    gate = scored[
+        scored["readout_role"].astype(str).eq("reader_gate")
+        & scored["layer"].astype(int).eq(layer)
+        & np.isclose(scored["l2"].astype(float), l2)
+    ].copy()
+    if gate.empty:
+        raise ValueError("candidate-reader gate has no frozen held-out rows")
+    analyzed = _analysis_rows(gate)
+    rng = np.random.default_rng(seed)
+    arms = {
+        "overall": analyzed,
+        "position_only": analyzed[analyzed["manipulation"].astype(str) == "position_only"],
+        "label_only": analyzed[analyzed["manipulation"].astype(str) == "label_only"],
+        "incorrect_decisions": analyzed[~analyzed.get("raw_correct", pd.Series(True, index=analyzed.index)).astype(bool)],
+        "conflicts": analyzed[
+            analyzed["manipulation"].astype(str).isin(("position_only", "label_only"))
+            & ~analyzed["baseline_content_stable"].astype(bool)
+        ],
+    }
+    metrics: dict[str, object] = {}
+    for name, arm in arms.items():
+        report = _metric_report(
+            arm, "content_correct", bootstrap_samples=bootstrap_samples, rng=rng
+        )
+        report["permutation_99"] = _permutation_99(
+            arm, samples=permutation_samples, rng=rng
+        )
+        metrics[name] = report
+    for manipulation in ("position_only", "label_only"):
+        metrics[f"{manipulation}_stable_preference"] = _metric_report(
+            arms[manipulation],
+            "stable_content_preference",
+            bootstrap_samples=bootstrap_samples,
+            rng=rng,
+        )
+
+    control_reports: dict[str, dict[str, float | int]] = {}
+    control_vectors: dict[str, pd.Series] = {}
+    primary_by_key = analyzed.set_index("work_key")["content_correct"].astype(float)
+    for name, control in controls.items():
+        subset = control[control["readout_role"].astype(str).eq("reader_gate")]
+        subset = subset.drop_duplicates("work_key", keep="first")
+        controlled = _analysis_rows(subset)
+        report = _metric_report(
+            controlled, "content_correct", bootstrap_samples=bootstrap_samples, rng=rng
+        )
+        control_reports[name] = report
+        control_vectors[name] = controlled.set_index("work_key")["content_correct"].astype(float)
+    strongest_control = max(control_reports, key=lambda name: control_reports[name]["point"])
+    aligned = pd.concat(
+        [primary_by_key.rename("primary"), control_vectors[strongest_control].rename("control")],
+        axis=1,
+        join="inner",
+    ).join(analyzed.set_index("work_key")[["item_id"]]).dropna()
+    differences = aligned.assign(difference=aligned["primary"] - aligned["control"])
+    metrics["improvement_over_strongest_control"] = {
+        **_metric_report(
+            differences.reset_index(),
+            "difference",
+            bootstrap_samples=bootstrap_samples,
+            rng=rng,
+        ),
+        "control": strongest_control,
+    }
+
+    random_reports = []
+    for random_reader in random_readers:
+        subset = random_reader[random_reader["readout_role"].astype(str).eq("reader_gate")]
+        random_reports.append(_metric_report(
+            _analysis_rows(subset.drop_duplicates("work_key", keep="first")),
+            "content_correct",
+            bootstrap_samples=bootstrap_samples,
+            rng=rng,
+        ))
+    metrics["random_target_readers"] = random_reports
+
+    wrapper_reports: dict[str, object] = {}
+    for wrapper, group in analyzed.groupby("wrapper_name", sort=True):
+        report = _metric_report(group, "content_correct", bootstrap_samples=bootstrap_samples, rng=rng)
+        if int(report["items"]) >= 30:
+            wrapper_reports[str(wrapper)] = report
+    metrics["wrapper_strata"] = wrapper_reports
+
+    basic_names = ("overall", "position_only", "label_only")
+    tier_1 = all(
+        metrics[name]["lower_95"] > 0.25
+        and metrics[name]["point"] > metrics[name]["permutation_99"]
+        for name in basic_names
+    )
+    tier_1 = bool(
+        tier_1
+        and metrics["position_only_stable_preference"]["lower_95"] > 0.50
+        and metrics["label_only_stable_preference"]["lower_95"] > 0.50
+        and metrics["improvement_over_strongest_control"]["lower_95"] > 0.0
+        and metrics["incorrect_decisions"]["point"] > 0.25
+        and all(
+            report["lower_95"] <= 0.25 <= report["upper_95"] and report["point"] < 0.40
+            for report in random_reports
+        )
+    )
+    conflict = metrics["conflicts"]
+    tier_2 = bool(
+        tier_1
+        and metrics["overall"]["point"] >= 0.90
+        and metrics["overall"]["lower_95"] >= 0.85
+        and all(
+            metrics[name]["point"] >= 0.85 and metrics[name]["lower_95"] >= 0.75
+            for name in ("position_only", "label_only")
+        )
+        and all(
+            metrics[f"{name}_stable_preference"]["point"] >= 0.90
+            and metrics[f"{name}_stable_preference"]["lower_95"] >= 0.80
+            for name in ("position_only", "label_only")
+        )
+        and metrics["improvement_over_strongest_control"]["point"] >= 0.10
+        and conflict["items"] > 0
+        and conflict["point"] >= 0.85
+        and conflict["lower_95"] > 0.25
+        and all(
+            report["point"] >= 0.75 and report["lower_95"] > 0.50
+            for report in wrapper_reports.values()
+        )
+    )
+    return {
+        "schema_version": 1,
+        "claim": "candidate_local_linear_decodability",
+        "selected_layer": layer,
+        "selected_l2": l2,
+        "gate_items": int(analyzed["item_id"].nunique()),
+        "tier_1_pass": tier_1,
+        "tier_2_pass": tier_2,
+        "content_reader_usable": tier_1,
+        "patch_eligible": False,
+        "opens_final_confirmation": tier_2,
+        "metrics": metrics,
+        "controls": control_reports,
+    }

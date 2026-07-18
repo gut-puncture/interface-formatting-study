@@ -17,12 +17,15 @@ from interface_formatting_study.causal_option_maps import (
 )
 from interface_formatting_study.decision_binding_content import (
     CandidateRanker,
+    candidate_score_rows,
     capture_candidate_states,
     evaluate_candidate_ranker,
     fit_candidate_ranker,
+    gate_candidate_reader,
     locate_content_token_indices,
     metadata_candidate_features,
     prepare_candidate_sites,
+    select_candidate_reader,
 )
 
 
@@ -437,3 +440,128 @@ def test_batched_candidate_capture_matches_scalar_layer_states(tiny_hook_model):
         for layer in range(2):
             expected = direct.hidden_states[layer + 1][0, positions[row]].float()
             assert torch.allclose(captured.activations[row, layer], expected)
+
+
+def _synthetic_candidate_scores(*, role: str, weak: bool = False) -> pd.DataFrame:
+    rows = []
+    for item in range(40):
+        target = item % 4
+        for manipulation, contents, labels in (
+            ("controlled_baseline", [0, 1, 2, 3], list("ABCD")),
+            ("position_only", [3, 0, 1, 2], list("DABC")),
+            ("label_only", [0, 1, 2, 3], list("BCDA")),
+        ):
+            for layer, l2, strength in ((0, 0.01, 0.30), (1, 0.01, 0.96), (1, 0.1, 0.94)):
+                probability = np.full(4, (1.0 - strength) / 3.0)
+                predicted = target if not weak else (target + 1) % 4
+                probability[predicted] = strength
+                rows.append({
+                    "item_id": f"item-{item}",
+                    "wrapper_name": "plain",
+                    "work_key": f"{item}|{manipulation}",
+                    "readout_role": role,
+                    "manipulation": manipulation,
+                    "layer": layer,
+                    "l2": l2,
+                    "actual_winner_content_id": target,
+                    "actual_content_ids_by_position": contents,
+                    "labels_by_position": labels,
+                    "raw_correct": item % 3 != 0,
+                    "raw_margin": 0.5,
+                    **{f"content_prob_{index}": float(probability[index]) for index in range(4)},
+                })
+    return pd.DataFrame(rows)
+
+
+def test_candidate_score_rows_maps_physical_candidates_back_to_content_identity():
+    sites = pd.DataFrame({
+        "work_key": ["a"],
+        "item_id": ["item"],
+        "wrapper_name": ["plain"],
+        "readout_role": ["layer_select"],
+        "manipulation": ["position_only"],
+        "actual_winner_content_id": [2],
+        "actual_content_ids_by_position": [[3, 0, 2, 1]],
+        "labels_by_position": [list("DABC")],
+        "raw_correct": [False],
+        "raw_margin": [0.2],
+    })
+    probabilities = np.asarray([[[0.1, 0.2, 0.6, 0.1]]], dtype=np.float32)
+
+    scored = candidate_score_rows(sites, probabilities, l2=0.01, reader_name="content")
+
+    assert scored.iloc[0].content_predicted_id == 2
+    assert scored.iloc[0].content_prob_2 == pytest.approx(0.6)
+    assert scored.iloc[0].content_target_probability == pytest.approx(0.6)
+
+
+def test_selection_uses_only_layer_select_and_prefers_invariant_reader():
+    selection = _synthetic_candidate_scores(role="layer_select")
+    gate = _synthetic_candidate_scores(role="reader_gate", weak=True)
+    combined = pd.concat([selection, gate], ignore_index=True)
+    controls = {
+        "position": selection.assign(**{
+            "content_prob_0": 0.25, "content_prob_1": 0.25,
+            "content_prob_2": 0.25, "content_prob_3": 0.25,
+        }),
+        "label": selection.assign(**{
+            "content_prob_0": 0.25, "content_prob_1": 0.25,
+            "content_prob_2": 0.25, "content_prob_3": 0.25,
+        }),
+    }
+
+    selected = select_candidate_reader(combined, controls)
+
+    assert selected["selected_layer"] == 1
+    assert selected["selected_l2"] == pytest.approx(0.1)
+    assert selected["selection_items"] == 40
+    changed_gate = combined.copy()
+    mask = changed_gate["readout_role"].eq("reader_gate")
+    changed_gate.loc[mask, [f"content_prob_{index}" for index in range(4)]] = 0.25
+    assert select_candidate_reader(changed_gate, controls) == selected
+
+
+def test_gate_reports_tier_one_only_for_held_out_decodability():
+    gate = _synthetic_candidate_scores(role="reader_gate")
+    selected = {"selected_layer": 1, "selected_l2": 0.1}
+    controls = {
+        name: gate.assign(**{
+            "content_prob_0": 0.25, "content_prob_1": 0.25,
+            "content_prob_2": 0.25, "content_prob_3": 0.25,
+        })
+        for name in ("position", "label", "position_label", "answer_length")
+    }
+    random_readers = [controls["position"].copy() for _ in range(3)]
+
+    report = gate_candidate_reader(
+        gate,
+        selected,
+        controls,
+        random_readers,
+        bootstrap_samples=300,
+        permutation_samples=100,
+        seed=9,
+    )
+
+    assert report["tier_1_pass"] is True
+    assert report["claim"] == "candidate_local_linear_decodability"
+    assert report["opens_final_confirmation"] is report["tier_2_pass"]
+    assert report["metrics"]["overall"]["lower_95"] > 0.25
+    assert report["metrics"]["incorrect_decisions"]["point"] > 0.25
+
+    weak = gate.copy()
+    probabilities = np.full((len(weak), 4), 0.01)
+    targets = weak["actual_winner_content_id"].to_numpy(int)
+    probabilities[np.arange(len(weak)), (targets + 1) % 4] = 0.97
+    for index in range(4):
+        weak[f"content_prob_{index}"] = probabilities[:, index]
+    failed = gate_candidate_reader(
+        weak,
+        selected,
+        controls,
+        random_readers,
+        bootstrap_samples=100,
+        permutation_samples=50,
+        seed=9,
+    )
+    assert failed["tier_1_pass"] is False

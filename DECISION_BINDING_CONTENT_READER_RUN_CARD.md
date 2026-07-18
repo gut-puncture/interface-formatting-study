@@ -4,10 +4,10 @@
 
 - Existing path reused: exact stored prompts, finalized audited option maps, discovery splits, model loaders, all-layer capture, atomic shards, semantic identity, GPU operator, artifact fetch, and checksum verification.
 - New production code: one narrow candidate-local ranker is required because the completed common-checkpoint content classifier did not independently identify answer content.
-- Expected scope: one focused domain module, a narrow CLI/operator extension, and focused tests; about 600-750 net production lines and four to six local implementation hours. The owner approved this revised ceiling after exact all-row endpoint binding required 416 lines by itself.
+- Expected scope: one focused domain module, a narrow CLI/operator extension, and focused tests. There is no hard line-count stop; keep every addition necessary, simple, and inside this experiment only.
 - Review: exactly two independent reviewers, one for scientific/data semantics and one for runtime/resume/operator behavior; maximum two review rounds.
 - Final validation: one full local suite after review closes; first real proof is a small Mistral canary followed by the full Mistral discovery gate only if the canary is exact.
-- Deviation gate: pause before 750 net production lines, six implementation hours before review, a second new production module, any change to stored prompts/audits/splits, or any redesign of the existing decision-binding architecture.
+- Deviation gate: pause only for a second new production subsystem, any change to stored prompts/audits/splits, or any redesign of the existing decision-binding architecture—not for an arbitrary line count.
 
 ## Source Truth Read
 
@@ -94,4 +94,4 @@
 - Review rejection flags: prompt-byte drift; source/audit mismatch; position/label leakage presented as content; data leakage across roles; final set read before freeze; silent exclusions; checkpoint mismatch; non-reproducible selection; stale resume; missing teardown; or any causal claim.
 - Evidence for Shailesh: exact row/item counts, zero silent prompt loss, sample endpoint audit, selected layer/L2 and frozen hash, control comparison, gate report with confidence intervals, exact cost/runtime, checksums, and final empty task-owned inventory.
 - Update `README.md` and operator/reproducibility documentation only after final validation and real-run outcome. Do not edit the paper in this task.
-- Stop for missing source truth, an irreproducible stored winner, any required architecture redesign, more than the scoped production size/time, a second material defect in the same design class, materially higher paid forecast, or inability to monitor/fetch/terminate safely.
+- Stop for missing source truth, an irreproducible stored winner, any required architecture redesign, a second material defect in the same design class, materially higher paid forecast, or inability to monitor/fetch/terminate safely.
