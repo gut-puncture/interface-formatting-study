@@ -800,7 +800,7 @@ def candidate_score_rows(
                 "work_key", "item_id", "subject", "wrapper_name", "readout_role",
                 "manipulation", "variant", "actual_winner_content_id",
                 "actual_content_ids_by_position", "labels_by_position", "raw_correct",
-                "raw_margin",
+                "raw_margin", "content_target_evaluable",
             )
             if key in row
         }
@@ -828,6 +828,28 @@ def candidate_score_rows(
     ).reset_index(drop=True)
 
 
+def majority_candidate_scores(
+    sites: pd.DataFrame,
+    training_content_targets: Sequence[int] | np.ndarray,
+) -> pd.DataFrame:
+    """Score every candidate with the training-only target-frequency baseline."""
+
+    targets = np.asarray(training_content_targets, dtype=int)
+    if not len(targets) or np.any((targets < 0) | (targets > 3)):
+        raise ValueError("majority control requires valid training content targets")
+    distribution = np.bincount(targets, minlength=4).astype(np.float64)
+    distribution /= distribution.sum()
+    physical = np.empty((len(sites), 1, 4), dtype=np.float64)
+    for row_index, contents in enumerate(sites["actual_content_ids_by_position"]):
+        mapping = [int(value) for value in _sequence(contents, name="actual_content_ids_by_position")]
+        if sorted(mapping) != [0, 1, 2, 3]:
+            raise ValueError("majority control requires permutation content mappings")
+        physical[row_index, 0] = distribution[mapping]
+    return candidate_score_rows(
+        sites, physical, l2=1.0, reader_name="majority"
+    )
+
+
 _PROBABILITY_COLUMNS = tuple(f"content_prob_{content_id}" for content_id in range(4))
 
 
@@ -849,8 +871,13 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
     if np.any((targets < 0) | (targets > 3)):
         raise ValueError("candidate analysis targets are invalid")
     predictions = probabilities.argmax(axis=1)
+    evaluable = (
+        scored["content_target_evaluable"].astype(bool).to_numpy()
+        if "content_target_evaluable" in scored
+        else np.ones(len(scored), dtype=bool)
+    )
     scored["content_predicted_id"] = predictions
-    scored["content_correct"] = predictions == targets
+    scored["content_correct"] = np.where(evaluable, predictions == targets, np.nan)
     target_probability = probabilities[np.arange(len(scored)), targets]
     pairwise = np.empty(len(scored), dtype=float)
     for index, (scores, target) in enumerate(zip(probabilities, targets, strict=True)):
@@ -858,10 +885,10 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
             1.0 if scores[target] > scores[other] else 0.5 if scores[target] == scores[other] else 0.0
             for other in range(4) if other != target
         ]
-        pairwise[index] = float(np.mean(comparisons))
+        pairwise[index] = float(np.mean(comparisons)) if evaluable[index] else np.nan
     scored["within_question_auc"] = pairwise
 
-    baseline_columns: dict[tuple[str, str], tuple[int, int, str]] = {}
+    baseline_columns: dict[tuple[str, str], tuple[int, int, str, bool]] = {}
     for key, group in scored.groupby(["item_id", "wrapper_name"], sort=False):
         baseline = group[group["manipulation"].astype(str) == "controlled_baseline"]
         if len(baseline) != 1:
@@ -874,18 +901,22 @@ def _analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
         labels = [str(value) for value in _sequence(row["labels_by_position"], name="labels")]
         target_position = contents.index(target)
         baseline_columns[(str(key[0]), str(key[1]))] = (
-            target, target_position, labels[target_position]
+            target,
+            target_position,
+            labels[target_position],
+            bool(row.get("content_target_evaluable", True)),
         )
 
     stable: list[bool] = []
     nuisance_ids: list[int | None] = []
     preferences: list[bool | None] = []
     for row, scores in zip(scored.to_dict("records"), probabilities, strict=True):
-        baseline_target, baseline_position, baseline_label = baseline_columns[
+        baseline_target, baseline_position, baseline_label, baseline_evaluable = baseline_columns[
             (str(row["item_id"]), str(row["wrapper_name"]))
         ]
         target = int(row["actual_winner_content_id"])
-        is_stable = target == baseline_target
+        row_evaluable = bool(row.get("content_target_evaluable", True))
+        is_stable = baseline_evaluable and row_evaluable and target == baseline_target
         contents = [int(value) for value in _sequence(
             row["actual_content_ids_by_position"], name="actual_content_ids_by_position"
         )]
@@ -1053,21 +1084,23 @@ def _permutation_99(
 ) -> float:
     if frame.empty:
         return float("nan")
-    rows = frame[["item_id", "actual_winner_content_id", "content_predicted_id"]].copy()
+    rows = frame.dropna(subset=["content_correct"])[
+        ["item_id", "actual_winner_content_id", "content_predicted_id"]
+    ].copy()
+    if rows.empty:
+        return float("nan")
     item_ids = rows["item_id"].astype(str).unique().tolist()
-    values: list[float] = []
-    for _ in range(samples):
-        offsets = dict(zip(item_ids, rng.integers(0, 4, size=len(item_ids)), strict=True))
-        permuted = (
-            rows["actual_winner_content_id"].to_numpy(dtype=int)
-            + rows["item_id"].astype(str).map(offsets).to_numpy(dtype=int)
-        ) % 4
-        correct = rows["content_predicted_id"].to_numpy(dtype=int) == permuted
-        per_item = pd.Series(correct.astype(float)).groupby(
-            rows["item_id"].astype(str).reset_index(drop=True), sort=False
-        ).mean()
-        values.append(float(per_item.mean()))
-    return float(np.quantile(values, 0.99))
+    item_index = {item_id: index for index, item_id in enumerate(item_ids)}
+    correct_by_offset = np.empty((len(item_ids), 4), dtype=float)
+    for item_id, group in rows.groupby(rows["item_id"].astype(str), sort=False):
+        target = group["actual_winner_content_id"].to_numpy(dtype=int)
+        prediction = group["content_predicted_id"].to_numpy(dtype=int)
+        correct_by_offset[item_index[str(item_id)]] = [
+            np.mean(prediction == ((target + offset) % 4)) for offset in range(4)
+        ]
+    offsets = rng.integers(0, 4, size=(samples, len(item_ids)))
+    draws = correct_by_offset[np.arange(len(item_ids))[None, :], offsets].mean(axis=1)
+    return float(np.quantile(draws, 0.99))
 
 
 def gate_candidate_reader(
@@ -1079,10 +1112,17 @@ def gate_candidate_reader(
     bootstrap_samples: int = 5000,
     permutation_samples: int = 1000,
     seed: int = 0,
+    parity: Mapping[str, bool] | None = None,
 ) -> dict[str, object]:
     """Apply the predeclared internal gate without reading the final 599 items."""
 
-    if bootstrap_samples <= 0 or permutation_samples <= 0 or len(random_readers) != 3:
+    parity_receipt = dict(parity or {})
+    if (
+        bootstrap_samples <= 0
+        or permutation_samples <= 0
+        or len(random_readers) != 3
+        or set(parity_receipt) != {"save_load", "batch", "seed"}
+    ):
         raise ValueError("invalid candidate-reader gate configuration")
     layer, l2 = int(selected["selected_layer"]), float(selected["selected_l2"])
     gate = scored[
@@ -1136,7 +1176,19 @@ def gate_candidate_reader(
         )
         control_reports[name] = report
         control_vectors[name] = controlled.set_index("work_key")["content_correct"].astype(float)
-    strongest_control = max(control_reports, key=lambda name: control_reports[name]["point"])
+    isolated_control_points = {}
+    for name, control in controls.items():
+        subset = control[control["readout_role"].astype(str).eq("reader_gate")].drop_duplicates(
+            "work_key", keep="first"
+        )
+        control_analysis = _analysis_rows(subset)
+        isolated_control = control_analysis[
+            control_analysis["manipulation"].astype(str).isin(("position_only", "label_only"))
+        ]
+        isolated_control_points[name] = _item_metric(
+            isolated_control, "content_correct"
+        )[0]
+    strongest_control = max(isolated_control_points, key=isolated_control_points.get)
     aligned = pd.concat(
         [primary_by_key.rename("primary"), control_vectors[strongest_control].rename("control")],
         axis=1,
@@ -1182,7 +1234,7 @@ def gate_candidate_reader(
         and metrics["position_only_stable_preference"]["lower_95"] > 0.50
         and metrics["label_only_stable_preference"]["lower_95"] > 0.50
         and metrics["improvement_over_strongest_control"]["lower_95"] > 0.0
-        and metrics["incorrect_decisions"]["point"] > 0.25
+        and metrics["incorrect_decisions"]["lower_95"] > 0.25
         and all(
             report["lower_95"] <= 0.25 <= report["upper_95"] and report["point"] < 0.40
             for report in random_reports
@@ -1203,6 +1255,7 @@ def gate_candidate_reader(
             for name in ("position_only", "label_only")
         )
         and metrics["improvement_over_strongest_control"]["point"] >= 0.10
+        and all(parity_receipt.values())
         and conflict["items"] > 0
         and conflict["point"] >= 0.85
         and conflict["lower_95"] > 0.25
@@ -1222,6 +1275,7 @@ def gate_candidate_reader(
         "content_reader_usable": tier_1,
         "patch_eligible": False,
         "opens_final_confirmation": tier_2,
+        "parity": parity_receipt,
         "metrics": metrics,
         "controls": control_reports,
     }

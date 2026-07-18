@@ -6,7 +6,9 @@ import pandas as pd
 import pytest
 
 from interface_formatting_study.decision_binding_content_cli import (
+    _load_activation_shard,
     _load_prepared_bundle,
+    _save_activation_shard,
     _select_canary_sites,
     build_parser,
     verify_run_root,
@@ -73,7 +75,11 @@ def test_canary_sampling_is_role_balanced_and_never_changes_source_rows():
                     "item_id": f"{role}|{item}",
                     "readout_role": role,
                     "variant": variant,
-                    "prompt": f"exact-{role}-{item}-{variant}",
+                    "prompt": (
+                        f"exact-{role}-{item}-{variant}-" + ("λ" if item == 1 else "")
+                        + ("x" * 200 if item == 2 else "")
+                    ),
+                    "candidate_texts": ["one", "two words", "three", "four"],
                 })
     sites = pd.DataFrame(rows)
 
@@ -86,6 +92,25 @@ def test_canary_sampling_is_role_balanced_and_never_changes_source_rows():
     }
     expected = sites.set_index("work_key")["prompt"]
     assert all(expected[row.work_key] == row.prompt for row in canary.itertuples())
+    assert canary["prompt"].str.contains("λ").any()
+    assert canary["prompt"].str.len().max() > 200
+
+
+def test_activation_shards_are_identity_and_checksum_bound(tmp_path):
+    path = tmp_path / "capture.pt"
+    values = __import__("torch").arange(24).reshape(1, 2, 4, 3)
+    _save_activation_shard(
+        path, activations=values, work_keys=["work"], semantic_sha256="a" * 64
+    )
+
+    loaded = _load_activation_shard(
+        path, work_keys=["work"], semantic_sha256="a" * 64
+    )
+
+    assert loaded.equal(values)
+    path.write_bytes(path.read_bytes() + b"corrupt")
+    with pytest.raises(RuntimeError, match="checksum"):
+        _load_activation_shard(path, work_keys=["work"], semantic_sha256="a" * 64)
 
 
 def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
@@ -103,10 +128,29 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         "opens_final_confirmation": False,
     }
     (tmp_path / "gate_report.json").write_text(json.dumps(gate))
-    artifact = {
-        "sha256": sha256_file(tmp_path / "gate_report.json"),
-        "bytes": (tmp_path / "gate_report.json").stat().st_size,
-    }
+    (tmp_path / "frozen_selection.json").write_text("{}")
+    (tmp_path / "ranker_manifest.json").write_text(json.dumps({
+        "schema_version": 1, "semantic_sha256": "a" * 64, "rankers": {},
+    }))
+    scores = pd.DataFrame({
+        "work_key": ["a"], "reader_name": ["content"], "l2": [0.1],
+        "layer": [1], "readout_role": ["layer_select"],
+    })
+    scores.to_parquet(tmp_path / "layer_select_scores.parquet", index=False)
+    controls = scores.assign(reader_name="majority")
+    controls.to_parquet(tmp_path / "layer_select_control_scores.parquet", index=False)
+    names = [
+        "semantic_identity.json", "frozen_selection.json", "gate_report.json",
+        "ranker_manifest.json", "layer_select_scores.parquet",
+        "layer_select_control_scores.parquet",
+    ]
+    artifacts = {}
+    for name in names:
+        path = tmp_path / name
+        artifacts[name] = {"sha256": sha256_file(path), "bytes": path.stat().st_size}
+        if path.suffix == ".parquet":
+            artifacts[name]["rows"] = 1
+            artifacts[name]["work_keys"] = 1
     manifest = {
         "status": "content_readout_complete",
         "semantic_identity": identity,
@@ -116,13 +160,25 @@ def test_run_verifier_checks_identity_artifacts_and_claim_boundary(tmp_path):
         "tier_2_pass": False,
         "patch_eligible": False,
         "final_confirmation_opened": False,
-        "artifacts": {"gate_report.json": artifact},
+        "reader_gate_opened": False,
+        "artifacts": artifacts,
     }
     (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
 
     verified = verify_run_root(tmp_path, expected_run_id="run-id", mode="complete")
 
     assert verified["status"] == "content_readout_complete"
+    complete_artifacts = dict(artifacts)
+    manifest["artifacts"] = {
+        name: receipt
+        for name, receipt in complete_artifacts.items()
+        if name != "frozen_selection.json"
+    }
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match="required artifacts"):
+        verify_run_root(tmp_path, expected_run_id="run-id", mode="complete")
+    manifest["artifacts"] = complete_artifacts
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
     (tmp_path / "gate_report.json").write_text("{}")
     with pytest.raises(RuntimeError, match="checksum"):
         verify_run_root(tmp_path, expected_run_id="run-id", mode="complete")

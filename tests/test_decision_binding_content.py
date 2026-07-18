@@ -23,6 +23,7 @@ from interface_formatting_study.decision_binding_content import (
     fit_candidate_ranker,
     gate_candidate_reader,
     locate_content_token_indices,
+    majority_candidate_scores,
     metadata_candidate_features,
     prepare_candidate_sites,
     load_candidate_ranker,
@@ -502,6 +503,7 @@ def _synthetic_candidate_scores(*, role: str, weak: bool = False) -> pd.DataFram
                     "labels_by_position": labels,
                     "raw_correct": item % 3 != 0,
                     "raw_margin": 0.5,
+                    "content_target_evaluable": True,
                     **{f"content_prob_{index}": float(probability[index]) for index in range(4)},
                 })
     return pd.DataFrame(rows)
@@ -527,6 +529,25 @@ def test_candidate_score_rows_maps_physical_candidates_back_to_content_identity(
     assert scored.iloc[0].content_predicted_id == 2
     assert scored.iloc[0].content_prob_2 == pytest.approx(0.6)
     assert scored.iloc[0].content_target_probability == pytest.approx(0.6)
+
+
+def test_majority_control_uses_training_targets_without_position_leakage():
+    sites = pd.DataFrame({
+        "work_key": ["a", "b"],
+        "item_id": ["a", "b"],
+        "wrapper_name": ["plain", "plain"],
+        "readout_role": ["layer_select", "layer_select"],
+        "manipulation": ["controlled_baseline", "controlled_baseline"],
+        "actual_winner_content_id": [2, 2],
+        "actual_content_ids_by_position": [[0, 1, 2, 3], [2, 3, 0, 1]],
+        "labels_by_position": [list("ABCD"), list("CDAB")],
+        "content_target_evaluable": [True, True],
+    })
+
+    scored = majority_candidate_scores(sites, [2, 2, 1])
+
+    assert scored["content_predicted_id"].tolist() == [2, 2]
+    assert scored["content_prob_2"].tolist() == pytest.approx([2 / 3, 2 / 3])
 
 
 def test_selection_uses_only_layer_select_and_prefers_invariant_reader():
@@ -560,6 +581,11 @@ def test_selection_uses_only_layer_select_and_prefers_invariant_reader():
     canary_selection = select_candidate_reader(weak, controls, allow_ineligible=True)
     assert canary_selection["selection_eligible"] is False
 
+    mixed = selection.copy()
+    baseline = mixed["manipulation"].eq("controlled_baseline") & mixed["item_id"].eq("item-0")
+    mixed.loc[baseline, "content_target_evaluable"] = False
+    assert select_candidate_reader(mixed, controls)["selected_layer"] == 1
+
 
 def test_gate_reports_tier_one_only_for_held_out_decodability():
     gate = _synthetic_candidate_scores(role="reader_gate")
@@ -569,7 +595,7 @@ def test_gate_reports_tier_one_only_for_held_out_decodability():
             "content_prob_0": 0.25, "content_prob_1": 0.25,
             "content_prob_2": 0.25, "content_prob_3": 0.25,
         })
-        for name in ("position", "label", "position_label", "answer_length")
+        for name in ("majority", "position", "label", "position_label", "answer_length")
     }
     random_readers = [controls["position"].copy() for _ in range(3)]
 
@@ -581,6 +607,7 @@ def test_gate_reports_tier_one_only_for_held_out_decodability():
         bootstrap_samples=300,
         permutation_samples=100,
         seed=9,
+        parity={"save_load": True, "batch": True, "seed": True},
     )
 
     assert report["tier_1_pass"] is True
@@ -603,5 +630,48 @@ def test_gate_reports_tier_one_only_for_held_out_decodability():
         bootstrap_samples=100,
         permutation_samples=50,
         seed=9,
+        parity={"save_load": True, "batch": True, "seed": True},
     )
     assert failed["tier_1_pass"] is False
+
+
+def test_tier_two_requires_all_bound_parity_receipts():
+    gate = _synthetic_candidate_scores(role="reader_gate")
+    for item in range(0, 40, 2):
+        mask = gate["item_id"].eq(f"item-{item}") & gate["manipulation"].isin(
+            ["position_only", "label_only"]
+        )
+        target = (item % 4 + 1) % 4
+        gate.loc[mask, "actual_winner_content_id"] = target
+        gate.loc[mask, [f"content_prob_{index}" for index in range(4)]] = 0.01
+        gate.loc[mask, f"content_prob_{target}"] = 0.97
+    controls = {
+        name: gate.assign(**{
+            "content_prob_0": 0.25, "content_prob_1": 0.25,
+            "content_prob_2": 0.25, "content_prob_3": 0.25,
+        })
+        for name in ("majority", "position", "label", "position_label", "answer_length")
+    }
+    random_frame = gate.copy()
+    random_frame[[f"content_prob_{index}" for index in range(4)]] = 0.01
+    for row_index, row in random_frame.iterrows():
+        item_index = int(str(row["item_id"]).split("-")[-1])
+        predicted = (int(row["actual_winner_content_id"]) + item_index % 4) % 4
+        random_frame.at[row_index, f"content_prob_{predicted}"] = 0.97
+    random_readers = [random_frame.copy() for _ in range(3)]
+    selected = {"selected_layer": 1, "selected_l2": 0.1}
+
+    passed = gate_candidate_reader(
+        gate, selected, controls, random_readers,
+        bootstrap_samples=200, permutation_samples=80, seed=4,
+        parity={"save_load": True, "batch": True, "seed": True},
+    )
+    failed = gate_candidate_reader(
+        gate, selected, controls, random_readers,
+        bootstrap_samples=200, permutation_samples=80, seed=4,
+        parity={"save_load": True, "batch": False, "seed": True},
+    )
+
+    assert passed["tier_2_pass"] is True
+    assert failed["tier_2_pass"] is False
+    assert failed["opens_final_confirmation"] is False
