@@ -221,6 +221,7 @@ def test_gpu_bootstrap_supports_plain_ubuntu_without_changing_the_runtime_contra
     assert '"$PYTHON_BIN" -m interface_formatting_study.decision_binding_content_cli' in run
     assert 'BATCH_SIZE:-32' in run
     assert 'MAX_BATCH_TOKENS:-40000' in run
+    assert 'MAX_ITER:-100' in run
     assert 'torch.__version__.split("+")[0] == "2.7.1"' in bootstrap
     assert 'torch.version.cuda == "12.6"' in bootstrap
 

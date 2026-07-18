@@ -17,6 +17,7 @@ ARGS=(
   --batch-size "${BATCH_SIZE:-32}"
   --max-batch-tokens "${MAX_BATCH_TOKENS:-40000}"
   --capture-chunk-size "${CAPTURE_CHUNK_SIZE:-64}"
+  --max-iter "${MAX_ITER:-100}"
   --local-files-only
 )
 if [[ "$MODE" == "functional" ]]; then
