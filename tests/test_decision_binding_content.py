@@ -25,6 +25,8 @@ from interface_formatting_study.decision_binding_content import (
     locate_content_token_indices,
     metadata_candidate_features,
     prepare_candidate_sites,
+    load_candidate_ranker,
+    save_candidate_ranker,
     select_candidate_reader,
 )
 
@@ -358,7 +360,7 @@ def test_shared_candidate_ranker_recovers_known_direction_without_position_ident
     for item, target in enumerate(targets):
         values[item, 1, target] += 4.0 * direction
 
-    ranker = fit_candidate_ranker(values, targets, l2=1e-2, max_iter=80)
+    ranker = fit_candidate_ranker(values, targets, l2=1e-2, max_iter=80, device="cpu")
     probabilities = evaluate_candidate_ranker(ranker, values)
 
     assert isinstance(ranker, CandidateRanker)
@@ -380,6 +382,24 @@ def test_shared_candidate_ranker_is_invariant_to_per_item_common_activation_shif
     after = evaluate_candidate_ranker(ranker, values + common)
 
     np.testing.assert_allclose(before, after, atol=1e-5)
+
+
+def test_candidate_ranker_save_load_preserves_scores_and_identity(tmp_path):
+    generator = np.random.default_rng(19)
+    values = generator.normal(size=(24, 2, 4, 5)).astype(np.float32)
+    targets = generator.integers(0, 4, size=24)
+    ranker = fit_candidate_ranker(values, targets, l2=0.01, max_iter=30)
+    path = tmp_path / "ranker.npz"
+
+    save_candidate_ranker(path, ranker, semantic_sha256="a" * 64)
+    loaded = load_candidate_ranker(path, semantic_sha256="a" * 64)
+
+    np.testing.assert_allclose(
+        evaluate_candidate_ranker(ranker, values),
+        evaluate_candidate_ranker(loaded, values),
+    )
+    with pytest.raises(ValueError, match="semantic identity"):
+        load_candidate_ranker(path, semantic_sha256="b" * 64)
 
 
 def test_metadata_controls_encode_only_the_declared_nuisance():
@@ -519,6 +539,12 @@ def test_selection_uses_only_layer_select_and_prefers_invariant_reader():
     mask = changed_gate["readout_role"].eq("reader_gate")
     changed_gate.loc[mask, [f"content_prob_{index}" for index in range(4)]] = 0.25
     assert select_candidate_reader(changed_gate, controls) == selected
+
+    weak = _synthetic_candidate_scores(role="layer_select", weak=True)
+    with pytest.raises(ValueError, match="beats both isolated"):
+        select_candidate_reader(weak, controls)
+    canary_selection = select_candidate_reader(weak, controls, allow_ineligible=True)
+    assert canary_selection["selection_eligible"] is False
 
 
 def test_gate_reports_tier_one_only_for_held_out_decodability():

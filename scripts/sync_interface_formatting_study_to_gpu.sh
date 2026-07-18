@@ -73,6 +73,9 @@ rsync -az --delete \
   --include '/scripts/control_causal_followup_gpu.sh' \
   --include '/scripts/run_decision_binding_gpu.sh' \
   --include '/scripts/control_decision_binding_gpu.sh' \
+  --include '/scripts/run_decision_binding_content_gpu.sh' \
+  --include '/scripts/control_decision_binding_content_gpu.sh' \
+  --include '/scripts/fetch_decision_binding_content_artifacts.sh' \
   --include '/scripts/cache_causal_models.py' \
   --exclude '*' \
   -e "${RSYNC_RSH[*]}" \
@@ -86,6 +89,14 @@ if [[ -f "${ACTIVE_DATASET_PATH}.manifest.json" ]]; then
   rsync -az --relative \
     -e "${RSYNC_RSH[*]}" \
     "${ROOT_DIR}/./${ACTIVE_DATASET}.manifest.json" \
+    "${REMOTE}:${REMOTE_DIR}/"
+fi
+PREPARED_MANIFEST_PATH="$(dirname "$ACTIVE_DATASET_PATH")/prepared_manifest.json"
+if [[ -f "$PREPARED_MANIFEST_PATH" ]]; then
+  PREPARED_MANIFEST_RELATIVE="${PREPARED_MANIFEST_PATH#"${ROOT_DIR}/"}"
+  rsync -az --relative \
+    -e "${RSYNC_RSH[*]}" \
+    "${ROOT_DIR}/./${PREPARED_MANIFEST_RELATIVE}" \
     "${REMOTE}:${REMOTE_DIR}/"
 fi
 APPLICABILITY_PATH="${ACTIVE_DATASET_PATH%.*}.applicability.parquet"

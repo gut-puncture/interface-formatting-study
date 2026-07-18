@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
+import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -573,11 +577,13 @@ def fit_candidate_ranker(
     *,
     l2: float,
     max_iter: int = 100,
+    device: str | torch.device | None = None,
 ) -> CandidateRanker:
     """Fit one shared no-intercept option scorer independently at every layer."""
 
-    values = torch.as_tensor(activations, dtype=torch.float32)
-    targets = torch.as_tensor(target_positions, dtype=torch.long)
+    fit_device = torch.device(device) if device is not None else torch.device("cpu")
+    values = torch.as_tensor(activations, dtype=torch.float32, device=fit_device)
+    targets = torch.as_tensor(target_positions, dtype=torch.long, device=fit_device)
     if (
         values.ndim != 4
         or values.shape[2] != 4
@@ -593,7 +599,10 @@ def fit_candidate_ranker(
     rms = centered.square().mean(dim=(0, 2, 3)).sqrt().clamp_min(1e-8)
     normalized = centered / rms[None, :, None, None]
     weights = torch.zeros(
-        (values.shape[1], values.shape[3]), dtype=torch.float32, requires_grad=True
+        (values.shape[1], values.shape[3]),
+        dtype=torch.float32,
+        device=fit_device,
+        requires_grad=True,
     )
     optimizer = torch.optim.LBFGS(
         [weights],
@@ -657,6 +666,60 @@ def evaluate_candidate_ranker(
     probabilities = np.exp(scores)
     probabilities /= probabilities.sum(axis=2, keepdims=True)
     return probabilities
+
+
+def save_candidate_ranker(
+    path: str | Path,
+    ranker: CandidateRanker,
+    *,
+    semantic_sha256: str,
+) -> None:
+    destination = Path(path)
+    if len(semantic_sha256) != 64:
+        raise ValueError("candidate ranker requires a full semantic identity hash")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    metadata = json.dumps({
+        "schema_version": 1,
+        "semantic_sha256": semantic_sha256,
+        "l2": ranker.l2,
+        "training_loss": ranker.training_loss,
+        "iterations": ranker.iterations,
+    }, sort_keys=True)
+    with temporary.open("wb") as handle:
+        np.savez(handle, weights=ranker.weights, rms=ranker.rms, metadata=metadata)
+    os.replace(temporary, destination)
+
+
+def load_candidate_ranker(
+    path: str | Path,
+    *,
+    semantic_sha256: str,
+) -> CandidateRanker:
+    with np.load(Path(path), allow_pickle=False) as stored:
+        metadata = json.loads(str(stored["metadata"].item()))
+        weights = np.asarray(stored["weights"], dtype=np.float32)
+        rms = np.asarray(stored["rms"], dtype=np.float32)
+    if (
+        metadata.get("schema_version") != 1
+        or metadata.get("semantic_sha256") != semantic_sha256
+    ):
+        raise ValueError("candidate ranker semantic identity mismatch")
+    if (
+        weights.ndim != 2
+        or rms.shape != (weights.shape[0],)
+        or not np.isfinite(weights).all()
+        or not np.isfinite(rms).all()
+        or np.any(rms <= 0)
+    ):
+        raise ValueError("candidate ranker artifact is malformed")
+    return CandidateRanker(
+        weights=weights,
+        rms=rms,
+        l2=float(metadata["l2"]),
+        training_loss=float(metadata["training_loss"]),
+        iterations=int(metadata["iterations"]),
+    )
 
 
 def metadata_candidate_features(frame: pd.DataFrame) -> dict[str, np.ndarray]:
@@ -727,6 +790,16 @@ def candidate_score_rows(
         ]
         if sorted(contents) != [0, 1, 2, 3]:
             raise ValueError("candidate score content mapping is not a permutation")
+        metadata = {
+            key: row[key]
+            for key in (
+                "work_key", "item_id", "subject", "wrapper_name", "readout_role",
+                "manipulation", "variant", "actual_winner_content_id",
+                "actual_content_ids_by_position", "labels_by_position", "raw_correct",
+                "raw_margin",
+            )
+            if key in row
+        }
         for layer in range(values.shape[1]):
             content_probabilities = np.empty(4, dtype=np.float64)
             for position, content_id in enumerate(contents):
@@ -735,7 +808,7 @@ def candidate_score_rows(
             if target not in range(4):
                 raise ValueError("candidate score target is outside [0, 3]")
             records.append({
-                **row,
+                **metadata,
                 "reader_name": str(reader_name),
                 "layer": int(layer),
                 "l2": float(l2),
@@ -860,6 +933,8 @@ def _control_accuracy(control: pd.DataFrame, role: str, manipulation: str) -> fl
 def select_candidate_reader(
     scored: pd.DataFrame,
     controls: Mapping[str, pd.DataFrame],
+    *,
+    allow_ineligible: bool = False,
 ) -> dict[str, object]:
     """Select layer/L2 on layer_select only; reader_gate rows are never inspected."""
 
@@ -869,8 +944,11 @@ def select_candidate_reader(
     if selection.empty or not {"layer", "l2"}.issubset(selection.columns):
         raise ValueError("candidate selection has no layer_select candidates")
     candidates: list[dict[str, object]] = []
-    position_control = _control_accuracy(controls["position"], "layer_select", "position_only")
-    label_control = _control_accuracy(controls["label"], "layer_select", "label_only")
+    control_accuracy = {
+        (control, arm): _control_accuracy(controls[control], "layer_select", arm)
+        for control in ("position", "label")
+        for arm in ("position_only", "label_only")
+    }
     for (layer, l2), group in selection.groupby(["layer", "l2"], sort=True):
         analyzed = _analysis_rows(group)
         position_accuracy = _arm_accuracy(analyzed, "position_only")
@@ -885,8 +963,14 @@ def select_candidate_reader(
         )[0]
         auc = _item_metric(analyzed, "within_question_auc")[0]
         eligible = bool(
-            position_accuracy > position_control
-            and label_accuracy > label_control
+            position_accuracy > max(
+                control_accuracy[("position", "position_only")],
+                control_accuracy[("label", "position_only")],
+            )
+            and label_accuracy > max(
+                control_accuracy[("position", "label_only")],
+                control_accuracy[("label", "label_only")],
+            )
             and position_preference > 0.5
             and label_preference > 0.5
         )
@@ -902,10 +986,11 @@ def select_candidate_reader(
             "within_question_auc": float(auc),
         })
     eligible = [candidate for candidate in candidates if candidate["eligible"]]
-    if not eligible:
+    if not eligible and not allow_ineligible:
         raise ValueError("no candidate reader beats both isolated nuisance controls")
+    selection_pool = eligible or candidates
     selected = max(
-        eligible,
+        selection_pool,
         key=lambda candidate: (
             candidate["worst_arm_accuracy"],
             candidate["within_question_auc"],
@@ -916,9 +1001,12 @@ def select_candidate_reader(
     return {
         "selected_layer": selected["layer"],
         "selected_l2": selected["l2"],
+        "selection_eligible": bool(selected["eligible"]),
         "selection_items": int(selection["item_id"].nunique()),
-        "position_control_accuracy": float(position_control),
-        "label_control_accuracy": float(label_control),
+        "control_accuracy": {
+            f"{control}:{arm}": float(value)
+            for (control, arm), value in control_accuracy.items()
+        },
         "selected_metrics": selected,
         "candidates": candidates,
         "claim": "candidate_local_linear_decodability",
@@ -1031,7 +1119,10 @@ def gate_candidate_reader(
 
     control_reports: dict[str, dict[str, float | int]] = {}
     control_vectors: dict[str, pd.Series] = {}
-    primary_by_key = analyzed.set_index("work_key")["content_correct"].astype(float)
+    isolated = analyzed[analyzed["manipulation"].astype(str).isin(
+        ("position_only", "label_only")
+    )]
+    primary_by_key = isolated.set_index("work_key")["content_correct"].astype(float)
     for name, control in controls.items():
         subset = control[control["readout_role"].astype(str).eq("reader_gate")]
         subset = subset.drop_duplicates("work_key", keep="first")
@@ -1046,7 +1137,7 @@ def gate_candidate_reader(
         [primary_by_key.rename("primary"), control_vectors[strongest_control].rename("control")],
         axis=1,
         join="inner",
-    ).join(analyzed.set_index("work_key")[["item_id"]]).dropna()
+    ).join(isolated.set_index("work_key")[["item_id"]]).dropna()
     differences = aligned.assign(difference=aligned["primary"] - aligned["control"])
     metrics["improvement_over_strongest_control"] = {
         **_metric_report(
