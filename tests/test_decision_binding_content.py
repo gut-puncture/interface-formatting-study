@@ -599,6 +599,9 @@ def test_batched_candidate_capture_matches_scalar_layer_states(tiny_hook_model):
             return [(ord(character) % 15) + 1 for character in text]
 
     tokenizer = SmallCharacterTokenizer()
+    # Tokenization metadata must not affect this routine: it constructs and
+    # indexes its own right-padded tensors explicitly.
+    tokenizer.padding_side = "left"
     prompts = ["A)a B)b C)c D)d" + _SUFFIX, "A)e B)f C)g D)h" + _SUFFIX]
     positions = [[2, 6, 10, 14], [2, 6, 10, 14]]
 

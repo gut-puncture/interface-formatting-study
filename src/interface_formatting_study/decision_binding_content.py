@@ -476,7 +476,6 @@ def capture_candidate_states(
         or len(prompts) != len(token_positions)
         or batch_size <= 0
         or (max_batch_tokens is not None and max_batch_tokens <= 0)
-        or getattr(tokenizer, "padding_side", "right") != "right"
     ):
         raise ValueError("invalid candidate-capture inputs")
     label_ids = single_token_label_ids(tokenizer)
