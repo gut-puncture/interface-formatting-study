@@ -339,6 +339,16 @@ def _save_activation_shard(
     raw = raw_log_probs.detach().float().cpu()
     if raw.shape != (len(normalized_keys), 4) or not torch.isfinite(raw).all():
         raise ValueError("training activation raw scores are malformed")
+    if (
+        not isinstance(activations, torch.Tensor)
+        or activations.ndim != 4
+        or activations.shape[0] != len(normalized_keys)
+        or activations.shape[1] <= 0
+        or activations.shape[2] != 4
+        or activations.shape[3] <= 0
+        or not torch.isfinite(activations).all()
+    ):
+        raise ValueError("training activations are malformed")
     state_json = target_state.to_json(orient="split", index=False, double_precision=15)
     state_sha256 = hashlib.sha256(state_json.encode("utf-8")).hexdigest()
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -390,7 +400,15 @@ def _load_activation_shard(
     ):
         raise RuntimeError(f"training activation shard identity mismatch: {path}")
     values = payload.get("activations")
-    if not isinstance(values, torch.Tensor) or values.ndim != 4 or values.shape[2] != 4:
+    if (
+        not isinstance(values, torch.Tensor)
+        or values.ndim != 4
+        or values.shape[0] != len(work_keys)
+        or values.shape[1] <= 0
+        or values.shape[2] != 4
+        or values.shape[3] <= 0
+        or not torch.isfinite(values).all()
+    ):
         raise RuntimeError(f"training activation shard is malformed: {path}")
     raw = payload.get("raw_log_probs")
     state_json = payload.get("target_state_json")
@@ -1219,14 +1237,16 @@ def cmd_run_model(args) -> None:
 
     def progress(phase: str, completed: int, total: int) -> None:
         elapsed = max(time.monotonic() - started, 1e-9)
-        _atomic_json({
+        receipt = {
             "phase": phase,
             "completed": int(completed),
             "total": int(total),
             "elapsed_seconds": elapsed,
             "units_per_second": completed / elapsed,
             "peak_vram_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
-        }, root / "progress.json")
+        }
+        _atomic_json(receipt, root / "progress.json")
+        print(json.dumps(receipt, sort_keys=True), flush=True)
 
     try:
         model, tokenizer, device = load_model_and_tokenizer(

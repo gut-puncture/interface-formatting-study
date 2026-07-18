@@ -46,7 +46,14 @@ case "$ACTION" in
     echo "started profile=$PROFILE mode=$MODE pid=$! log=$LOG_FILE"
     ;;
   status)
-    if pid="$(running_pid)"; then echo "running profile=$PROFILE pid=$pid log=$LOG_FILE"; else echo "stopped profile=$PROFILE log=$LOG_FILE"; fi
+    if pid="$(running_pid)"; then
+      echo "running profile=$PROFILE pid=$pid log=$LOG_FILE"
+      if [[ -s "$LOG_FILE" ]]; then
+        grep '"peak_vram_bytes"' "$LOG_FILE" | tail -n 1 || true
+      fi
+    else
+      echo "stopped profile=$PROFILE log=$LOG_FILE"
+    fi
     ;;
   stop)
     pid="$(running_pid)" || { echo "not running profile=$PROFILE"; exit 0; }

@@ -280,3 +280,55 @@ def test_decision_binding_operator_is_thin_resumable_and_fetch_verified():
     assert "control_decision_binding_gpu.sh" in sync
     assert 'DECISION_PAIR_PATH="$(dirname "$ACTIVE_DATASET_PATH")/patch_pair_ledger.parquet"' in sync
     assert 'DECISION_MANIFEST_PATH="$(dirname "$ACTIVE_DATASET_PATH")/bundle_manifest.json"' in sync
+
+
+def test_content_operator_status_surfaces_latest_durable_progress(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    profile = "mistral"
+    mode = "functional"
+    bundle = "/prepared/mistral"
+    (state / f"{profile}.pid").write_text(str(os.getpid()))
+    (state / f"{profile}.mode").write_text(mode)
+    (state / f"{profile}.args").write_text(bundle)
+    progress = {
+        "phase": "training_capture",
+        "completed": 1,
+        "total": 8,
+        "elapsed_seconds": 3.5,
+        "units_per_second": 0.29,
+        "peak_vram_bytes": 1234,
+    }
+    (state / f"{profile}-{mode}.log").write_text(
+        __import__("json").dumps(progress) + "\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ps = fake_bin / "ps"
+    fake_ps.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo 'python -m decision_binding_content --profile {profile} {bundle}'\n"
+    )
+    fake_ps.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            "bash",
+            os.path.abspath("scripts/control_decision_binding_content_gpu.sh"),
+            "status",
+            profile,
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DECISION_CONTENT_STATE_DIR": str(state),
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "running profile=mistral" in result.stdout
+    assert '"phase": "training_capture"' in result.stdout
+    assert '"completed": 1' in result.stdout
+    assert '"peak_vram_bytes": 1234' in result.stdout

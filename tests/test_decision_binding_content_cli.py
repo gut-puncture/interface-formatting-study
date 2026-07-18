@@ -194,6 +194,63 @@ def test_activation_shards_are_identity_and_checksum_bound(tmp_path):
         _load_activation_shard(path, work_keys=["work"], semantic_sha256="a" * 64)
 
 
+@pytest.mark.parametrize(
+    "activations",
+    [
+        torch.tensor([[[[float("nan")]] * 4]]),
+        torch.zeros(2, 1, 4, 1),
+    ],
+)
+def test_activation_shard_save_rejects_nonfinite_or_misaligned_values(
+    tmp_path, activations
+):
+    path = tmp_path / "capture.pt"
+    state = _target_state_for_keys(["work"])
+
+    with pytest.raises(ValueError, match="activations are malformed"):
+        _save_activation_shard(
+            path,
+            activations=activations,
+            raw_log_probs=torch.tensor([[-0.1, -1.0, -2.0, -3.0]]),
+            target_state=state,
+            work_keys=["work"],
+            semantic_sha256="a" * 64,
+        )
+
+
+@pytest.mark.parametrize("corruption", ["nonfinite", "cardinality"])
+def test_activation_shard_load_rejects_nonfinite_or_misaligned_values(
+    tmp_path, corruption
+):
+    path = tmp_path / "capture.pt"
+    state = _target_state_for_keys(["work"])
+    _save_activation_shard(
+        path,
+        activations=torch.zeros(1, 1, 4, 1),
+        raw_log_probs=torch.tensor([[-0.1, -1.0, -2.0, -3.0]]),
+        target_state=state,
+        work_keys=["work"],
+        semantic_sha256="a" * 64,
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["activations"] = (
+        torch.tensor([[[[float("inf")]] * 4]])
+        if corruption == "nonfinite"
+        else torch.zeros(2, 1, 4, 1)
+    )
+    torch.save(payload, path)
+    manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    manifest["sha256"] = sha256_file(path)
+    manifest["bytes"] = path.stat().st_size
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="activation shard is malformed"):
+        _load_activation_shard(
+            path, work_keys=["work"], semantic_sha256="a" * 64
+        )
+
+
 def test_activation_shard_rejects_target_state_tampering(tmp_path):
     path = tmp_path / "capture.pt"
     source = pd.DataFrame({
