@@ -103,7 +103,7 @@ scripts/sync_interface_formatting_study_to_gpu.sh \
 ssh -i <key> -p <port> ubuntu@<host> \
   'cd /home/ubuntu/interface_formatting_study && scripts/bootstrap_causal_followup_gpu.sh'
 ssh -i <key> -p <port> ubuntu@<host> \
-  'cd /home/ubuntu/interface_formatting_study && python scripts/cache_causal_models.py'
+  'cd /home/ubuntu/interface_formatting_study && .venv/bin/python scripts/cache_causal_models.py'
 ```
 
 ## Canary, forecast, and full-run gates

@@ -144,6 +144,37 @@ teardown contract is in `DECISION_BINDING_RUN_CARD.md`. Confirmation is prepared
 only after discovery is complete and frozen, and then uses all 599 held-out test
 items without changing the frozen layer/mechanism specification.
 
+### Candidate-local content reader (implemented, GPU run pending)
+
+The bounded follow-up captures each answer option's final audited
+content-bearing token at every layer and fits a shared linear ranker to decode
+the model's chosen answer content. It trains only on 1,801 discovery-training
+items, selects layer and regularization on 300 validation items, and applies the
+frozen choice to a separate 300-item gate. A faithful fresh BF16 forward may
+change an almost-tied winner; those rows are retained with explicit stored and
+fresh scores and an ineligibility reason, never silently dropped or relabeled.
+The same persisted eligibility population drives readers, controls, metrics,
+strata, parity, and resume.
+
+Runtime batching remains configurable and identity-bound. The identity also
+binds GPU model and compute capability, Torch/CUDA, BF16, SDPA, and library
+versions, preventing A100 and H100 numerical shards from being mixed. The first
+paid stop/go model is Mistral; Phi and Qwen remain locked unless verified
+Mistral Tier 2 passes. The 599-question confirmation set and confirmation code
+remain locked until that decision.
+
+```bash
+scripts/control_decision_binding_content_gpu.sh start mistral functional \
+  artifacts/decision_binding/v3_content/discovery/mistral-7b-instruct-v0.3
+scripts/control_decision_binding_content_gpu.sh status mistral
+scripts/control_decision_binding_content_gpu.sh stop mistral
+```
+
+The binding scientific contract is in
+`DECISION_BINDING_CONTENT_READER_RUN_CARD.md`; exact launch, stop/go, fetch,
+cost, and teardown steps are in
+`DECISION_BINDING_CONTENT_EXECUTION_CHECKLIST.md`.
+
 ### Legacy Qwen run
 
 On a GPU host, run the focused paper pipeline:

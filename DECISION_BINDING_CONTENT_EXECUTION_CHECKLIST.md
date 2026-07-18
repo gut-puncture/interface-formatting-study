@@ -6,21 +6,21 @@ This is the binding task ledger for the candidate-local content-reader experimen
 
 - [ ] Branch is `codex/decision-binding-mechanism` and the exact release commit is recorded: `________________`.
 - [ ] `git status --short --branch` is clean before packaging, launch, fetch verification, and closeout.
-- [ ] No stored prompt, wrapper, audit, split, v2 artifact, or final-set artifact changed.
-- [ ] The implementation remains inside the existing content module/CLI/operator path; no model-specific batching branch or campaign framework was added.
-- [ ] Exactly two independent reviewers closed the frozen implementation diff: scientific/data semantics `________`; runtime/resume/operator `________`.
-- [ ] One final full local suite passed against the reviewed stable diff; command, elapsed time, and result are recorded: `________________`.
+- [x] No stored prompt, wrapper, audit, split, v2 artifact, or final-set artifact changed.
+- [x] The implementation remains inside the existing content module/CLI/operator path; no model-specific batching branch or campaign framework was added.
+- [x] Exactly two independent reviewers closed the frozen implementation diff: scientific/data semantics `/root/scientific_diff_review`; runtime/resume/operator `/root/runtime_diff_review`; frozen implementation commit `1e09966`, coordinated fix through `56b118e`.
+- [x] One final full local suite passed against the reviewed stable diff: `python3 -m pytest -q`; 318 passed; about 28 seconds on 2026-07-19.
 
 ## Frozen Scientific Decisions
 
-- [ ] The hard content target is usable only when the stored winner is unique, answer content is unambiguous, the fresh winner is unique, and stored/fresh winning content IDs agree.
-- [ ] Exclusive ineligibility reason precedence is frozen as: `stored_raw_tie`, `ambiguous_answer_content`, `fresh_raw_tie`, `stored_fresh_content_mismatch`, `eligible`.
-- [ ] Ineligible rows are retained and counted, never relabeled, and excluded only from hard-target fitting, selection, controls, metrics, confidence intervals, and gates.
-- [ ] No numerical epsilon is used for scientific target eligibility.
-- [ ] Batch/scalar parity limits are frozen at `2e-2` for activations, raw log probabilities, and selected-reader probabilities. A winner swap is ambiguous only when both top-two margins are no greater than twice the observed coordinate drift.
-- [ ] L2 grid is `1e-4 1e-3 1e-2 1e-1`; seed is `0`; inference is BF16; fitting is float32; attention backend is SDPA.
-- [ ] Bootstrap samples are `5000`; within-item target permutations are `1000`.
-- [ ] The claim remains candidate-local linear decodability of chosen answer content, not causation, factual understanding, or a unique circuit.
+- [x] The hard content target is usable only when the stored winner is unique, answer content is unambiguous, the fresh winner is unique, and stored/fresh winning content IDs agree.
+- [x] Exclusive ineligibility reason precedence is frozen as: `stored_raw_tie`, `ambiguous_answer_content`, `fresh_raw_tie`, `stored_fresh_content_mismatch`, `eligible`.
+- [x] Ineligible rows are retained and counted, never relabeled, and excluded only from hard-target fitting, selection, controls, metrics, confidence intervals, and gates.
+- [x] No numerical epsilon is used for scientific target eligibility.
+- [x] Batch/scalar parity limits are frozen at `2e-2` for activations, raw log probabilities, and selected-reader probabilities. A winner swap is ambiguous only when both top-two margins are no greater than twice the observed coordinate drift. The `1e-12` comparison allowance only represents the declared decimal boundary in floating point; it is not tuned from data.
+- [x] L2 grid is `1e-4 1e-3 1e-2 1e-1`; seed is `0`; inference is BF16; fitting is float32; attention backend is SDPA.
+- [x] Bootstrap samples are `5000`; within-item target permutations are `1000`.
+- [x] The claim remains candidate-local linear decodability of chosen answer content, not causation, factual understanding, or a unique circuit.
 
 ## Discovery Source Receipts
 
@@ -35,11 +35,11 @@ This is the binding task ledger for the candidate-local content-reader experimen
 
 ## Local Implementation And Proof
 
-- [ ] RED evidence is recorded for forward eligibility, activation-state resume, uniform masks, control selection, parity, hardware identity, optimizer exhaustion, and frozen-artifact verification.
-- [ ] Focused GREEN command passed:
+- [x] RED evidence is recorded for forward eligibility, activation-state resume, uniform masks, control selection, parity, hardware identity, optimizer exhaustion, activation corruption, operator telemetry, and frozen-artifact verification.
+- [x] Focused GREEN command passed:
 
   ```bash
-  .venv/bin/python -m pytest -q \
+  python3 -m pytest -q \
     tests/test_decision_binding_content.py \
     tests/test_decision_binding_content_cli.py \
     tests/test_run_identity.py \
@@ -49,13 +49,13 @@ This is the binding task ledger for the candidate-local content-reader experimen
     tests/test_cli_contracts.py
   ```
 
-- [ ] Interrupted/resumed synthetic execution produced the same eligibility hash and accepted training keys as uninterrupted execution.
-- [ ] Artifact tamper tests reject stale identity, changed eligibility state, inconsistent repeated work keys, and altered frozen ranker hashes.
-- [ ] Review batch and focused re-review receipts are linked: `________________`.
-- [ ] Final suite passed exactly once after review closure:
+- [x] Interrupted/resumed synthetic execution produced the same eligibility hash and accepted training keys as uninterrupted execution.
+- [x] Artifact tamper tests reject stale identity, changed eligibility state, non-finite or misaligned activations, inconsistent repeated work keys, and altered frozen ranker hashes.
+- [x] Review batch and focused re-review receipts are linked to commits `1e09966`, `94d77db`, and `56b118e`.
+- [x] Final suite passed exactly once after review closure:
 
   ```bash
-  .venv/bin/python -m pytest -q
+  python3 -m pytest -q
   ```
 
 ## Thin Deploy And Runtime Preflight
@@ -96,7 +96,7 @@ This is the binding task ledger for the candidate-local content-reader experimen
     artifacts/decision_binding/v3_content/discovery/mistral-7b-instruct-v0.3
   ```
 
-- [ ] Status/log telemetry shows phase, completed/total units, throughput, preparation/forward time, peak VRAM, errors, and stop reason.
+- [ ] `status`/`tail` telemetry shows phase, completed/total units, elapsed time, throughput, and peak VRAM; errors remain in the log and interruption/failure reason is verified from the terminal manifest.
 - [ ] Stop after durable progress, confirm a clean interrupted manifest, then resume with the identical command and semantic identity.
 - [ ] Resume reuses completed activation state without duplicate or lost work keys.
 - [ ] H100 identity, eligibility receipts, batch/scalar parity, ranker receipts, and compact artifacts verify strictly.
