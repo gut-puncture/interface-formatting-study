@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 
+import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 from interface_formatting_study.causal_option_maps import (
     OptionRepresentation,
@@ -14,7 +16,12 @@ from interface_formatting_study.causal_option_maps import (
     transform_with_option_map,
 )
 from interface_formatting_study.decision_binding_content import (
+    CandidateRanker,
+    capture_candidate_states,
+    evaluate_candidate_ranker,
+    fit_candidate_ranker,
     locate_content_token_indices,
+    metadata_candidate_features,
     prepare_candidate_sites,
 )
 
@@ -336,3 +343,97 @@ def test_prepare_candidate_sites_fails_closed_on_prompt_hash_drift():
 
     with pytest.raises(ValueError, match="prompt checksum mismatch"):
         prepare_candidate_sites(pd.DataFrame([row]), applicability, option_maps={})
+
+
+def test_shared_candidate_ranker_recovers_known_direction_without_position_identity():
+    generator = np.random.default_rng(7)
+    items, layers, hidden = 96, 3, 8
+    targets = generator.integers(0, 4, size=items)
+    values = generator.normal(size=(items, layers, 4, hidden)).astype(np.float32)
+    direction = generator.normal(size=hidden).astype(np.float32)
+    direction /= np.linalg.norm(direction)
+    for item, target in enumerate(targets):
+        values[item, 1, target] += 4.0 * direction
+
+    ranker = fit_candidate_ranker(values, targets, l2=1e-2, max_iter=80)
+    probabilities = evaluate_candidate_ranker(ranker, values)
+
+    assert isinstance(ranker, CandidateRanker)
+    assert probabilities.shape == (items, layers, 4)
+    assert (probabilities[:, 1].argmax(axis=1) == targets).mean() > 0.95
+    assert ranker.weights.shape == (layers, hidden)
+    assert ranker.rms.shape == (layers,)
+    assert np.isfinite(ranker.weights).all()
+
+
+def test_shared_candidate_ranker_is_invariant_to_per_item_common_activation_shift():
+    generator = np.random.default_rng(11)
+    values = generator.normal(size=(40, 2, 4, 6)).astype(np.float32)
+    targets = generator.integers(0, 4, size=40)
+    ranker = fit_candidate_ranker(values, targets, l2=1e-2, max_iter=50)
+    common = generator.normal(size=(40, 2, 1, 6)).astype(np.float32)
+
+    before = evaluate_candidate_ranker(ranker, values)
+    after = evaluate_candidate_ranker(ranker, values + common)
+
+    np.testing.assert_allclose(before, after, atol=1e-5)
+
+
+def test_metadata_controls_encode_only_the_declared_nuisance():
+    frame = pd.DataFrame(
+        {
+            "labels_by_position": [list("ABCD"), list("BCDA")],
+            "content_ids_by_position": [[0, 1, 2, 3], [3, 0, 1, 2]],
+            "candidate_texts": [
+                ["a", "medium", "long answer", "tiny"],
+                ["a", "medium", "long answer", "tiny"],
+            ],
+        }
+    )
+
+    features = metadata_candidate_features(frame)
+
+    assert set(features) == {"position", "label", "position_label", "answer_length"}
+    assert features["position"].shape == (2, 1, 4, 4)
+    assert features["label"].shape == (2, 1, 4, 4)
+    assert features["position_label"].shape == (2, 1, 4, 8)
+    assert features["answer_length"].shape == (2, 1, 4, 1)
+    np.testing.assert_array_equal(features["position"][0, 0], np.eye(4))
+    np.testing.assert_array_equal(features["label"][1, 0].argmax(axis=1), [1, 2, 3, 0])
+    np.testing.assert_array_equal(
+        features["answer_length"][1, 0, :, 0],
+        [len("tiny"), len("a"), len("medium"), len("long answer")],
+    )
+
+
+def test_batched_candidate_capture_matches_scalar_layer_states(tiny_hook_model):
+    class SmallCharacterTokenizer(CharacterTokenizer):
+        pad_token_id = 0
+        eos_token_id = 0
+
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [(ord(character) % 15) + 1 for character in text]
+
+    tokenizer = SmallCharacterTokenizer()
+    prompts = ["A)a B)b C)c D)d" + _SUFFIX, "A)e B)f C)g D)h" + _SUFFIX]
+    positions = [[2, 6, 10, 14], [2, 6, 10, 14]]
+
+    captured = capture_candidate_states(
+        tiny_hook_model,
+        tokenizer,
+        prompts,
+        positions,
+        batch_size=2,
+        max_batch_tokens=512,
+    )
+
+    assert captured.activations.shape == (2, 2, 4, 3)
+    assert captured.raw_log_probs.shape == (2, 4)
+    assert captured.actual_tokens > 0
+    for row, prompt in enumerate(prompts):
+        direct = tiny_hook_model(
+            input_ids=torch.tensor([tokenizer.encode(prompt)]), output_hidden_states=True
+        )
+        for layer in range(2):
+            expected = direct.hidden_states[layer + 1][0, positions[row]].float()
+            assert torch.allclose(captured.activations[row, layer], expected)

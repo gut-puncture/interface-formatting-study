@@ -4,10 +4,10 @@
 
 - Existing path reused: exact stored prompts, finalized audited option maps, discovery splits, model loaders, all-layer capture, atomic shards, semantic identity, GPU operator, artifact fetch, and checksum verification.
 - New production code: one narrow candidate-local ranker is required because the completed common-checkpoint content classifier did not independently identify answer content.
-- Expected scope: one focused domain module, a narrow CLI/operator extension, and focused tests; about 350-500 net production lines and four to six local implementation hours.
+- Expected scope: one focused domain module, a narrow CLI/operator extension, and focused tests; about 600-750 net production lines and four to six local implementation hours. The owner approved this revised ceiling after exact all-row endpoint binding required 416 lines by itself.
 - Review: exactly two independent reviewers, one for scientific/data semantics and one for runtime/resume/operator behavior; maximum two review rounds.
 - Final validation: one full local suite after review closes; first real proof is a small Mistral canary followed by the full Mistral discovery gate only if the canary is exact.
-- Deviation gate: pause before 500 net production lines, six implementation hours before review, a second new production module, any change to stored prompts/audits/splits, or any redesign of the existing decision-binding architecture.
+- Deviation gate: pause before 750 net production lines, six implementation hours before review, a second new production module, any change to stored prompts/audits/splits, or any redesign of the existing decision-binding architecture.
 
 ## Source Truth Read
 

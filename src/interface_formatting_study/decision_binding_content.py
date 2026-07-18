@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import itertools
 import re
+import time
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+import numpy as np
 import pandas as pd
+import torch
+import torch.nn.functional as F
 
 from .causal_design import _raw_label_spans, _text_spans
 from .causal_option_maps import (
@@ -16,7 +20,8 @@ from .causal_option_maps import (
     parse_prompt_options,
     validate_option_map,
 )
-from .scoring import tokenize_text
+from .hooks import find_transformer_blocks
+from .scoring import single_token_label_ids, tokenize_text
 
 
 _REQUIRED_LEDGER_COLUMNS = {
@@ -54,6 +59,26 @@ class _Replacement:
     text: str
     content_id: int | None = None
     selected_position: int | None = None
+
+
+@dataclass(frozen=True)
+class CandidateRanker:
+    weights: np.ndarray
+    rms: np.ndarray
+    l2: float
+    training_loss: float
+    iterations: int
+
+
+@dataclass(frozen=True)
+class CapturedCandidateStates:
+    activations: torch.Tensor
+    raw_log_probs: torch.Tensor
+    batches: int
+    actual_tokens: int
+    padded_tokens: int
+    input_preparation_seconds: float
+    forward_seconds: float
 
 
 def _sequence(value: object, *, name: str) -> list[object]:
@@ -414,3 +439,253 @@ def locate_content_token_indices(
     if len(indices) != len(char_spans):
         raise AssertionError("candidate token endpoint count drift")
     return indices
+
+
+def capture_candidate_states(
+    model,
+    tokenizer,
+    prompts: Sequence[str],
+    token_positions: Sequence[Sequence[int]],
+    *,
+    batch_size: int,
+    max_batch_tokens: int | None,
+) -> CapturedCandidateStates:
+    if (
+        not prompts
+        or len(prompts) != len(token_positions)
+        or batch_size <= 0
+        or (max_batch_tokens is not None and max_batch_tokens <= 0)
+        or getattr(tokenizer, "padding_side", "right") != "right"
+    ):
+        raise ValueError("invalid candidate-capture inputs")
+    label_ids = single_token_label_ids(tokenizer)
+    if label_ids is None or len(set(label_ids.values())) != 4:
+        raise ValueError("candidate capture requires distinct single-token A-D labels")
+    preparation_started = time.monotonic()
+    encoded = [tokenize_text(tokenizer, str(prompt)) for prompt in prompts]
+    positions = [[int(value) for value in values] for values in token_positions]
+    if any(
+        len(values) != 4
+        or len(set(values)) != 4
+        or min(values) < 0
+        or max(values) >= len(ids)
+        for values, ids in zip(positions, encoded, strict=True)
+    ):
+        raise ValueError("candidate token positions must be four distinct in-range indices")
+    order = sorted(range(len(prompts)), key=lambda index: (len(encoded[index]), index))
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_max = 0
+    for index in order:
+        candidate_max = max(current_max, len(encoded[index]))
+        if current and (
+            len(current) >= batch_size
+            or (
+                max_batch_tokens is not None
+                and candidate_max * (len(current) + 1) > max_batch_tokens
+            )
+        ):
+            groups.append(current)
+            current, current_max = [], 0
+        current.append(index)
+        current_max = max(current_max, len(encoded[index]))
+    if current:
+        groups.append(current)
+    preparation_seconds = time.monotonic() - preparation_started
+    blocks = find_transformer_blocks(model)
+    device = next(model.parameters()).device
+    pad_id = int(
+        getattr(tokenizer, "pad_token_id", None)
+        or getattr(tokenizer, "eos_token_id", 0)
+        or 0
+    )
+    activations: torch.Tensor | None = None
+    raw_scores: torch.Tensor | None = None
+    forward_seconds = 0.0
+    padded_tokens = 0
+    for indices in groups:
+        prep = time.monotonic()
+        max_len = max(len(encoded[index]) for index in indices)
+        input_ids = torch.full((len(indices), max_len), pad_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros_like(input_ids)
+        sites = torch.empty((len(indices), 4), dtype=torch.long, device=device)
+        lengths = torch.empty(len(indices), dtype=torch.long, device=device)
+        for row, index in enumerate(indices):
+            ids = encoded[index]
+            input_ids[row, : len(ids)] = torch.tensor(ids, device=device)
+            attention_mask[row, : len(ids)] = 1
+            sites[row] = torch.tensor(positions[index], device=device)
+            lengths[row] = len(ids)
+        preparation_seconds += time.monotonic() - prep
+        captured: dict[int, torch.Tensor] = {}
+
+        def hook_for(layer: int):
+            def hook(_module, _inputs, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                rows = torch.arange(hidden.shape[0], device=hidden.device).unsqueeze(1)
+                captured[layer] = hidden[rows, sites].detach()
+                return output
+
+            return hook
+
+        handles = [block.register_forward_hook(hook_for(layer)) for layer, block in enumerate(blocks)]
+        try:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            started = time.monotonic()
+            with torch.inference_mode():
+                logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            forward_seconds += time.monotonic() - started
+        finally:
+            for handle in handles:
+                handle.remove()
+        if set(captured) != set(range(len(blocks))):
+            raise RuntimeError("not every transformer-block candidate hook ran")
+        layer_values = torch.stack([captured[layer] for layer in range(len(blocks))], dim=1).cpu()
+        rows = torch.arange(len(indices), device=device)
+        log_probs = torch.log_softmax(logits[rows, lengths - 1], dim=-1)
+        label_tensor = torch.tensor([label_ids[label] for label in LETTERS], device=device)
+        scores = log_probs.index_select(-1, label_tensor).detach().float().cpu()
+        if activations is None:
+            activations = torch.empty((len(prompts), *layer_values.shape[1:]), dtype=layer_values.dtype)
+            raw_scores = torch.empty((len(prompts), 4), dtype=torch.float32)
+        activations[indices] = layer_values
+        assert raw_scores is not None
+        raw_scores[indices] = scores
+        padded_tokens += len(indices) * max_len
+    assert activations is not None and raw_scores is not None
+    return CapturedCandidateStates(
+        activations,
+        raw_scores,
+        len(groups),
+        sum(map(len, encoded)),
+        padded_tokens,
+        preparation_seconds,
+        forward_seconds,
+    )
+
+
+def fit_candidate_ranker(
+    activations: np.ndarray | torch.Tensor,
+    target_positions: Sequence[int] | np.ndarray,
+    *,
+    l2: float,
+    max_iter: int = 100,
+) -> CandidateRanker:
+    """Fit one shared no-intercept option scorer independently at every layer."""
+
+    values = torch.as_tensor(activations, dtype=torch.float32)
+    targets = torch.as_tensor(target_positions, dtype=torch.long)
+    if (
+        values.ndim != 4
+        or values.shape[2] != 4
+        or values.shape[0] != len(targets)
+        or not len(targets)
+        or bool(((targets < 0) | (targets > 3)).any())
+        or l2 <= 0
+        or max_iter <= 0
+        or not bool(torch.isfinite(values).all())
+    ):
+        raise ValueError("invalid candidate-ranker training data or hyperparameters")
+    centered = values - values.mean(dim=2, keepdim=True)
+    rms = centered.square().mean(dim=(0, 2, 3)).sqrt().clamp_min(1e-8)
+    normalized = centered / rms[None, :, None, None]
+    weights = torch.zeros(
+        (values.shape[1], values.shape[3]), dtype=torch.float32, requires_grad=True
+    )
+    optimizer = torch.optim.LBFGS(
+        [weights],
+        lr=1.0,
+        max_iter=max_iter,
+        tolerance_grad=1e-7,
+        tolerance_change=1e-9,
+        line_search_fn="strong_wolfe",
+    )
+    iterations = 0
+
+    def closure() -> torch.Tensor:
+        nonlocal iterations
+        optimizer.zero_grad()
+        scores = torch.einsum("nlch,lh->nlc", normalized, weights)
+        repeated_targets = targets[:, None].expand(-1, values.shape[1]).reshape(-1)
+        loss = F.cross_entropy(scores.reshape(-1, 4), repeated_targets)
+        loss = loss + 0.5 * float(l2) * weights.square().sum(dim=1).mean()
+        if not bool(torch.isfinite(loss)):
+            raise ValueError("candidate-ranker loss became non-finite")
+        loss.backward()
+        iterations += 1
+        return loss
+
+    optimizer.step(closure)
+    with torch.no_grad():
+        scores = torch.einsum("nlch,lh->nlc", normalized, weights)
+        repeated_targets = targets[:, None].expand(-1, values.shape[1]).reshape(-1)
+        final_loss = float(
+            F.cross_entropy(scores.reshape(-1, 4), repeated_targets)
+            + 0.5 * float(l2) * weights.square().sum(dim=1).mean()
+        )
+    learned = weights.detach().cpu().numpy()
+    if not np.isfinite(learned).all():
+        raise ValueError("candidate-ranker weights are non-finite")
+    return CandidateRanker(
+        weights=learned,
+        rms=rms.detach().cpu().numpy(),
+        l2=float(l2),
+        training_loss=final_loss,
+        iterations=iterations,
+    )
+
+
+def evaluate_candidate_ranker(
+    ranker: CandidateRanker,
+    activations: np.ndarray | torch.Tensor,
+) -> np.ndarray:
+    values = np.asarray(activations, dtype=np.float32)
+    if (
+        values.ndim != 4
+        or values.shape[2] != 4
+        or values.shape[1:] != (len(ranker.rms), 4, ranker.weights.shape[1])
+    ):
+        raise ValueError("candidate-ranker evaluation shape mismatch")
+    centered = values - values.mean(axis=2, keepdims=True)
+    scores = np.einsum(
+        "nlch,lh->nlc", centered / ranker.rms[None, :, None, None], ranker.weights
+    )
+    scores -= scores.max(axis=2, keepdims=True)
+    probabilities = np.exp(scores)
+    probabilities /= probabilities.sum(axis=2, keepdims=True)
+    return probabilities
+
+
+def metadata_candidate_features(frame: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Build the four predeclared controls without reading model activations."""
+
+    required = {"labels_by_position", "candidate_texts"}
+    if missing := required - set(frame.columns):
+        raise ValueError(f"metadata controls are missing columns: {sorted(missing)}")
+    content_column = (
+        "actual_content_ids_by_position"
+        if "actual_content_ids_by_position" in frame
+        else "content_ids_by_position"
+    )
+    if content_column not in frame:
+        raise ValueError("metadata controls lack content-position mappings")
+    position = np.broadcast_to(np.eye(4, dtype=np.float32), (len(frame), 4, 4)).copy()
+    label = np.zeros_like(position)
+    lengths = np.empty((len(frame), 4, 1), dtype=np.float32)
+    for row_index, row in enumerate(frame.to_dict("records")):
+        labels = [str(value) for value in _sequence(row["labels_by_position"], name="labels")]
+        contents = [int(value) for value in _sequence(row[content_column], name="contents")]
+        candidates = [str(value) for value in _sequence(row["candidate_texts"], name="candidates")]
+        if sorted(labels) != list(LETTERS) or sorted(contents) != [0, 1, 2, 3]:
+            raise ValueError("metadata controls require permutation coordinates")
+        label[row_index, np.arange(4), [LETTERS.index(value) for value in labels]] = 1.0
+        lengths[row_index, :, 0] = [len(candidates[content]) for content in contents]
+    return {
+        "position": position[:, None],
+        "label": label[:, None],
+        "position_label": np.concatenate((position, label), axis=2)[:, None],
+        "answer_length": lengths[:, None],
+    }
