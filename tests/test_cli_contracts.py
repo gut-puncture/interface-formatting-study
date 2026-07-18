@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from types import SimpleNamespace
 
 import pandas as pd
@@ -203,6 +204,54 @@ def test_causal_sync_copies_source_preserving_design_sidecars():
 
     assert 'ACTIVE_DATASET_PATH%.*}.applicability.parquet' in sync
     assert 'ACTIVE_DATASET_PATH}.manifest.json' in sync
+    assert 'cd "$ROOT_DIR"' in sync
+    assert '"./$relative_path"' in sync
+
+
+def test_gpu_bootstrap_supports_plain_ubuntu_without_changing_the_runtime_contract():
+    bootstrap = open("scripts/bootstrap_causal_followup_gpu.sh", encoding="utf-8").read()
+    run = open("scripts/run_decision_binding_content_gpu.sh", encoding="utf-8").read()
+
+    assert "UV_UNMANAGED_INSTALL" in bootstrap
+    assert '"$UV_BIN" python install 3.11' in bootstrap
+    assert '"$UV_BIN" venv --python 3.11' in bootstrap
+    assert 'torch==2.7.1' in bootstrap
+    assert "https://download.pytorch.org/whl/cu126" in bootstrap
+    assert '.venv/bin/python' in run
+    assert '"$PYTHON_BIN" -m interface_formatting_study.decision_binding_content_cli' in run
+    assert 'torch.__version__.split("+")[0] == "2.7.1"' in bootstrap
+    assert 'torch.version.cuda == "12.6"' in bootstrap
+
+
+def test_gpu_bootstrap_rerun_uses_uv_for_an_existing_uv_environment(tmp_path):
+    project = tmp_path / "project"
+    home = tmp_path / "home"
+    python_log = tmp_path / "python.log"
+    uv_log = tmp_path / "uv.log"
+    (project / ".venv/bin").mkdir(parents=True)
+    (home / ".local/bin").mkdir(parents=True)
+    fake_python = project / ".venv/bin/python"
+    fake_python.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{python_log}"\ncat >/dev/null\n',
+        encoding="utf-8",
+    )
+    fake_uv = home / ".local/bin/uv"
+    fake_uv.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{uv_log}"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_uv.chmod(0o755)
+
+    subprocess.run(
+        ["bash", os.path.abspath("scripts/bootstrap_causal_followup_gpu.sh")],
+        cwd=project,
+        env={**os.environ, "HOME": str(home)},
+        check=True,
+    )
+
+    assert "-m pip" not in python_log.read_text(encoding="utf-8")
+    assert uv_log.read_text(encoding="utf-8").count("pip install --python .venv/bin/python") == 2
 
 
 def test_decision_binding_operator_is_thin_resumable_and_fetch_verified():

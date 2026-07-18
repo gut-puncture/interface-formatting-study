@@ -23,4 +23,8 @@ if [[ "$MODE" == "functional" ]]; then
   ARGS+=(--canary-items "${CANARY_ITEMS:-8}")
 fi
 
-exec python -m interface_formatting_study.decision_binding_content_cli "${ARGS[@]}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if [[ -x .venv/bin/python && "$PYTHON_BIN" == python ]]; then
+  PYTHON_BIN=.venv/bin/python
+fi
+exec "$PYTHON_BIN" -m interface_formatting_study.decision_binding_content_cli "${ARGS[@]}"

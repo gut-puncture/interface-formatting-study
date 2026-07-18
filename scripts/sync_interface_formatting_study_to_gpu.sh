@@ -45,6 +45,17 @@ fi
 
 RSYNC_RSH=(ssh "${SSH_ARGS[@]}")
 
+sync_relative_file() {
+  local relative_path="$1"
+  (
+    cd "$ROOT_DIR"
+    rsync -az --relative \
+      -e "${RSYNC_RSH[*]}" \
+      "./$relative_path" \
+      "${REMOTE}:${REMOTE_DIR}/"
+  )
+}
+
 echo "Creating ${REMOTE_DIR} on ${REMOTE}"
 ssh "${SSH_ARGS[@]}" "$REMOTE" "mkdir -p '$REMOTE_DIR'"
 
@@ -81,41 +92,26 @@ rsync -az --delete \
   -e "${RSYNC_RSH[*]}" \
   "${ROOT_DIR}/" "${REMOTE}:${REMOTE_DIR}/"
 
-rsync -az --relative \
-  -e "${RSYNC_RSH[*]}" \
-  "${ROOT_DIR}/./${ACTIVE_DATASET}" \
-  "${REMOTE}:${REMOTE_DIR}/"
+sync_relative_file "$ACTIVE_DATASET"
 if [[ -f "${ACTIVE_DATASET_PATH}.manifest.json" ]]; then
-  rsync -az --relative \
-    -e "${RSYNC_RSH[*]}" \
-    "${ROOT_DIR}/./${ACTIVE_DATASET}.manifest.json" \
-    "${REMOTE}:${REMOTE_DIR}/"
+  sync_relative_file "${ACTIVE_DATASET}.manifest.json"
 fi
 PREPARED_MANIFEST_PATH="$(dirname "$ACTIVE_DATASET_PATH")/prepared_manifest.json"
 if [[ -f "$PREPARED_MANIFEST_PATH" ]]; then
   PREPARED_MANIFEST_RELATIVE="${PREPARED_MANIFEST_PATH#"${ROOT_DIR}/"}"
-  rsync -az --relative \
-    -e "${RSYNC_RSH[*]}" \
-    "${ROOT_DIR}/./${PREPARED_MANIFEST_RELATIVE}" \
-    "${REMOTE}:${REMOTE_DIR}/"
+  sync_relative_file "$PREPARED_MANIFEST_RELATIVE"
 fi
 APPLICABILITY_PATH="${ACTIVE_DATASET_PATH%.*}.applicability.parquet"
 if [[ -f "$APPLICABILITY_PATH" ]]; then
   APPLICABILITY_RELATIVE="${ACTIVE_DATASET%.*}.applicability.parquet"
-  rsync -az --relative \
-    -e "${RSYNC_RSH[*]}" \
-    "${ROOT_DIR}/./${APPLICABILITY_RELATIVE}" \
-    "${REMOTE}:${REMOTE_DIR}/"
+  sync_relative_file "$APPLICABILITY_RELATIVE"
 fi
 DECISION_PAIR_PATH="$(dirname "$ACTIVE_DATASET_PATH")/patch_pair_ledger.parquet"
 DECISION_MANIFEST_PATH="$(dirname "$ACTIVE_DATASET_PATH")/bundle_manifest.json"
 for SIDECAR_PATH in "$DECISION_PAIR_PATH" "$DECISION_MANIFEST_PATH"; do
   if [[ -f "$SIDECAR_PATH" ]]; then
     SIDECAR_RELATIVE="${SIDECAR_PATH#"${ROOT_DIR}/"}"
-    rsync -az --relative \
-      -e "${RSYNC_RSH[*]}" \
-      "${ROOT_DIR}/./${SIDECAR_RELATIVE}" \
-      "${REMOTE}:${REMOTE_DIR}/"
+    sync_relative_file "$SIDECAR_RELATIVE"
   fi
 done
 
