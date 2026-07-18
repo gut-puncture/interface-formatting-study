@@ -384,6 +384,20 @@ def test_shared_candidate_ranker_is_invariant_to_per_item_common_activation_shif
     np.testing.assert_allclose(before, after, atol=1e-5)
 
 
+def test_candidate_ranker_scores_bfloat16_capture_tensors():
+    generator = np.random.default_rng(17)
+    values = generator.normal(size=(20, 2, 4, 6)).astype(np.float32)
+    targets = generator.integers(0, 4, size=20)
+    ranker = fit_candidate_ranker(values, targets, l2=0.01, max_iter=30)
+
+    probabilities = evaluate_candidate_ranker(
+        ranker, torch.from_numpy(values).to(torch.bfloat16)
+    )
+
+    assert probabilities.shape == (20, 2, 4)
+    assert np.isfinite(probabilities).all()
+
+
 def test_candidate_ranker_save_load_preserves_scores_and_identity(tmp_path):
     generator = np.random.default_rng(19)
     values = generator.normal(size=(24, 2, 4, 5)).astype(np.float32)

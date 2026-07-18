@@ -651,7 +651,11 @@ def evaluate_candidate_ranker(
     ranker: CandidateRanker,
     activations: np.ndarray | torch.Tensor,
 ) -> np.ndarray:
-    values = np.asarray(activations, dtype=np.float32)
+    values = (
+        activations.detach().float().cpu().numpy()
+        if isinstance(activations, torch.Tensor)
+        else np.asarray(activations, dtype=np.float32)
+    )
     if (
         values.ndim != 4
         or values.shape[2] != 4
