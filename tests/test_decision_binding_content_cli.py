@@ -10,6 +10,7 @@ from interface_formatting_study.decision_binding_content_cli import (
     _load_prepared_bundle,
     _save_activation_shard,
     _select_canary_sites,
+    _verify_raw_winners,
     build_parser,
     verify_run_root,
 )
@@ -34,8 +35,36 @@ def test_content_cli_exposes_preparation_model_run_and_verification():
     assert run.command == "run-model"
     assert verify.command == "verify"
     assert run.l2_grid == [1e-4, 1e-3, 1e-2, 1e-1]
+    assert run.batch_size == 32
+    assert run.max_batch_tokens == 40000
     with pytest.raises(SystemExit):
         parser.parse_args(["run-model", "--profile", "mistral", "--bundle", "x", "--stage", "confirmation"])
+
+
+def test_raw_winner_mismatch_reports_exact_row_and_scores():
+    rows = pd.DataFrame({
+        "work_key": ["stable", "unstable"],
+        "raw_predicted_label": ["A", "A"],
+        "winner_unique": [True, True],
+        "raw_score_A": [-0.5, -1.0],
+        "raw_score_B": [-1.0, -1.0625],
+        "raw_score_C": [-2.0, -2.0],
+        "raw_score_D": [-3.0, -3.0],
+    })
+    fresh = __import__("torch").tensor([
+        [-0.5, -1.0, -2.0, -3.0],
+        [-1.0625, -1.0, -2.0, -3.0],
+    ])
+
+    with pytest.raises(RuntimeError) as error:
+        _verify_raw_winners(rows, fresh)
+
+    message = str(error.value)
+    assert "unstable" in message
+    assert '"expected_label": "A"' in message
+    assert '"fresh_label": "B"' in message
+    assert '"stored_scores": [-1.0, -1.0625, -2.0, -3.0]' in message
+    assert '"fresh_scores": [-1.0625, -1.0, -2.0, -3.0]' in message
 
 
 def test_prepared_bundle_is_checksum_and_role_bound(tmp_path):

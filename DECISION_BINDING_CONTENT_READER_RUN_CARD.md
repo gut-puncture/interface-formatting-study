@@ -54,6 +54,7 @@
 - Each option endpoint is the final tokenizer token whose offset overlaps the selected audited content representation. Token crossing an adjacent delimiter is rejected rather than silently accepted.
 - For formats with symbolic aliases, select the actual content-bearing representation (for example, protobuf answer text rather than enum number, shell assignment text rather than `$OPTION_A`). If multiple complete content-bearing representations remain, use the last one in prompt order; ambiguity outside that rule is fatal.
 - New forward passes must reproduce the stored raw categorical winner for every unique-winner prompt used with prior artifacts. A mismatch stops the run; rows are not dropped.
+- Reproduction and activation capture use the source scoring geometry (batch size 32, 40,000-token cap); both values and the capture chunk size are semantic-identity fields.
 - Prompt hash, audit/source hash, tokenizer identity, model revision, split hash, selected specification, and work key are validated on prepare, resume, merge, fetch, and confirmation.
 - Duplicate identical shards merge once; conflicting duplicates fail. SIGINT/SIGTERM finishes the current shard, writes progress atomically, and resumes by deterministic work key.
 - Fail closed on missing spans, missing tokenizer offsets, padding/index mismatch, malformed option maps, stale identity, non-finite loss/weights, failed convergence, or attempted final-set access before freeze.

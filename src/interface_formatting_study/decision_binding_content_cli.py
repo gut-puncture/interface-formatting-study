@@ -187,9 +187,35 @@ def _verify_raw_winners(chunk: pd.DataFrame, raw_log_probs: torch.Tensor) -> Non
         {"A": 0, "B": 1, "C": 2, "D": 3}
     ).to_numpy()
     unique = chunk["winner_unique"].astype(bool).to_numpy()
-    if np.isnan(expected).any() or not np.array_equal(predictions[unique], expected[unique]):
-        mismatches = int(np.sum(predictions[unique] != expected[unique]))
-        raise RuntimeError(f"captured forward pass changes {mismatches} stored raw winners")
+    if np.isnan(expected).any():
+        raise RuntimeError("stored raw winners contain an invalid label")
+    mismatch_indices = np.flatnonzero(unique & (predictions != expected.astype(int)))
+    if len(mismatch_indices):
+        labels = np.asarray(["A", "B", "C", "D"])
+        fresh_scores = np.asarray(raw_log_probs.float())
+        stored_scores = chunk[[
+            "raw_score_A", "raw_score_B", "raw_score_C", "raw_score_D",
+        ]].to_numpy(dtype=float)
+        details = []
+        for index in mismatch_indices[:10]:
+            stored_ordered = np.sort(stored_scores[index])
+            fresh_ordered = np.sort(fresh_scores[index])
+            details.append({
+                "work_key": str(chunk.iloc[index]["work_key"]),
+                "expected_label": str(labels[int(expected[index])]),
+                "fresh_label": str(labels[int(predictions[index])]),
+                "stored_scores": stored_scores[index].tolist(),
+                "fresh_scores": fresh_scores[index].tolist(),
+                "stored_top_two_gap": float(stored_ordered[-1] - stored_ordered[-2]),
+                "fresh_top_two_gap": float(fresh_ordered[-1] - fresh_ordered[-2]),
+                "max_abs_score_drift": float(
+                    np.max(np.abs(stored_scores[index] - fresh_scores[index]))
+                ),
+            })
+        raise RuntimeError(
+            f"captured forward pass changes {len(mismatch_indices)} stored raw winners: "
+            f"{json.dumps(details, sort_keys=True)}"
+        )
 
 
 def _token_positions(tokenizer, chunk: pd.DataFrame) -> list[list[int]]:
@@ -790,6 +816,9 @@ def cmd_run_model(args) -> None:
         "bootstrap_samples": int(args.bootstrap_samples),
         "permutation_samples": int(args.permutation_samples),
         "canary_items": args.canary_items,
+        "batch_size": int(args.batch_size),
+        "max_batch_tokens": int(args.max_batch_tokens),
+        "capture_chunk_size": int(args.capture_chunk_size),
         "max_iter": int(args.max_iter),
         "inference_dtype": "bfloat16",
         "fit_dtype": "float32",
@@ -1224,8 +1253,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--profile", choices=sorted(MODEL_PROFILES), required=True)
     run.add_argument("--bundle", required=True)
     run.add_argument("--output-base", default="results/decision_binding_content_runs")
-    run.add_argument("--batch-size", type=int, default=16)
-    run.add_argument("--max-batch-tokens", type=int, default=24000)
+    run.add_argument("--batch-size", type=int, default=32)
+    run.add_argument("--max-batch-tokens", type=int, default=40000)
     run.add_argument("--capture-chunk-size", type=int, default=64)
     run.add_argument("--max-iter", type=int, default=100)
     run.add_argument("--l2-grid", type=float, nargs="+", default=list(L2_GRID))

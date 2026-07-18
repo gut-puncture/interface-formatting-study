@@ -14,8 +14,8 @@ ARGS=(
   run-model
   --profile "$PROFILE"
   --bundle "$BUNDLE"
-  --batch-size "${BATCH_SIZE:-16}"
-  --max-batch-tokens "${MAX_BATCH_TOKENS:-24000}"
+  --batch-size "${BATCH_SIZE:-32}"
+  --max-batch-tokens "${MAX_BATCH_TOKENS:-40000}"
   --capture-chunk-size "${CAPTURE_CHUNK_SIZE:-64}"
   --local-files-only
 )
