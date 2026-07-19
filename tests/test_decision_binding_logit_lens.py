@@ -295,6 +295,62 @@ def test_audit_disables_mistral_metaspace_prefix_for_fixed_root_continuations():
     ]
 
 
+def test_audit_disables_phi_sentencepiece_normalizer_prefix_at_fixed_root():
+    class _Normalizer:
+        def __repr__(self):
+            return (
+                'Sequence(normalizers=[Prepend(prepend="▁"), '
+                'Replace(pattern=String(" "), content="▁")])'
+            )
+
+    class _Backend:
+        def __init__(self):
+            self.pre_tokenizer = None
+            self.normalizer = _Normalizer()
+
+    class PrefixingTokenizer:
+        all_special_ids = []
+
+        def __init__(self):
+            self.backend_tokenizer = _Backend()
+
+        def encode(self, text, add_special_tokens=False):
+            assert not add_special_tokens
+            if text == "Answer: ":
+                return [10, 11]
+            has_implicit_prefix = "Prepend" in repr(
+                self.backend_tokenizer.normalizer
+            )
+            table = {letter: 20 + index for index, letter in enumerate("ABCD")}
+            if text in table:
+                return [table[text] + 10 if has_implicit_prefix else table[text]]
+            raise AssertionError(text)
+
+        def decode(self, ids, **_kwargs):
+            pieces = {
+                10: "Answer:",
+                11: " ",
+                **{20 + i: value for i, value in enumerate("ABCD")},
+                **{30 + i: " " + value for i, value in enumerate("ABCD")},
+            }
+            return "".join(pieces[int(value)] for value in ids)
+
+    audit = audit_fixed_root_continuations(
+        PrefixingTokenizer(), "Answer: ", ["A", "B", "C", "D"]
+    )
+
+    assert audit.label_token_ids == (20, 21, 22, 23)
+    assert lens_module.continuation_tokenization_policy(PrefixingTokenizer()) == (
+        "fixed_root_sentencepiece_without_implicit_prefix"
+    )
+    assert [candidate.token_ids for candidate in audit.candidates] == [
+        (20,),
+        (21,),
+        (22,),
+        (23,),
+    ]
+
+
 def test_audit_binds_exact_prompt_ids_when_tokenizer_drops_initial_space_on_decode():
     class LeadingSpaceDroppingTokenizer(ExactTokenizer):
         def encode(self, text, add_special_tokens=False):

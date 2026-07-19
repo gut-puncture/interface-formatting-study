@@ -87,10 +87,10 @@ Candidate scoring preserves the exact audited displayed bytes:
   paraphrases, chat template, BOS, EOS, or alternative-tokenization sum;
 - `add_special_tokens=False`; the exact prompt string and exact resulting root
   token IDs are both hash-bound. If the pinned tokenizer uses the audited
-  standalone Metaspace prefix, that prefix is disabled only for continuation
-  encoding because the fixed root already contains every real boundary byte;
-  otherwise the canonical tokenizer backend is unchanged. The tokenization
-  manifest records which policy was actually applied;
+  standalone Metaspace or SentencePiece word prefix, that prefix is disabled
+  only for continuation encoding because the fixed root already contains every
+  real boundary byte; otherwise the canonical tokenizer backend is unchanged.
+  The tokenization manifest records which policy was actually applied;
 - the appended path must decode to the decoded fixed root plus the exact
   candidate surface. Prompt-only round-trip differences such as a tokenizer
   dropping an initial space are counted and hashed, not silently repaired;

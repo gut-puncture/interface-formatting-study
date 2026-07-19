@@ -92,10 +92,11 @@ that a step happened, and it never authorizes access to the final 599 items.
   punctuation, label-like, duplicate, identical-token, shared-first-token,
   strict-prefix, decode-failure, special-token, and context-overflow counts.
 - [ ] Verify contextual A/B/C/D are distinct single tokens.
-- [ ] Verify the fixed-root Metaspace-without-implicit-prefix policy, count
-  prompt-only round-trip mismatches, and verify every eligible appended path
-  decodes to the decoded root plus the exact candidate surface. Confirm no row
-  was silently removed.
+- [ ] Verify the recorded fixed-root continuation policy (Metaspace or
+  SentencePiece without its implicit standalone prefix, or unchanged backend),
+  count prompt-only round-trip mismatches, and verify every eligible appended
+  path decodes to the decoded root plus the exact candidate surface. Confirm no
+  row was silently removed.
 
 ## Local Implementation Proof
 
