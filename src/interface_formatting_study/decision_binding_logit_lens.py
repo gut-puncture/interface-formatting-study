@@ -78,20 +78,28 @@ def _decode(tokenizer, token_ids: Sequence[int]) -> str:
         return str(tokenizer.decode(list(token_ids)))
 
 
-def _fixed_root_continuation_tokenizer(tokenizer):
-    """Disable only Mistral's implicit standalone leading-space marker."""
-
+def continuation_tokenization_policy(tokenizer) -> str:
+    """Describe the exact fixed-root continuation backend behavior."""
     backend = getattr(tokenizer, "backend_tokenizer", None)
     pre_tokenizer = getattr(backend, "pre_tokenizer", None)
     description = repr(pre_tokenizer)
     if not description.startswith("Metaspace("):
-        return tokenizer
+        return "unchanged_canonical_backend"
     if (
         'replacement="▁"' not in description
         or "prepend_scheme=first" not in description
         or "split=False" not in description
     ):
-        raise ValueError("unexpected Mistral Metaspace tokenizer policy")
+        raise ValueError("unexpected Metaspace tokenizer policy")
+    return "fixed_root_metaspace_without_implicit_prefix"
+
+
+def _fixed_root_continuation_tokenizer(tokenizer):
+    """Disable an implicit standalone Metaspace prefix at the fixed boundary."""
+
+    policy = continuation_tokenization_policy(tokenizer)
+    if policy == "unchanged_canonical_backend":
+        return tokenizer
     cached = _FIXED_ROOT_TOKENIZER_CACHE.get(id(tokenizer))
     if cached is not None and cached[0] is tokenizer:
         return cached[1]

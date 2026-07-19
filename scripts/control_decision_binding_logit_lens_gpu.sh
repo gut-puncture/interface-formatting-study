@@ -21,7 +21,7 @@ mkdir -p "$STATE_DIR"
 PID_FILE="$STATE_DIR/$PROFILE.pid"
 MODE_FILE="$STATE_DIR/$PROFILE.mode"
 ARGS_FILE="$STATE_DIR/$PROFILE.args"
-LOCK_FILE="$STATE_DIR/$PROFILE.lock"
+HOST_GPU_LOCK_FILE="$STATE_DIR/gpu.lock"
 
 if [[ -z "$MODE" && -f "$MODE_FILE" ]]; then MODE="$(cat "$MODE_FILE")"; fi
 MODE="${MODE:-full}"
@@ -79,9 +79,9 @@ case "$ACTION" in
     nohup bash -c '
       set -euo pipefail
       exec 9>"$1"
-      flock -n 9 || { echo "logit-lens profile lock is held" >&2; exit 73; }
+      flock -n 9 || { echo "logit-lens host GPU lock is held" >&2; exit 73; }
       exec scripts/run_decision_binding_logit_lens_gpu.sh "$2" "$3" "$4" "$5"
-    ' bash "$LOCK_FILE" "$MODE" "$PROFILE" "$BUNDLE" "$TOKEN_AUDIT" >>"$LOG_FILE" 2>&1 &
+    ' bash "$HOST_GPU_LOCK_FILE" "$MODE" "$PROFILE" "$BUNDLE" "$TOKEN_AUDIT" >>"$LOG_FILE" 2>&1 &
     pid=$!
     echo "$pid" > "$PID_FILE"
     echo "started model=$PROFILE mode=$MODE pid=$pid log=$LOG_FILE"

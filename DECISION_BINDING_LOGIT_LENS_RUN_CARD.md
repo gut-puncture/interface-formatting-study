@@ -1,12 +1,13 @@
-# Mistral Two-Contract Logit-Lens Run Card
+# Pinned-Profile Two-Contract Logit-Lens Run Card
 
 ## Owner Scope Box
 
-- Existing path reused: authenticated Mistral causal prompts and audits, pinned
+- Existing path reused: authenticated, profile-matched causal prompts and audits, pinned
   model/tokenizer loader, transformer-block hooks, semantic identity, atomic
   shards, Ubuntu bootstrap, model cache, thin sync, PID operator, and strict
   local artifact verification.
-- New production code is limited to one Mistral logit-lens scorer, its CLI and
+- New production code is limited to one shared logit-lens scorer for the pinned
+  Mistral, Phi, and Qwen profiles, its CLI and
   analysis, three thin operator scripts, focused tests, and these durable run
   documents. The causal and candidate-reader systems remain unchanged.
 - The original 1,400-2,000-line estimate was rechecked when the implementation
@@ -18,8 +19,8 @@
   scientific identity/scoring/analysis and one for cache/resume/operator
   behavior. One coordinated correction and focused re-review are allowed.
 - Validation: focused tests during implementation, then one full suite after
-  review closes. First paid proof is one eight-block Mistral startup and resume
-  check, followed directly by the full run if it passes.
+  review closes. First paid proof for each profile is one eight-block startup
+  and resume check, followed directly by that profile's full run if it passes.
 
 ## Scientific Contract
 
@@ -49,7 +50,7 @@ of causation or a controlling circuit.
 
 ## Protected Inputs And Observation Point
 
-- Preparation accepts only authenticated Mistral causal baseline, matched
+- Preparation accepts only an authenticated pinned-profile causal baseline, matched
   exact-answer-text, and content-free calibration rows from train/validation.
 - It must account for 2,401 unique items and 21,609 item-format blocks, with
   nine formats per item. Unknown or protected splits fail closed.
@@ -58,8 +59,9 @@ of causation or a controlling circuit.
   governing source hashes are bound into a separate v4 bundle.
 - The only scientific observation point is the final non-padding token of the
   exact stored prompt ending in `Answer:` or `Answer: ` (the source-preserved
-  trailing-space difference is retained). Transformer blocks are indexed 0-31;
-  no embedding pseudo-layer is added.
+  trailing-space difference is retained). Phi and Mistral use 32 transformer
+  blocks (layers 0-31); Qwen uses 28 transformer blocks (layers 0-27). No
+  embedding pseudo-layer is added.
 - End-of-question, option endpoints, and end-of-options are not scientific
   measurements. A shared pre-instruction boundary may be checked only as a
   technical causal-prefix invariant.
@@ -70,7 +72,7 @@ ineligible; it does not delete the block or its local scores.
 
 ## Frozen Lens And Continuation Semantics
 
-At every block output, apply Mistral's existing final RMSNorm and language-model
+At every block output, apply the pinned model's existing final normalization and language-model
 head, then compute log-softmax. Retain only declared continuation-token scores;
 never persist hidden states or full-vocabulary logits.
 
@@ -84,9 +86,11 @@ Candidate scoring preserves the exact audited displayed bytes:
 - no trimming, Unicode normalization, case or punctuation variants, synonyms,
   paraphrases, chat template, BOS, EOS, or alternative-tokenization sum;
 - `add_special_tokens=False`; the exact prompt string and exact resulting root
-  token IDs are both hash-bound. Mistral's implicit standalone Metaspace prefix
-  is disabled only for continuation encoding because the fixed root already
-  contains every real boundary byte;
+  token IDs are both hash-bound. If the pinned tokenizer uses the audited
+  standalone Metaspace prefix, that prefix is disabled only for continuation
+  encoding because the fixed root already contains every real boundary byte;
+  otherwise the canonical tokenizer backend is unchanged. The tokenization
+  manifest records which policy was actually applied;
 - the appended path must decode to the decoded fixed root plus the exact
   candidate surface. Prompt-only round-trip differences such as a tokenizer
   dropping an initial space are counted and hashed, not silently repaired;
@@ -114,7 +118,7 @@ No byte-normalized score or result-dependent scoring rule is permitted.
 ## Prefix Tree, Parity, And Eligibility
 
 Production scoring performs one root prefill per exact prompt batch, builds a
-four-candidate token trie, reuses shared prefixes and Mistral `DynamicCache`,
+four-candidate token trie, reuses shared prefixes and the model's `DynamicCache`,
 batches equal-depth divergent branches, and discards temporary states after
 projection. An uncached scalar scorer is a bounded startup sensitivity
 diagnostic, not the production full-run path.
@@ -160,8 +164,9 @@ also reported separately as a fixed replication check.
 
 Within each item, average the eight eligible wrapped-versus-plain comparisons
 before aggregating items. Winner agreement is Jaccard overlap of complete
-argmax sets. Layers 0-30 form the pre-final trajectory summary; layer 31 remains
-visible as the native endpoint and parity anchor but is excluded from AUC.
+argmax sets. Every layer before the profile-bound final layer forms the
+pre-final trajectory summary; the profile-bound final layer remains visible as
+the native endpoint and parity anchor but is excluded from AUC.
 
 The two co-primary contrasts are candidate-total plain/wrapped agreement AUC
 minus raw-letter agreement AUC, separately under the letter-output and
@@ -171,8 +176,8 @@ first-token sensitivities, calibrated-letter trajectories, and fixed-contract
 comparisons. Absolute candidate-versus-letter probability magnitudes are not
 compared.
 
-Winner-stability layer is the earliest layer 0-30 whose unique winner remains
-the same through layer 31. Plain/wrapped separation onset is defined only when
+Winner-stability layer is the earliest pre-final layer whose unique winner remains
+the same through the profile-bound final layer. Plain/wrapped separation onset is defined only when
 both final winners are unique and different, and is the earliest layer from
 which both remain fixed to their respective final winners. The numerical
 ambiguity reference is `0.04`; it flags sensitivity but does not exclude rows.
@@ -200,7 +205,7 @@ than uninformative is allowed, all four frozen quality gates must pass:
    2,401-item permitted population (therefore at least 1,921 items here).
 3. Candidate-total and candidate-token-mean AUC contrasts have the same
    nonzero direction separately under both prompt contracts.
-4. At layer 31, the `0.04` ambiguity rate is at most 20% separately for plain
+4. At the profile-bound final layer, the `0.04` ambiguity rate is at most 20% separately for plain
    and wrapped rows for both raw-letter and candidate-total readouts under both
    contracts.
 
@@ -211,12 +216,17 @@ internally inconsistent result from receiving a positive mechanism label.
 ## Runtime, Resume, And Artifact Contract
 
 Public CLI commands are `prepare`, `audit-tokenizer`, `run-model`, `analyze`,
-and `verify`. The operator fixes `--profile mistral`. Batch size, maximum batch
+and `verify`. The operator fixes one of the pinned `--profile mistral`,
+`--profile phi`, or `--profile qwen` values. The controller command is
+`control_decision_binding_logit_lens_gpu.sh <action> <profile> <mode> ...`.
+Batch size, maximum batch
 tokens, and capture chunk size remain runtime configuration and are recorded in
 identity; no model-profile batching branch exists.
+One host-wide GPU lock prevents concurrent profile runs on the single-GPU host;
+PID, mode, argument, and log receipts remain profile-specific.
 
 One atomic work unit contains both prompt contracts, its calibration prompt,
-all 32 layers, and all four candidates for one item-format block. Shards use
+all profile-bound layers, and all four candidates for one item-format block. Shards use
 deterministic work keys and atomic writes. Exact duplicate shards merge once;
 conflicting overlaps fail. `--max-chunks-this-invocation` is an execution-only
 stop/resume seam and does not change scientific identity.
@@ -266,7 +276,7 @@ artifact framework is authorized.
 Lifecycle DAG:
 
 `local prepare -> reviewed release -> thin sync -> Ubuntu bootstrap -> pinned
-Mistral cache -> complete tokenizer audit -> one startup chunk -> partial fetch
+profile cache -> complete tokenizer audit -> one startup chunk -> partial fetch
 and verify -> identical resume -> startup verify -> full run -> complete fetch
 and local verify -> local analysis -> task-owned teardown proof`
 
@@ -305,3 +315,6 @@ non-finite value, stale/mixed resume, missing telemetry, unverifiable fetch,
 unknown task-owned teardown, or cost forecast beyond the approved ceiling.
 Do not tune a cross-forward threshold, change score rules, add a new probe, or
 inspect the 599 final items in response to an unattractive result.
+
+The Phi/Qwen extension preserves the same scoring, eligibility, parity, and
+claim boundaries as Mistral. It does not authorize opening the final 599 items.

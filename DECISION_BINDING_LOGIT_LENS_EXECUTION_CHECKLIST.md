@@ -1,6 +1,6 @@
-# Mistral Two-Contract Logit-Lens Execution Checklist
+# Pinned-Profile Two-Contract Logit-Lens Execution Checklist
 
-This is the durable execution ledger for the approved Mistral-only logit-lens
+This is the durable execution ledger for the approved Mistral, Phi, and Qwen logit-lens
 experiment. Check boxes require live receipts. This document is not evidence
 that a step happened, and it never authorizes access to the final 599 items.
 
@@ -22,7 +22,8 @@ that a step happened, and it never authorizes access to the final 599 items.
 - [ ] Population is exactly 1,801 train plus 600 validation items and nine
   formats per item; final-test count remains inaccessible to the runner.
 - [ ] Scientific position is only the final non-padding token of each exact
-  stored `Answer:` or `Answer: ` prompt; blocks are 0-31.
+  stored `Answer:` or `Answer: ` prompt; blocks are profile-bound (0-31 for
+  Mistral/Phi and 0-27 for Qwen).
 - [ ] Prompt contracts differ only in the authenticated terminal instruction.
 - [ ] Raw letters are primary; content-free letter calibration is separate and
   secondary; no candidate calibration exists.
@@ -42,12 +43,12 @@ that a step happened, and it never authorizes access to the final 599 items.
 - [ ] Freeze the positive-interpretation gates: resolved primary estimates;
   at least 200 and at least 80% of 2,401 unique items per contract; same nonzero
   candidate-total/token-mean direction under both contracts; and no more than
-  20% layer-31 `0.04`-ambiguity in either plain or wrapped rows for raw-letter
+  20% final-layer `0.04`-ambiguity in either plain or wrapped rows for raw-letter
   or candidate-total readouts under either contract.
 
 ## Authenticated Preparation
 
-- [ ] Record authenticated Mistral causal run root and semantic identity.
+- [ ] Record the authenticated, profile-matched causal run root and semantic identity.
 - [ ] Record causal design, applicability, v2 readout, v3 prepared-manifest,
   option-audit, and choice-audit hashes.
 - [ ] Run the committed CLI preparation command from the project root and paste
@@ -70,7 +71,7 @@ that a step happened, and it never authorizes access to the final 599 items.
 
 ## Tokenizer Audit Before Model Load
 
-- [ ] Cache only pinned Mistral revision after the reviewed release is on the
+- [ ] Cache only the selected pinned profile revision after the reviewed release is on the
   host.
 - [ ] Run the committed CLI tokenizer audit over the complete v4 bundle and
   paste its stdout receipt here:
@@ -104,10 +105,12 @@ that a step happened, and it never authorizes access to the final 599 items.
   analysis, and operator behavior.
 - [ ] Record focused GREEN command and elapsed time.
 - [ ] Verify shell syntax for all three logit-lens operator scripts.
-- [ ] Verify runner uses `.venv/bin/python`, fixed Mistral, runtime batch knobs,
+- [ ] Verify runner uses `.venv/bin/python`, an explicit pinned profile, runtime batch knobs,
   token-audit binding, and optional max-chunks seam.
 - [ ] Verify controller owns both bundle and token-audit arguments before
   signaling and surfaces the latest progress JSON.
+- [ ] Verify one host-wide GPU lock prevents different profiles from running
+  concurrently while PID, mode, args, and logs remain profile-specific.
 - [ ] Verify fetch modes `partial`, `startup`, and `complete` all call the
   production verifier.
 - [ ] Verify thin sync includes the new scripts and excludes local results,
@@ -158,16 +161,16 @@ keys and coverage reasons. Do not inspect model outcomes to choose them.
 ssh -i <key> -p <port> ubuntu@<host> \
   'cd /home/ubuntu/interface_formatting_study && \
    MAX_CHUNKS_THIS_INVOCATION=1 \
-   scripts/control_decision_binding_logit_lens_gpu.sh start startup \
+   scripts/control_decision_binding_logit_lens_gpu.sh start mistral startup \
    <v4-bundle> <token-audit>'
 
 ssh -i <key> -p <port> ubuntu@<host> \
   'cd /home/ubuntu/interface_formatting_study && \
-   scripts/control_decision_binding_logit_lens_gpu.sh status'
+   scripts/control_decision_binding_logit_lens_gpu.sh status mistral'
 
 ssh -i <key> -p <port> ubuntu@<host> \
   'cd /home/ubuntu/interface_formatting_study && \
-   scripts/control_decision_binding_logit_lens_gpu.sh tail'
+   scripts/control_decision_binding_logit_lens_gpu.sh tail mistral'
 ```
 
 - [ ] Record startup semantic run ID, runtime configuration, selected work keys,
@@ -197,13 +200,13 @@ Fetch form:
 
 ```bash
 scripts/fetch_decision_binding_logit_lens_artifacts.sh \
-  ubuntu@<host> <semantic-run-id> \
+  mistral ubuntu@<host> <semantic-run-id> \
   /home/ubuntu/interface_formatting_study \
   gpu_artifacts/decision_binding_logit_lens \
   <key> <port> <partial|startup|complete>
 ```
 
-## Full Mistral Run
+## Full Pinned-Profile Run
 
 Freeze and record `BATCH_SIZE` and `MAX_BATCH_TOKENS` from the successful
 startup. The startup chunk size is predeclared as 4 so one invocation leaves
@@ -218,7 +221,7 @@ a fatal threshold.
 ssh -i <key> -p <port> ubuntu@<host> \
   'cd /home/ubuntu/interface_formatting_study && \
    BATCH_SIZE=<n> MAX_BATCH_TOKENS=<n> CAPTURE_CHUNK_SIZE=<n> \
-   scripts/control_decision_binding_logit_lens_gpu.sh start full \
+   scripts/control_decision_binding_logit_lens_gpu.sh start mistral full \
    <v4-bundle> <token-audit>'
 ```
 
@@ -268,5 +271,5 @@ ssh -i <key> -p <port> ubuntu@<host> \
 - [ ] Confirm no credential value, model cache, protected final data, or private
   artifact was committed or included in the thin payload.
 - [ ] Push the final verified code/document checkpoint and record origin receipt.
-- [ ] Record the exact next paper action. Phi/Qwen, final-599 confirmation,
-  another probe, or paper-wide claim expansion requires a separate decision.
+- [ ] Record the exact next paper action. Final-599 confirmation, another probe,
+  or paper-wide claim expansion requires a separate decision.

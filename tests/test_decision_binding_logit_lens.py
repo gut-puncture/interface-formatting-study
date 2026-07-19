@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from interface_formatting_study import decision_binding_logit_lens as lens_module
 from interface_formatting_study.decision_binding_logit_lens import (
     PARITY_ATOL,
     audit_fixed_root_continuations,
@@ -283,6 +284,9 @@ def test_audit_disables_mistral_metaspace_prefix_for_fixed_root_continuations():
     )
 
     assert audit.label_token_ids == (20, 21, 22, 23)
+    assert lens_module.continuation_tokenization_policy(PrefixingTokenizer()) == (
+        "fixed_root_metaspace_without_implicit_prefix"
+    )
     assert [candidate.token_ids for candidate in audit.candidates] == [
         (20,),
         (21,),

@@ -66,6 +66,11 @@ Use the logit lens as a direct, lightweight diagnostic rather than inventing sem
 - treat intermediate-layer unembedding as an imperfect descriptive window, not literal access to thought;
 - never infer that semantic information is absent merely because raw candidate-token logits are weak.
 
+The frozen extension applies this same diagnostic to the pinned Mistral, Phi,
+and Qwen profiles. Model identity and revision determine the complete layer
+range and final parity layer; scoring, eligibility, interpretation, and claim
+boundaries do not change by profile.
+
 Any causal claim still requires an intervention. A logit-lens trajectory can locate a candidate transition; it cannot by itself prove that the decoded signal controls the answer.
 
 ## Immediate Scientific Sequence
@@ -74,7 +79,7 @@ Any causal claim still requires an intervention. A logit-lens trajectory can loc
 2. Build a quantitative decomposition of conflicts using confidence, position rotations, letter rotations, answer-text versus letter outcomes, wrapper identity, and their overlaps.
 3. Report both marginal explanatory coverage and overlap. Do not create arbitrary mutually exclusive causal percentages.
 4. Identify the largest scientifically important unexplained population.
-5. Freeze one small Mistral-only internal diagnostic targeted at that population, using the logit lens rather than another semantic classifier.
+5. Freeze one small pinned-profile internal diagnostic targeted at that population, using the logit lens rather than another semantic classifier.
 6. Consider one targeted causal intervention only if the diagnostic reveals a clear, repeatable internal transition.
 
 The untouched final 599 questions remain closed until the method and interpretation are frozen. The failed candidate-local gate does not authorize opening them.

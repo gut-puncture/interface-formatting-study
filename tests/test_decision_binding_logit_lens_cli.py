@@ -383,9 +383,7 @@ def test_token_audit_is_complete_hash_bound_and_persists_structural_eligibility(
     assert not bool(first["primary_contrast_evaluable"])
     assert manifest["final_599_opened"] is False
     assert manifest["rows"] == 6
-    assert manifest["continuation_tokenization_policy"].endswith(
-        "without_implicit_prefix"
-    )
+    assert manifest["continuation_tokenization_policy"] == "unchanged_canonical_backend"
     assert len(manifest["audit_sha256"]) == 64
 
     path = tmp_path / "tokenization" / "continuation_audit.parquet"

@@ -25,6 +25,7 @@ from .decision_binding_logit_lens import (
     ContinuationAudit,
     PARITY_ATOL,
     audit_fixed_root_continuations,
+    continuation_tokenization_policy,
     score_candidate_paths_cached_many,
     score_candidate_paths_scalar,
 )
@@ -1011,9 +1012,7 @@ def audit_tokenizer_bundle(
         "prepared_ledger_sha256": prepared["ledger_sha256"],
         "max_context_tokens": int(max_context_tokens),
         "tokenizer": _tokenizer_receipt(tokenizer),
-        "continuation_tokenization_policy": (
-            "fixed_root_mistral_metaspace_without_implicit_prefix"
-        ),
+        "continuation_tokenization_policy": continuation_tokenization_policy(tokenizer),
         "prompt_roundtrip_mismatches": int(
             frame["prompt_roundtrip_exact"].eq(False).sum()
         ),
