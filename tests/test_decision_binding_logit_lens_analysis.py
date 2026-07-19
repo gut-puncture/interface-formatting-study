@@ -473,6 +473,33 @@ def test_diagnostics_jsd_remains_finite_when_restricted_probabilities_underflow(
     assert np.allclose(diagnostics["mean_jsd"], np.log(2.0))
 
 
+def test_diagnostics_jsd_remains_finite_when_mixture_midpoint_underflows():
+    frame = _frame()
+    for column in (
+        "letter_raw_logps",
+        "candidate_path_total_logps",
+        "candidate_mean_token_logps",
+        "candidate_first_token_logps",
+    ):
+        frame[column] = frame.apply(
+            lambda row: [
+                (
+                    [0.0, -745.0, -1_000.0, -1_000.0]
+                    if row["wrapper_name"] == "plain"
+                    else [0.0, -1_000.0, -745.0, -1_000.0]
+                )[content_id]
+                for content_id in row["content_ids_by_position"]
+            ],
+            axis=1,
+        )
+
+    diagnostics = MODULE.analyze_frame(frame, n_boot=5, seed=2)["diagnostics"]
+
+    assert np.isfinite(diagnostics["mean_jsd"]).all()
+    assert (diagnostics["mean_jsd"] >= 0.0).all()
+    assert (diagnostics["mean_jsd"] <= np.log(2.0)).all()
+
+
 def test_masked_candidate_nans_are_allowed_but_eligible_or_letter_nans_fail():
     frame = _frame()
     excluded = frame["wrapper_name"] == "xml"

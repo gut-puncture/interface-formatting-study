@@ -438,12 +438,16 @@ def _restricted_probabilities(values: Sequence[float]) -> np.ndarray:
 def _jensen_shannon(left: Sequence[float], right: Sequence[float]) -> float:
     p = _restricted_probabilities(left)
     q = _restricted_probabilities(right)
-    midpoint = 0.5 * (p + q)
     p_positive = p > 0.0
     q_positive = q > 0.0
+    log_p = np.full_like(p, -np.inf)
+    log_q = np.full_like(q, -np.inf)
+    log_p[p_positive] = np.log(p[p_positive])
+    log_q[q_positive] = np.log(q[q_positive])
+    log_midpoint = np.logaddexp(log_p, log_q) - np.log(2.0)
     return float(
-        0.5 * np.sum(p[p_positive] * np.log(p[p_positive] / midpoint[p_positive]))
-        + 0.5 * np.sum(q[q_positive] * np.log(q[q_positive] / midpoint[q_positive]))
+        0.5 * np.sum(p[p_positive] * (log_p[p_positive] - log_midpoint[p_positive]))
+        + 0.5 * np.sum(q[q_positive] * (log_q[q_positive] - log_midpoint[q_positive]))
     )
 
 
