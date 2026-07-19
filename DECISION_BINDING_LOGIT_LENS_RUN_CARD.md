@@ -234,7 +234,10 @@ Startup telemetry is cumulative across the two invocations and carries exact
 covered work keys. Verification requires the frozen `0 -> 4 interrupted` then
 `4 -> 8 startup_complete` attempt chain, with each attempt's telemetry keys
 matching its processed keys. Paper-facing analysis outputs are accepted only
-when the complete declared set and every manifest hash verify.
+when the complete declared set, each canonical `analysis/` path, and every
+manifest hash verify. Internal analysis may first verify a complete score run
+without those not-yet-created outputs; public `complete` verification requires
+them.
 
 ## Operator Lifecycle And Paid Gate
 

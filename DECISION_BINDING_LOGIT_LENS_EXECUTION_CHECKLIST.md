@@ -183,8 +183,8 @@ ssh -i <key> -p <port> ubuntu@<host> \
 - [ ] Record scalar/batch, cached/uncached, per-token/path-total, layer count,
   final-native, shape, finiteness, source hash, and resume parity receipts.
 - [ ] Verify shard-local candidate eligibility against the authenticated
-  continuation audit and every declared analysis artifact hash before accepting
-  paper-facing outputs.
+  continuation audit and require the exact canonical analysis artifact set,
+  paths, and hashes before accepting a public `complete` verification.
 - [ ] Record measured shutdown/flush/fetch duration and a full-run runtime/cost
   forecast from useful-block throughput.
 - [ ] If any startup gate fails, stop before scale, diagnose that exact surface,

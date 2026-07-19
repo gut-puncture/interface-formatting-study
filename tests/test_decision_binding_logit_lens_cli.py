@@ -1026,9 +1026,16 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     }
     (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
 
-    receipt = verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
+    receipt = verify_run_root(
+        tmp_path,
+        expected_run_id=run_id,
+        mode="complete",
+        require_analysis=False,
+    )
 
     assert receipt == {"status": "complete", "work_units": 1, "rows": 4}
+    with pytest.raises(ValueError, match="analysis artifact manifest is required"):
+        verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
     analysis_dir = tmp_path / "analysis"
     analysis_dir.mkdir()
     analysis_names = {
@@ -1056,6 +1063,14 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     }
     (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
     assert verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")["rows"] == 4
+    rebound = json.loads(json.dumps(manifest))
+    rebound["artifacts"]["analysis"]["quality_gates"] = dict(
+        rebound["artifacts"]["analysis"]["analysis_summary"]
+    )
+    (tmp_path / "run_manifest.json").write_text(json.dumps(rebound))
+    with pytest.raises(ValueError, match="canonical path"):
+        verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
     (analysis_dir / "quality_gates.json").write_text("tampered")
     with pytest.raises(ValueError, match="analysis artifact"):
         verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")

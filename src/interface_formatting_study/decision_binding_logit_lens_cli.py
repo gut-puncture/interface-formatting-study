@@ -61,18 +61,18 @@ CLAIM_BOUNDARY = "descriptive_layerwise_logit_lens_not_causal"
 TOKEN_AUDIT_SCHEMA_VERSION = 1
 RUN_SCHEMA_VERSION = 1
 EXPECTED_ANALYSIS_ARTIFACTS = {
-    "analysis_summary",
-    "interpretation_memo",
-    "quality_gates",
-    "calibrated_letter",
-    "diagnostics",
-    "primary_contrasts",
-    "secondary_contrasts",
-    "trajectories",
-    "timing",
-    "timing_distributions",
-    "trajectory_figure",
-    "strata",
+    "analysis_summary": "analysis/analysis_summary.json",
+    "interpretation_memo": "analysis/interpretation_memo.md",
+    "quality_gates": "analysis/quality_gates.json",
+    "calibrated_letter": "analysis/calibrated_letter.csv",
+    "diagnostics": "analysis/diagnostics.csv",
+    "primary_contrasts": "analysis/primary_contrasts.csv",
+    "secondary_contrasts": "analysis/secondary_contrasts.csv",
+    "trajectories": "analysis/trajectories.csv",
+    "timing": "analysis/timing.csv",
+    "timing_distributions": "analysis/timing_distributions.csv",
+    "trajectory_figure": "analysis/trajectory_2x2.png",
+    "strata": "analysis/strata.csv",
 }
 
 
@@ -2228,7 +2228,11 @@ def _validate_semantic_identity_digest(identity: Mapping[str, object]) -> None:
 
 
 def verify_run_root(
-    root: str | Path, *, expected_run_id: str, mode: str
+    root: str | Path,
+    *,
+    expected_run_id: str,
+    mode: str,
+    require_analysis: bool = True,
 ) -> dict[str, object]:
     if mode not in {"partial", "startup", "complete"}:
         raise ValueError("verification mode must be partial, startup, or complete")
@@ -2452,13 +2456,15 @@ def verify_run_root(
         )
 
     analysis_artifacts = manifest.get("artifacts", {}).get("analysis")
+    if mode == "complete" and require_analysis and analysis_artifacts is None:
+        raise ValueError("analysis artifact manifest is required for complete verification")
     if analysis_artifacts is not None:
-        if set(analysis_artifacts) != EXPECTED_ANALYSIS_ARTIFACTS:
+        if set(analysis_artifacts) != set(EXPECTED_ANALYSIS_ARTIFACTS):
             raise ValueError("analysis artifact manifest is incomplete or contains extras")
         for name, receipt in analysis_artifacts.items():
             relative = Path(str(receipt.get("path", "")))
-            if relative.is_absolute() or ".." in relative.parts:
-                raise ValueError(f"analysis artifact path is unsafe: {name}")
+            if relative.as_posix() != EXPECTED_ANALYSIS_ARTIFACTS[name]:
+                raise ValueError(f"analysis artifact does not use its canonical path: {name}")
             path = run_root / relative
             if not path.is_file() or sha256_file(path) != receipt.get("sha256"):
                 raise ValueError(f"analysis artifact checksum mismatch: {name}")
@@ -2534,7 +2540,12 @@ def _cmd_analyze(args: argparse.Namespace) -> None:
     run_root = Path(args.run_root)
     identity = _read_json(run_root / "semantic_identity.json", name="semantic identity")
     run_id = str(identity.get("semantic_run_id", ""))
-    verify_run_root(run_root, expected_run_id=run_id, mode="complete")
+    verify_run_root(
+        run_root,
+        expected_run_id=run_id,
+        mode="complete",
+        require_analysis=False,
+    )
     module = _load_analysis_module()
     output_dir = run_root / "analysis"
     outputs = module.analyze(
