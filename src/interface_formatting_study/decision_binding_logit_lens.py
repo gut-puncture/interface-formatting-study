@@ -324,10 +324,14 @@ def _forward_last_position(
                     -1, target_tensor
                 )
             )
-        final_projected = head(norm(captured[len(blocks) - 1])).float()
+        # Preserve the native [batch, sequence, hidden] projection shape. BF16
+        # GEMM kernels can differ when the singleton sequence axis is removed.
+        final_projected = head(
+            norm(captured[len(blocks) - 1].unsqueeze(1))
+        ).float()
         final_scores = torch.log_softmax(final_projected, dim=-1).index_select(
             -1, target_tensor
-        )
+        )[:, -1, :]
         layer_rows.append(final_scores.unsqueeze(1))
         native = torch.log_softmax(outputs.logits[:, -1, :].float(), dim=-1).index_select(
             -1, target_tensor

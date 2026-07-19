@@ -448,6 +448,8 @@ def test_semantic_identity_binds_hardware_and_batching_but_not_max_chunks(tmp_pa
         "batch_size": 8,
         "max_batch_tokens": 24000,
         "capture_chunk_size": 8,
+        "work_shard_count": 2,
+        "work_shard_index": 0,
     }
     first = build_logit_lens_identity(
         profile, config={**base, "max_chunks_this_invocation": 1},
@@ -467,10 +469,35 @@ def test_semantic_identity_binds_hardware_and_batching_but_not_max_chunks(tmp_pa
         profile, config={**base, "batch_size": 4},
         dataset_path=dataset, source_paths=[source],
     )
+    other_partition_index = build_logit_lens_identity(
+        profile,
+        config={
+            **base,
+            "work_shard_index": 1,
+            "max_chunks_this_invocation": None,
+        },
+        dataset_path=dataset,
+        source_paths=[source],
+    )
+    other_partition_count = build_logit_lens_identity(
+        profile,
+        config={**base, "work_shard_count": 4, "work_shard_index": 3},
+        dataset_path=dataset,
+        source_paths=[source],
+    )
+    other_work_plan = build_logit_lens_identity(
+        profile,
+        config={**base, "ordered_work_keys_sha256": "different"},
+        dataset_path=dataset,
+        source_paths=[source],
+    )
 
     assert first.semantic_run_id == resumed.semantic_run_id
+    assert first.semantic_run_id == other_partition_index.semantic_run_id
+    assert first.semantic_run_id != other_partition_count.semantic_run_id
     assert first.semantic_run_id != other_gpu.semantic_run_id
     assert first.semantic_run_id != other_batch.semantic_run_id
+    assert first.semantic_run_id != other_work_plan.semantic_run_id
 
 
 def test_design_manifest_binds_both_option_and_displayed_choice_audits(tmp_path):
@@ -700,6 +727,53 @@ def test_work_partition_is_deterministic_disjoint_and_complete():
         partition_work_keys(work_keys, shard_count=4, shard_index=4)
 
 
+def test_partition_resume_accepts_exact_union_and_rejects_foreign_keys(tmp_path):
+    dataset = tmp_path / "dataset.parquet"
+    pd.DataFrame({"value": [1]}).to_parquet(dataset, index=False)
+    source = tmp_path / "source.py"
+    source.write_text("VALUE = 1\n")
+    identity = build_logit_lens_identity(
+        get_model_profile("mistral"),
+        config={"stage": "discovery"},
+        dataset_path=dataset,
+        source_paths=[source],
+    )
+    store = ShardStore(tmp_path / "shards", identity)
+    store.write_shard(
+        pd.DataFrame(
+            {"block_work_key": ["b", "d"], "_work_key": ["b", "d"]}
+        ),
+        work_keys=["b", "d"],
+    )
+
+    processed = run_atomic_chunks(
+        store,
+        ["a", "c"],
+        allowed_work_keys=["a", "b", "c", "d"],
+        chunk_size=1,
+        max_chunks_this_invocation=None,
+        process_chunk=lambda keys: pd.DataFrame({"block_work_key": keys}),
+    )
+
+    assert processed == ["a", "c"]
+    assert store.completed_work_keys() == {"a", "b", "c", "d"}
+
+    foreign = ShardStore(tmp_path / "foreign", identity)
+    foreign.write_shard(
+        pd.DataFrame({"block_work_key": ["foreign"], "_work_key": ["foreign"]}),
+        work_keys=["foreign"],
+    )
+    with pytest.raises(ValueError, match="outside the authenticated work plan"):
+        run_atomic_chunks(
+            foreign,
+            ["a", "c"],
+            allowed_work_keys=["a", "b", "c", "d"],
+            chunk_size=1,
+            max_chunks_this_invocation=None,
+            process_chunk=lambda keys: pd.DataFrame({"block_work_key": keys}),
+        )
+
+
 def test_parity_coverage_survives_crash_after_atomic_shard_commit(tmp_path):
     dataset = tmp_path / "dataset.parquet"
     pd.DataFrame({"value": [1]}).to_parquet(dataset, index=False)
@@ -831,6 +905,91 @@ def test_startup_attempt_chain_requires_interrupted_four_then_resumed_four():
         },
     ]
     _validate_attempt_chain(resumed, keys, mode="startup")
+
+
+def test_full_attempt_chain_accepts_partition_local_progress_only():
+    all_keys = list("abcdefgh")
+    assigned = partition_work_keys(all_keys, shard_count=2, shard_index=1)
+    receipts = [
+        {
+            "started_at_unix": 1.0,
+            "status": "interrupted",
+            "completed_before": 0,
+            "processed_work_keys": assigned[:2],
+            "completed_after": 2,
+            "telemetry_work_keys": assigned[:2],
+            "work_shard_count": 2,
+            "work_shard_index": 1,
+        },
+        {
+            "started_at_unix": 2.0,
+            "status": "interrupted",
+            "completed_before": 2,
+            "processed_work_keys": assigned[2:],
+            "completed_after": len(assigned),
+            "telemetry_work_keys": assigned[2:],
+            "work_shard_count": 2,
+            "work_shard_index": 1,
+        },
+    ]
+
+    _validate_attempt_chain(receipts, all_keys, mode="full")
+    forged = [dict(receipts[0], processed_work_keys=["a", "c"]), receipts[1]]
+    with pytest.raises(ValueError, match="partition"):
+        _validate_attempt_chain(forged, all_keys, mode="full")
+
+
+def test_full_attempt_chain_accepts_exact_union_finalizer_after_partition_workers():
+    all_keys = list("abcdefgh")
+    receipts = []
+    for shard_index in range(2):
+        assigned = partition_work_keys(
+            all_keys, shard_count=2, shard_index=shard_index
+        )
+        telemetry = {
+            "covered_work_keys": assigned,
+            "completed_work_units": len(assigned),
+            "root_input_tokens": 1,
+            "branch_input_tokens": 1,
+            "peak_vram_bytes": 1,
+            "phase_seconds": {"root": 1.0, "branch": 1.0},
+            "gpu_utilization": {
+                "root": {"samples": 1, "mean_percent": 50.0, "max_percent": 50.0},
+                "branch": {"samples": 1, "mean_percent": 50.0, "max_percent": 50.0},
+            },
+        }
+        receipts.append(
+            {
+                "started_at_unix": float(shard_index + 1),
+                "status": "interrupted",
+                "completed_before": 0,
+                "processed_work_keys": assigned,
+                "completed_after": len(assigned),
+                "telemetry_work_keys": assigned,
+                "work_shard_count": 2,
+                "work_shard_index": shard_index,
+                "telemetry_receipt": telemetry,
+            }
+        )
+    receipts.append(
+        {
+            "started_at_unix": 3.0,
+            "status": "complete",
+            "completed_before": len(partition_work_keys(all_keys, shard_count=2, shard_index=0)),
+            "processed_work_keys": [],
+            "completed_after": len(partition_work_keys(all_keys, shard_count=2, shard_index=0)),
+            "telemetry_work_keys": [],
+            "work_shard_count": 2,
+            "work_shard_index": 0,
+        }
+    )
+
+    _validate_attempt_chain(receipts, all_keys, mode="full", require_complete=True)
+
+    with pytest.raises(ValueError, match="cover the complete work plan"):
+        _validate_attempt_chain(
+            receipts[:1], all_keys, mode="full", require_complete=True
+        )
 
 
 def test_execute_model_run_requires_the_frozen_eight_by_four_startup_shape():
@@ -1126,9 +1285,10 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
                 "started_at_unix": 1.0,
                 "completed_before": 0,
                 "processed_work_keys": ["item|plain"],
-                "completed_after": 1,
-                "telemetry_work_keys": ["item|plain"],
-            }
+                    "completed_after": 1,
+                    "telemetry_work_keys": ["item|plain"],
+                    "telemetry_receipt": telemetry,
+                }
         )
     )
     manifest = {

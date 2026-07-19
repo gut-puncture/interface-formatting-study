@@ -174,6 +174,35 @@ def test_logit_lens_batches_intermediate_layer_projections():
     assert calls == 3
 
 
+def test_final_layer_projection_preserves_native_sequence_axis_for_bf16_parity():
+    class RankSensitiveHead(torch.nn.Linear):
+        def forward(self, hidden):
+            logits = super().forward(hidden)
+            if hidden.ndim == 2:
+                logits = logits.clone()
+                logits[:, 6] += 0.05
+            return logits
+
+    tokenizer = ExactTokenizer()
+    audit = audit_fixed_root_continuations(
+        tokenizer,
+        "Question\nAnswer: ",
+        ["A", "B", "C", "D"],
+    )
+    model = TinyCachedMistral(layers=4)
+    replacement = RankSensitiveHead(
+        model.lm_head.in_features,
+        model.lm_head.out_features,
+        bias=False,
+    )
+    replacement.weight.data.copy_(model.lm_head.weight.data)
+    model.lm_head = replacement
+
+    scored = score_candidate_paths_cached(model, audit, expected_layers=4)
+
+    assert scored.max_final_native_difference < 1e-6
+
+
 def test_continuation_audit_rejects_malformed_candidates_and_marks_empty_without_dropping_it():
     tokenizer = ExactTokenizer()
     with pytest.raises(ValueError, match="exactly four"):

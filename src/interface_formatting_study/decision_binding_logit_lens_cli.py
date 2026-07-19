@@ -258,25 +258,71 @@ def _validate_attempt_chain(
     work_keys: Sequence[str],
     *,
     mode: str,
+    require_complete: bool = False,
 ) -> None:
     ordered_keys = [str(value) for value in work_keys]
-    advancing: list[Mapping[str, object]] = []
-    cursor = 0
+    grouped: dict[tuple[int, int], list[Mapping[str, object]]] = {}
     for receipt in sorted(receipts, key=lambda value: float(value["started_at_unix"])):
         if receipt.get("status") not in {"interrupted", "startup_complete", "complete"}:
             continue
-        before = int(receipt.get("completed_before", -1))
-        after = int(receipt.get("completed_after", -1))
-        processed = list(map(str, receipt.get("processed_work_keys", [])))
-        telemetry_keys = list(map(str, receipt.get("telemetry_work_keys", [])))
-        if before != cursor or after != before + len(processed):
-            raise ValueError("attempt receipts do not form a deterministic resume chain")
-        if processed != ordered_keys[before:after] or telemetry_keys != processed:
-            raise ValueError("attempt receipts do not bind work and telemetry coverage")
-        cursor = after
-        advancing.append(receipt)
-    if cursor != len(ordered_keys):
-        raise ValueError("attempt receipts do not cover the verified work prefix")
+        shard_count = int(receipt.get("work_shard_count", 1))
+        shard_index = int(receipt.get("work_shard_index", 0))
+        try:
+            partition_work_keys(
+                ordered_keys, shard_count=shard_count, shard_index=shard_index
+            )
+        except ValueError as error:
+            raise ValueError("attempt receipt has an invalid work partition") from error
+        if mode == "startup" and (shard_count, shard_index) != (1, 0):
+            raise ValueError("startup attempt receipt cannot use a work partition")
+        grouped.setdefault((shard_count, shard_index), []).append(receipt)
+
+    advancing: list[Mapping[str, object]] = []
+    covered: set[str] = set()
+    for (shard_count, shard_index), group in grouped.items():
+        assigned = partition_work_keys(
+            ordered_keys, shard_count=shard_count, shard_index=shard_index
+        )
+        cursor = 0
+        for receipt in group:
+            before = int(receipt.get("completed_before", -1))
+            after = int(receipt.get("completed_after", -1))
+            processed = list(map(str, receipt.get("processed_work_keys", [])))
+            telemetry_keys = list(map(str, receipt.get("telemetry_work_keys", [])))
+            if before != cursor or after != before + len(processed):
+                raise ValueError("attempt receipts do not form a deterministic resume chain")
+            if processed != assigned[before:after] or telemetry_keys != processed:
+                raise ValueError(
+                    "attempt receipts do not bind the deterministic work partition"
+                )
+            if require_complete and processed:
+                telemetry_receipt = receipt.get("telemetry_receipt")
+                if not isinstance(telemetry_receipt, Mapping):
+                    raise ValueError("completed attempt lacks worker telemetry")
+                telemetry_covered = set(
+                    map(str, telemetry_receipt.get("covered_work_keys", []))
+                )
+                phase_seconds = telemetry_receipt.get("phase_seconds", {})
+                utilization = telemetry_receipt.get("gpu_utilization", {})
+                if (
+                    telemetry_covered != set(processed)
+                    or int(telemetry_receipt.get("completed_work_units", -1))
+                    != len(processed)
+                    or int(telemetry_receipt.get("root_input_tokens", -1)) <= 0
+                    or int(telemetry_receipt.get("branch_input_tokens", -1)) <= 0
+                    or int(telemetry_receipt.get("peak_vram_bytes", -1)) < 0
+                    or any(float(phase_seconds.get(phase, 0.0)) <= 0 for phase in ("root", "branch"))
+                    or any(
+                        int(utilization.get(phase, {}).get("samples", 0)) < 1
+                        for phase in ("root", "branch")
+                    )
+                ):
+                    raise ValueError("completed attempt has invalid worker telemetry")
+            covered.update(processed)
+            cursor = after
+            advancing.append(receipt)
+    if require_complete and covered != set(ordered_keys):
+        raise ValueError("attempt receipts do not cover the complete work plan")
     if mode == "startup" and len(ordered_keys) == 8:
         shape = [
             (
@@ -1102,6 +1148,7 @@ def build_logit_lens_identity(
 ) -> SemanticIdentity:
     identity_config = dict(config)
     identity_config.pop("max_chunks_this_invocation", None)
+    identity_config.pop("work_shard_index", None)
     return build_semantic_identity(
         profile,
         config=identity_config,
@@ -1428,6 +1475,7 @@ def run_atomic_chunks(
     store: ShardStore,
     ordered_work_keys: Sequence[str],
     *,
+    allowed_work_keys: Sequence[str] | None = None,
     chunk_size: int,
     max_chunks_this_invocation: int | None,
     process_chunk,
@@ -1440,8 +1488,20 @@ def run_atomic_chunks(
         raise ValueError("chunk_size must be positive")
     if max_chunks_this_invocation is not None and max_chunks_this_invocation < 1:
         raise ValueError("max_chunks_this_invocation must be positive")
-    completed = store.completed_work_keys()
     ordered = [str(value) for value in ordered_work_keys]
+    if len(ordered) != len(set(ordered)):
+        raise ValueError("ordered work keys must be unique")
+    allowed = (
+        set(ordered)
+        if allowed_work_keys is None
+        else {str(value) for value in allowed_work_keys}
+    )
+    if not set(ordered).issubset(allowed):
+        raise ValueError("assigned work partition is outside the authenticated work plan")
+    all_completed = store.completed_work_keys()
+    if not all_completed.issubset(allowed):
+        raise ValueError("completed shard key is outside the authenticated work plan")
+    completed = all_completed.intersection(ordered)
     prefix_length = 0
     while prefix_length < len(ordered) and ordered[prefix_length] in completed:
         prefix_length += 1
@@ -1469,7 +1529,7 @@ def run_atomic_chunks(
         processed.extend(keys)
         chunks += 1
         if on_flush is not None:
-            on_flush(set(completed).union(processed), shard)
+            on_flush(set(all_completed).union(processed), shard)
         if should_stop():
             break
     return processed
@@ -1717,8 +1777,9 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
     environment = _runtime_environment()
     if args.startup_items is None:
         mode = "full"
+        all_work_keys = ledger["block_work_key"].astype(str).tolist()
         work_keys = partition_work_keys(
-            ledger["block_work_key"].astype(str).tolist(),
+            all_work_keys,
             shard_count=work_shard_count,
             shard_index=work_shard_index,
         )
@@ -1727,6 +1788,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             raise ValueError("startup runs cannot be work-sharded")
         mode = "startup"
         work_keys = select_startup_work_keys(token_audit, count=args.startup_items)
+        all_work_keys = work_keys
     config = {
         "experiment": "mistral_two_contract_logit_lens_v4",
         "stage": "discovery",
@@ -1739,7 +1801,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             Path(args.token_audit) / "tokenization_manifest.json"
         ),
         "continuation_audit_sha256": token_manifest["audit_sha256"],
-        "ordered_work_keys_sha256": _canonical_sha256(work_keys),
+        "ordered_work_keys_sha256": _canonical_sha256(all_work_keys),
         "startup_work_keys": work_keys if mode == "startup" else [],
         "scoring_policy": {
             "layers": list(range(profile.expected_layers)),
@@ -1795,15 +1857,18 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
     work_plan = {
         "schema_version": 1,
         "mode": mode,
-        "work_keys": work_keys,
-        "ordered_work_keys_sha256": _canonical_sha256(work_keys),
-        "expected_rows": len(work_keys) * profile.expected_layers * 2,
+        "work_keys": all_work_keys,
+        "ordered_work_keys_sha256": _canonical_sha256(all_work_keys),
+        "expected_rows": len(all_work_keys) * profile.expected_layers * 2,
     }
     _atomic_json(work_plan, run_root / "work_plan.json")
     _atomic_json(_analysis_spec(), run_root / "analysis_spec.json")
 
     store = ShardStore(run_root / "shards" / "lens", identity)
     completed_before = store.completed_work_keys()
+    if not completed_before.issubset(set(all_work_keys)):
+        raise ValueError("completed shard key is outside the authenticated work plan")
+    assigned_completed_before = completed_before.intersection(work_keys)
     started = time.time()
     attempt_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started)) + f"-{uuid.uuid4().hex[:8]}"
     attempt_path = run_root / "attempts" / f"{attempt_id}.json"
@@ -1813,7 +1878,9 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         "semantic_run_id": identity.semantic_run_id,
         "started_at_unix": started,
         "max_chunks_this_invocation": args.max_chunks_this_invocation,
-        "completed_before": len(completed_before),
+        "completed_before": len(assigned_completed_before),
+        "work_shard_count": work_shard_count,
+        "work_shard_index": work_shard_index,
         "status": "running",
     }
     _atomic_json(attempt, attempt_path)
@@ -1918,20 +1985,20 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
                 peak_vram_bytes=peak_vram,
             )
             telemetry_report["covered_work_keys"] = sorted(
-                completed - completed_before
+                completed.intersection(work_keys)
             )
             telemetry_report = _merge_telemetry_reports(
                 telemetry_base, telemetry_report
             )
             _atomic_json(telemetry_report, telemetry_path)
             rate = len(completed - completed_before) / elapsed
-            remaining = len(work_keys) - len(completed)
+            remaining = len(all_work_keys) - len(completed)
             progress = {
                 "phase": "lens",
                 "mode": mode,
                 "semantic_run_id": identity.semantic_run_id,
                 "completed_work_units": len(completed),
-                "total_work_units": len(work_keys),
+                "total_work_units": len(all_work_keys),
                 "work_units_per_second": rate,
                 "elapsed_seconds": elapsed,
                 "estimated_remaining_seconds": None if rate <= 0 else remaining / rate,
@@ -1964,6 +2031,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         processed = run_atomic_chunks(
             store,
             work_keys,
+            allowed_work_keys=all_work_keys,
             chunk_size=int(args.capture_chunk_size),
             max_chunks_this_invocation=args.max_chunks_this_invocation,
             process_chunk=process,
@@ -1979,7 +2047,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         parity = _parity_report_from_frame(reconciled)
         _atomic_json(parity, parity_path)
         write_runtime_receipts(completed, None)
-        is_complete = completed == set(work_keys)
+        is_complete = completed == set(all_work_keys)
         artifacts: dict[str, object] = {
             "parity_report_sha256": sha256_file(parity_path),
             "progress_sha256": sha256_file(run_root / "progress.json"),
@@ -2004,7 +2072,10 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             "status": status,
             "mode": mode,
             "semantic_identity": identity.as_dict(),
-            "expected_work_keys": work_keys,
+            "expected_work_keys": all_work_keys,
+            "execution_work_keys": work_keys,
+            "work_shard_count": work_shard_count,
+            "work_shard_index": work_shard_index,
             "expected_rows": work_plan["expected_rows"],
             "completed_work_units": len(completed),
             "artifacts": artifacts,
@@ -2012,13 +2083,34 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             "final_599_opened": False,
         }
         _atomic_json(manifest, run_root / "run_manifest.json")
+        processed_audit = audit_subset[
+            audit_subset["block_work_key"].astype(str).isin(processed)
+            & audit_subset["root_evaluable"].astype(bool)
+        ]
+        processed_branch_tokens = 0
+        for token_paths in processed_audit["candidate_token_ids"]:
+            processed_branch_tokens += len(
+                {
+                    tuple(int(value) for value in path[:depth])
+                    for path in token_paths
+                    for depth in range(1, len(path))
+                }
+            )
+        attempt_telemetry = telemetry.snapshot(
+            completed_work_units=len(processed),
+            root_input_tokens=int(processed_audit["prompt_token_count"].sum()),
+            branch_input_tokens=int(processed_branch_tokens),
+            peak_vram_bytes=int(torch.cuda.max_memory_allocated()),
+        )
+        attempt_telemetry["covered_work_keys"] = list(processed)
         attempt.update(
             {
                 "status": status,
                 "finished_at_unix": time.time(),
                 "processed_work_keys": processed,
-                "completed_after": len(completed),
+                "completed_after": len(completed.intersection(work_keys)),
                 "telemetry_work_keys": processed,
+                "telemetry_receipt": attempt_telemetry,
             }
         )
         _atomic_json(attempt, attempt_path)
@@ -2029,7 +2121,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             "run_root": str(run_root),
             "processed_this_invocation": len(processed),
             "completed_work_units": len(completed),
-            "total_work_units": len(work_keys),
+            "total_work_units": len(all_work_keys),
         }
     except BaseException as error:
         attempt.update(
@@ -2473,6 +2565,17 @@ def verify_run_root(
         != int(manifest.get("expected_rows", -1))
     ):
         raise ValueError("work plan differs from semantic identity or run manifest")
+    work_shard_count = int(manifest.get("work_shard_count", 1))
+    work_shard_index = int(manifest.get("work_shard_index", 0))
+    expected_execution_keys = partition_work_keys(
+        work_keys, shard_count=work_shard_count, shard_index=work_shard_index
+    )
+    execution_work_keys = [
+        str(value)
+        for value in manifest.get("execution_work_keys", expected_execution_keys)
+    ]
+    if execution_work_keys != expected_execution_keys:
+        raise ValueError("run manifest execution keys differ from its work partition")
 
     shard_keys, shard_frame = _load_lens_shards(run_root, identity)
     merged_path = run_root / "layerwise_scores.parquet"
@@ -2535,15 +2638,14 @@ def verify_run_root(
     if mode == "startup" and status != "startup_complete":
         raise ValueError("startup run is not complete")
     expected_keys = {str(value) for value in manifest.get("expected_work_keys", [])}
+    if not shard_keys.issubset(expected_keys):
+        raise ValueError("completed work keys fall outside the authenticated work plan")
     if mode in {"startup", "complete"} and shard_keys != expected_keys:
         raise ValueError("completed work keys do not match the work plan")
     if mode in {"startup", "complete"} and len(frame) != int(manifest.get("expected_rows", -1)):
         raise ValueError("completed row count does not match the work plan")
     if int(manifest.get("completed_work_units", -1)) != len(shard_keys):
         raise ValueError("completed work-unit count mismatch")
-    verified_prefix = work_keys[: len(shard_keys)]
-    if shard_keys != set(verified_prefix):
-        raise ValueError("verified shards are not the deterministic work-plan prefix")
     if frame.empty and mode in {"startup", "complete"}:
         raise ValueError("completed run contains no score rows")
     parity_path = run_root / "parity_report.json"
@@ -2596,7 +2698,10 @@ def verify_run_root(
             or telemetry.get("semantic_run_id") != identity.get("semantic_run_id")
             or int(progress.get("completed_work_units", -1)) != len(shard_keys)
             or int(telemetry.get("completed_work_units", -1)) != len(shard_keys)
-            or set(map(str, telemetry.get("covered_work_keys", []))) != shard_keys
+            or not set(map(str, telemetry.get("covered_work_keys", [])))
+            or not set(map(str, telemetry.get("covered_work_keys", []))).issubset(
+                shard_keys
+            )
             or int(telemetry.get("root_input_tokens", -1)) <= 0
             or int(telemetry.get("branch_input_tokens", -1)) <= 0
             or int(telemetry.get("peak_vram_bytes", -1)) < 0
@@ -2627,8 +2732,9 @@ def verify_run_root(
                 attempt_receipts.append(receipt)
         _validate_attempt_chain(
             attempt_receipts,
-            verified_prefix,
+            work_keys,
             mode=str(experiment_config.get("mode", "full")),
+            require_complete=mode == "complete",
         )
 
     analysis_artifacts = manifest.get("artifacts", {}).get("analysis")
