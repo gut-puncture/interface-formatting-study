@@ -175,6 +175,21 @@ The binding scientific contract is in
 cost, and teardown steps are in
 `DECISION_BINDING_CONTENT_EXECUTION_CHECKLIST.md`.
 
+### Mistral two-contract logit lens
+
+The bounded experiment projects every Mistral transformer-block output
+through the model's existing final normalization and output head. It compares
+plain/wrapped answer-content and A/B/C/D trajectories under matched letter-only
+and exact-answer-text instructions. Complete multi-token candidates are scored
+as exact teacher-forced continuation paths; this is descriptive continuation
+compatibility, not literal access to thought or causal proof.
+
+Only the existing 1,801 train and 600 validation items are in scope. The final
+599 remain inaccessible. The frozen scientific, resume, parity, H100 startup,
+cost, fetch, and teardown contracts are in
+`DECISION_BINDING_LOGIT_LENS_RUN_CARD.md` and
+`DECISION_BINDING_LOGIT_LENS_EXECUTION_CHECKLIST.md`.
+
 ### Legacy Qwen run
 
 On a GPU host, run the focused paper pipeline:

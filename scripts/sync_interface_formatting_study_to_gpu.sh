@@ -78,6 +78,10 @@ rsync -az --delete \
   --include '/pyproject.toml' \
   --include '/requirements-gpu.lock' \
   --include '/README.md' \
+  --include '/SCIENTIFIC_NORTH_STAR.md' \
+  --include '/DECISION_BINDING_LOGIT_LENS_RUN_CARD.md' \
+  --include '/analysis/' \
+  --include '/analysis/analyze_decision_binding_logit_lens.py' \
   --include '/scripts/' \
   --include '/scripts/bootstrap_causal_followup_gpu.sh' \
   --include '/scripts/run_causal_followup_gpu.sh' \
@@ -87,6 +91,9 @@ rsync -az --delete \
   --include '/scripts/run_decision_binding_content_gpu.sh' \
   --include '/scripts/control_decision_binding_content_gpu.sh' \
   --include '/scripts/fetch_decision_binding_content_artifacts.sh' \
+  --include '/scripts/run_decision_binding_logit_lens_gpu.sh' \
+  --include '/scripts/control_decision_binding_logit_lens_gpu.sh' \
+  --include '/scripts/fetch_decision_binding_logit_lens_artifacts.sh' \
   --include '/scripts/cache_causal_models.py' \
   --exclude '*' \
   -e "${RSYNC_RSH[*]}" \
