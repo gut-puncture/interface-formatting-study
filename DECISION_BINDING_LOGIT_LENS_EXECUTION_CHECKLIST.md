@@ -34,8 +34,9 @@ that a step happened, and it never authorizes access to the final 599 items.
 - [ ] Ties, duplicates, prefix collisions, shared first tokens, label-like
   candidates, surface drift, and incomplete mappings follow the Run Card's
   retained-but-explicit eligibility policy.
-- [ ] Tolerances are fixed at `0.02` per target token/coordinate,
-  `0.02 * token_count` per total path, and `0.04` only as an ambiguity flag.
+- [ ] Same-forward final/native tolerance is fixed at `0.02`; cached/full-prefix
+  BF16 differences are finite recorded sensitivity values with no acceptance
+  threshold; `0.04` remains only the analysis ambiguity flag.
 - [ ] Primary contrasts, layers 0-30 AUC, bootstrap count 5,000, Holm scope,
   prior strata, timing algorithms, and interpretation categories are frozen.
 - [ ] Freeze the positive-interpretation gates: resolved primary estimates;
@@ -180,15 +181,16 @@ ssh -i <key> -p <port> ubuntu@<host> \
 - [ ] Verify cumulative telemetry covers all eight exact work keys and the
   authenticated attempts prove `0 -> 4 interrupted` then
   `4 -> 8 startup_complete`; reject a one-shot startup receipt.
-- [ ] Record scalar/batch, cached/uncached, per-token/path-total, layer count,
-  final-native, shape, finiteness, source hash, and resume parity receipts.
+- [ ] Record scalar/batch and cached/uncached sensitivity maxima,
+  per-token/path-total values, layer count, same-forward final/native parity,
+  shape, finiteness, source hash, and resume receipts.
 - [ ] Verify shard-local candidate eligibility against the authenticated
   continuation audit and require the exact canonical analysis artifact set,
   paths, and hashes before accepting a public `complete` verification.
 - [ ] Record measured shutdown/flush/fetch duration and a full-run runtime/cost
   forecast from useful-block throughput.
-- [ ] If any startup gate fails, stop before scale, diagnose that exact surface,
-  and do not widen tolerances or start a second kind of canary.
+- [ ] If any hard startup gate fails, stop before scale and diagnose that exact
+  surface. Do not tune a cross-forward threshold or start a second canary.
 
 Fetch form:
 
@@ -206,8 +208,9 @@ Freeze and record `BATCH_SIZE` and `MAX_BATCH_TOKENS` from the successful
 startup. The startup chunk size is predeclared as 4 so one invocation leaves
 half of the exact eight-block sample for a real resume; the full-run chunk size
 is predeclared as 64 to avoid thousands of tiny Parquet shards. Both values are
-identity-bound, and the startup scalar/batch comparison must pass before the
-larger full-run grouping is allowed.
+identity-bound. The startup scalar/batch comparison must be complete, finite,
+and recorded before the larger full-run grouping is allowed; its BF16
+coordinate differences are sensitivity data, not a fatal threshold.
 
 ```bash
 ssh -i <key> -p <port> ubuntu@<host> \

@@ -185,7 +185,7 @@ as exact teacher-forced continuation paths; this is descriptive continuation
 compatibility, not literal access to thought or causal proof.
 
 Only the existing 1,801 train and 600 validation items are in scope. The final
-599 remain inaccessible. The frozen scientific, resume, parity, H100 startup,
+599 remain inaccessible. The frozen scientific, resume, parity, Hopper startup,
 cost, fetch, and teardown contracts are in
 `DECISION_BINDING_LOGIT_LENS_RUN_CARD.md` and
 `DECISION_BINDING_LOGIT_LENS_EXECUTION_CHECKLIST.md`.

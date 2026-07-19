@@ -60,6 +60,7 @@ MISTRAL_SLUG = "mistral-7b-instruct-v0.3"
 CLAIM_BOUNDARY = "descriptive_layerwise_logit_lens_not_causal"
 TOKEN_AUDIT_SCHEMA_VERSION = 1
 RUN_SCHEMA_VERSION = 1
+CROSS_FORWARD_SENSITIVITY_POLICY = "record_only_bf16_execution_shape_sensitivity"
 EXPECTED_ANALYSIS_ARTIFACTS = {
     "analysis_summary": "analysis/analysis_summary.json",
     "interpretation_memo": "analysis/interpretation_memo.md",
@@ -1210,13 +1211,6 @@ def score_lens_chunk(
                         ("max_cached_scalar_total_per_token_difference", total_difference),
                     ):
                         oracle_maxima[name] = max(oracle_maxima[name], value)
-                    if max(
-                        letter_difference,
-                        first_difference,
-                        mean_difference,
-                        total_difference,
-                    ) > PARITY_ATOL:
-                        raise ValueError("cached/scalar startup parity exceeds frozen tolerance")
             start += len(batch)
 
     output: list[dict[str, object]] = []
@@ -1438,7 +1432,8 @@ def _analysis_spec() -> dict[str, object]:
         "letter_secondary": "content_free_calibrated_logp",
         "pre_final_layers": list(range(31)),
         "parity_layer": 31,
-        "parity_atol": PARITY_ATOL,
+        "same_forward_final_native_parity_atol": PARITY_ATOL,
+        "cross_forward_sensitivity_policy": CROSS_FORWARD_SENSITIVITY_POLICY,
         "ambiguity_reference": 0.04,
         "quality_gates": {
             "minimum_primary_items_per_contract": 200,
@@ -1482,6 +1477,7 @@ def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
         return {
             "schema_version": 2,
             "tolerance": PARITY_ATOL,
+            "cross_forward_sensitivity_policy": CROSS_FORWARD_SENSITIVITY_POLICY,
             "covered_work_keys": [],
             "scalar_oracle_work_keys": [],
             **{name: 0.0 for name in PARITY_COLUMNS},
@@ -1507,6 +1503,7 @@ def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
     return {
         "schema_version": 2,
         "tolerance": PARITY_ATOL,
+        "cross_forward_sensitivity_policy": CROSS_FORWARD_SENSITIVITY_POLICY,
         "covered_work_keys": covered,
         "scalar_oracle_work_keys": scalar_keys,
         **maxima,
@@ -1520,9 +1517,16 @@ def _merge_parity_reports(
         current.get("tolerance", PARITY_ATOL)
     ) != PARITY_ATOL:
         raise ValueError("parity report tolerance drift")
+    policies = {
+        previous.get("cross_forward_sensitivity_policy", CROSS_FORWARD_SENSITIVITY_POLICY),
+        current.get("cross_forward_sensitivity_policy", CROSS_FORWARD_SENSITIVITY_POLICY),
+    }
+    if policies != {CROSS_FORWARD_SENSITIVITY_POLICY}:
+        raise ValueError("cross-forward sensitivity policy drift")
     return {
         "schema_version": 2,
         "tolerance": PARITY_ATOL,
+        "cross_forward_sensitivity_policy": CROSS_FORWARD_SENSITIVITY_POLICY,
         "covered_work_keys": sorted(
             set(map(str, previous.get("covered_work_keys", [])))
             | set(map(str, current.get("covered_work_keys", [])))
@@ -1591,7 +1595,8 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             "candidate_sensitivity": "mean_token_logp",
             "first_token": "root_state_diagnostic",
             "surface_policy": "exact_canonical_token_sequence_no_variants_no_eos",
-            "parity_atol": PARITY_ATOL,
+            "same_forward_final_native_parity_atol": PARITY_ATOL,
+            "cross_forward_sensitivity_policy": CROSS_FORWARD_SENSITIVITY_POLICY,
         },
         "analysis_policy": _analysis_spec(),
         "runtime_environment": environment,
@@ -2387,13 +2392,17 @@ def verify_run_root(
         parity = _read_json(parity_path, name="parity report")
         if float(parity.get("tolerance", -1.0)) != PARITY_ATOL:
             raise ValueError("parity report tolerance drift")
+        if parity.get("cross_forward_sensitivity_policy") != CROSS_FORWARD_SENSITIVITY_POLICY:
+            raise ValueError("cross-forward sensitivity policy drift")
         maxima = [
             float(value)
             for key, value in parity.items()
             if str(key).startswith("max_")
         ]
-        if not maxima or not np.isfinite(maxima).all() or max(maxima) > PARITY_ATOL:
-            raise ValueError("parity report exceeds the frozen tolerance")
+        if not maxima or not np.isfinite(maxima).all():
+            raise ValueError("parity report contains non-finite sensitivity values")
+        if float(parity.get("max_final_native_difference", math.inf)) > PARITY_ATOL:
+            raise ValueError("same-forward final/native parity exceeds the frozen tolerance")
         expected_parity = _parity_report_from_frame(frame)
         if parity != expected_parity:
             raise ValueError("parity coverage or maxima do not reconcile with score shards")

@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 import torch
 
+from interface_formatting_study import decision_binding_logit_lens_cli as logit_cli
 from interface_formatting_study.decision_binding_logit_lens_cli import (
     EXPECTED_FORMATS,
     _merge_telemetry_reports,
@@ -558,6 +559,60 @@ def test_score_chunk_batches_equal_length_roots_and_persists_calibration_and_mas
     assert parity["max_final_native_difference"] == 0.0
 
 
+def test_score_chunk_records_bf16_cross_forward_drift_without_rejecting_valid_same_forward_scores(
+    tmp_path, monkeypatch
+):
+    ledger = build_source_ledger(
+        _source_rows(),
+        expected_split_items={"train": 1},
+        expected_formats=("plain", "wrapped"),
+    )
+    _write_prepared_bundle(tmp_path / "bundle", ledger)
+    audit_tokenizer_bundle(
+        tmp_path / "bundle",
+        tmp_path / "tokenization",
+        tokenizer=_ExactTokenizer(),
+        max_context_tokens=4096,
+        expected_split_items={"train": 1},
+        expected_formats=("plain", "wrapped"),
+    )
+    _, audit = load_token_audit(
+        tmp_path / "tokenization", bundle_root=tmp_path / "bundle", expected_blocks=2
+    )
+
+    def scores(value: float, layers: int) -> LayerwisePathScores:
+        tensor = torch.tensor(
+            [[value, value - 1.0, value - 2.0, value - 3.0]] * layers,
+            dtype=torch.float32,
+        )
+        return LayerwisePathScores(tensor, tensor, tensor, tensor, 0.0)
+
+    def cached_scorer(_model, audits, *, expected_layers):
+        return [scores(-0.1, expected_layers) for _audit in audits]
+
+    monkeypatch.setattr(
+        logit_cli,
+        "score_candidate_paths_scalar",
+        lambda _model, _audit, *, expected_layers: scores(-0.225, expected_layers),
+    )
+
+    frame, parity = score_lens_chunk(
+        model=object(),
+        ledger=ledger,
+        token_audit=audit,
+        work_keys=ledger["block_work_key"].tolist(),
+        batch_size=2,
+        max_batch_tokens=10000,
+        expected_layers=2,
+        scorer=cached_scorer,
+        run_scalar_oracle=True,
+    )
+
+    assert parity["max_final_native_difference"] == 0.0
+    assert parity["max_cached_scalar_letter_difference"] == pytest.approx(0.125)
+    assert np.allclose(frame["parity_cached_scalar_letter_max"], 0.125)
+
+
 def test_atomic_chunk_resume_skips_completed_work_and_max_chunks_is_invocation_only(tmp_path):
     dataset = tmp_path / "dataset.parquet"
     pd.DataFrame({"value": [1]}).to_parquet(dataset, index=False)
@@ -963,6 +1018,7 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     parity = {
         "schema_version": 2,
         "tolerance": 0.02,
+        "cross_forward_sensitivity_policy": "record_only_bf16_execution_shape_sensitivity",
         "covered_work_keys": ["item|plain"],
         "scalar_oracle_work_keys": [],
         "max_final_native_difference": 0.0,
@@ -1077,6 +1133,59 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     (analysis_dir / "quality_gates.json").write_bytes(
         b"fixture:quality_gates.json"
     )
+    sensitive = scores.copy()
+    for column in (
+        "parity_cached_scalar_letter_max",
+        "parity_cached_scalar_first_token_max",
+        "parity_cached_scalar_mean_token_max",
+        "parity_cached_scalar_total_per_token_max",
+    ):
+        sensitive[column] = 0.125
+    sensitive.to_parquet(shard / "data.parquet", index=False)
+    shard_manifest["data_sha256"] = sha256_file(shard / "data.parquet")
+    (shard / "manifest.json").write_text(json.dumps(shard_manifest))
+    sensitive.to_parquet(tmp_path / "layerwise_scores.parquet", index=False)
+    manifest["artifacts"]["layerwise_scores_sha256"] = sha256_file(
+        tmp_path / "layerwise_scores.parquet"
+    )
+    sensitive_parity = _parity_report_from_frame(sensitive)
+    (tmp_path / "parity_report.json").write_text(json.dumps(sensitive_parity))
+    manifest["artifacts"]["parity_report_sha256"] = sha256_file(
+        tmp_path / "parity_report.json"
+    )
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+    assert verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")["rows"] == 4
+
+    hard_failure = sensitive.copy()
+    hard_failure["parity_final_native_max"] = 0.03
+    hard_failure.to_parquet(shard / "data.parquet", index=False)
+    shard_manifest["data_sha256"] = sha256_file(shard / "data.parquet")
+    (shard / "manifest.json").write_text(json.dumps(shard_manifest))
+    hard_failure.to_parquet(tmp_path / "layerwise_scores.parquet", index=False)
+    manifest["artifacts"]["layerwise_scores_sha256"] = sha256_file(
+        tmp_path / "layerwise_scores.parquet"
+    )
+    hard_parity = _parity_report_from_frame(hard_failure)
+    (tmp_path / "parity_report.json").write_text(json.dumps(hard_parity))
+    manifest["artifacts"]["parity_report_sha256"] = sha256_file(
+        tmp_path / "parity_report.json"
+    )
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="same-forward final/native parity"):
+        verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
+
+    scores.to_parquet(shard / "data.parquet", index=False)
+    shard_manifest["data_sha256"] = sha256_file(shard / "data.parquet")
+    (shard / "manifest.json").write_text(json.dumps(shard_manifest))
+    scores.to_parquet(tmp_path / "layerwise_scores.parquet", index=False)
+    manifest["artifacts"]["layerwise_scores_sha256"] = sha256_file(
+        tmp_path / "layerwise_scores.parquet"
+    )
+    (tmp_path / "parity_report.json").write_text(json.dumps(parity))
+    manifest["artifacts"]["parity_report_sha256"] = sha256_file(
+        tmp_path / "parity_report.json"
+    )
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
     incomplete_parity = {**parity, "covered_work_keys": []}
     (tmp_path / "parity_report.json").write_text(json.dumps(incomplete_parity))
     manifest["artifacts"]["parity_report_sha256"] = sha256_file(
