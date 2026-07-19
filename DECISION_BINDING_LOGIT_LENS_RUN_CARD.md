@@ -241,6 +241,17 @@ them.
 
 ## Operator Lifecycle And Paid Gate
 
+### Review learning note
+
+The second focused receipt review showed that treating analysis hashes as an
+optional verifier add-on could not distinguish a legitimate pre-analysis score
+run from a public complete result whose analysis receipts had been removed. We
+stopped extending that conditional design. The simplified boundary is now:
+internal analysis may explicitly request score-only verification before it
+creates outputs, while the public complete verifier always requires the exact
+canonical analysis set, paths, and hashes. No third review loop or broader
+artifact framework is authorized.
+
 Lifecycle DAG:
 
 `local prepare -> reviewed release -> thin sync -> Ubuntu bootstrap -> pinned
