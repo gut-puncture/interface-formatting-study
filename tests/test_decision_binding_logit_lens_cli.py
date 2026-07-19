@@ -1306,6 +1306,15 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
         verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
 
 
+def test_frame_reconciliation_handles_nested_parquet_arrays():
+    left = pd.DataFrame(
+        {"candidate_token_ids": [np.array([np.array([1, 2]), np.array([3])], dtype=object)]}
+    )
+    right = pd.DataFrame({"candidate_token_ids": [[[1, 2], [3]]]})
+
+    assert logit_cli._frames_match(left, right)
+
+
 def test_expected_formats_are_exactly_the_existing_nine():
     assert EXPECTED_FORMATS == (
         "plain", "csv_inline", "graphql_query", "html_form", "ini_file",

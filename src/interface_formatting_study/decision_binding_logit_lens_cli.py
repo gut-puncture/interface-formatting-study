@@ -2192,6 +2192,13 @@ def _frames_match(left: pd.DataFrame, right: pd.DataFrame) -> bool:
         return False
     columns = sorted(left.columns)
 
+    def json_default(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError(f"unsupported nested Parquet value: {type(value).__name__}")
+
     def normalized(frame: pd.DataFrame) -> pd.DataFrame:
         result = frame[columns].copy()
         for column in columns:
@@ -2199,10 +2206,11 @@ def _frames_match(left: pd.DataFrame, right: pd.DataFrame) -> bool:
                 continue
             result[column] = result[column].map(
                 lambda value: json.dumps(
-                    value.tolist() if isinstance(value, np.ndarray) else value,
+                    value,
                     sort_keys=True,
                     separators=(",", ":"),
                     ensure_ascii=False,
+                    default=json_default,
                 )
                 if isinstance(value, (list, tuple, dict, np.ndarray))
                 else value
