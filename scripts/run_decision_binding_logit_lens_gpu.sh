@@ -27,6 +27,8 @@ ARGS=(
   --token-audit "$TOKEN_AUDIT"
   --batch-size "${BATCH_SIZE:-8}"
   --max-batch-tokens "${MAX_BATCH_TOKENS:-24000}"
+  --work-shard-count "${WORK_SHARD_COUNT:-1}"
+  --work-shard-index "${WORK_SHARD_INDEX:-0}"
   --local-files-only
 )
 if [[ "$MODE" == "startup" ]]; then

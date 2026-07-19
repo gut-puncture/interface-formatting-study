@@ -1085,6 +1085,14 @@ def select_startup_work_keys(audit: pd.DataFrame, *, count: int = 8) -> list[str
     return sorted(selected[:count])
 
 
+def partition_work_keys(
+    work_keys: Sequence[str], *, shard_count: int, shard_index: int
+) -> list[str]:
+    if shard_count < 1 or shard_index < 0 or shard_index >= shard_count:
+        raise ValueError("work shard count/index is invalid")
+    return [str(value) for value in work_keys[shard_index::shard_count]]
+
+
 def build_logit_lens_identity(
     profile: ModelProfile,
     *,
@@ -1683,6 +1691,11 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("the logit-lens experiment is frozen to Mistral only")
     if args.batch_size < 1 or args.max_batch_tokens < 1 or args.capture_chunk_size < 1:
         raise ValueError("runtime batch size, token cap, and chunk size must be positive")
+    work_shard_count = int(getattr(args, "work_shard_count", 1))
+    work_shard_index = int(getattr(args, "work_shard_index", 0))
+    partition_work_keys(
+        ["validation"], shard_count=work_shard_count, shard_index=work_shard_index
+    )
     if args.startup_items is not None and args.startup_items < 1:
         raise ValueError("startup-items must be positive")
     if args.startup_items is not None and args.startup_items != 8:
@@ -1704,8 +1717,14 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
     environment = _runtime_environment()
     if args.startup_items is None:
         mode = "full"
-        work_keys = ledger["block_work_key"].astype(str).tolist()
+        work_keys = partition_work_keys(
+            ledger["block_work_key"].astype(str).tolist(),
+            shard_count=work_shard_count,
+            shard_index=work_shard_index,
+        )
     else:
+        if work_shard_count != 1 or work_shard_index != 0:
+            raise ValueError("startup runs cannot be work-sharded")
         mode = "startup"
         work_keys = select_startup_work_keys(token_audit, count=args.startup_items)
     config = {
@@ -1738,6 +1757,8 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         "batch_size": int(args.batch_size),
         "max_batch_tokens": int(args.max_batch_tokens),
         "capture_chunk_size": int(args.capture_chunk_size),
+        "work_shard_count": work_shard_count,
+        "work_shard_index": work_shard_index,
         "max_chunks_this_invocation": args.max_chunks_this_invocation,
     }
     identity = build_logit_lens_identity(
@@ -2762,6 +2783,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--batch-size", type=int, default=32)
     run.add_argument("--max-batch-tokens", type=int, default=40000)
     run.add_argument("--capture-chunk-size", type=int, default=64)
+    run.add_argument("--work-shard-count", type=int, default=1)
+    run.add_argument("--work-shard-index", type=int, default=0)
     run.add_argument("--startup-items", type=int)
     run.add_argument("--max-chunks-this-invocation", type=int)
     run.add_argument("--local-files-only", action="store_true")

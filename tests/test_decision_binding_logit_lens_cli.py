@@ -14,6 +14,7 @@ from interface_formatting_study import decision_binding_logit_lens_cli as logit_
 from interface_formatting_study.decision_binding_logit_lens_cli import (
     EXPECTED_FORMATS,
     _merge_telemetry_reports,
+    partition_work_keys,
     _parity_report_from_frame,
     _validate_attempt_chain,
     audit_tokenizer_bundle,
@@ -682,6 +683,23 @@ def test_atomic_chunk_resume_skips_completed_work_and_max_chunks_is_invocation_o
         )
 
 
+def test_work_partition_is_deterministic_disjoint_and_complete():
+    work_keys = [f"work-{index}" for index in range(11)]
+    partitions = [
+        partition_work_keys(work_keys, shard_count=4, shard_index=index)
+        for index in range(4)
+    ]
+
+    assert partitions == [work_keys[index::4] for index in range(4)]
+    flattened = [key for partition in partitions for key in partition]
+    assert sorted(flattened) == sorted(work_keys)
+    assert len(flattened) == len(set(flattened))
+    with pytest.raises(ValueError, match="work shard"):
+        partition_work_keys(work_keys, shard_count=0, shard_index=0)
+    with pytest.raises(ValueError, match="work shard"):
+        partition_work_keys(work_keys, shard_count=4, shard_index=4)
+
+
 def test_parity_coverage_survives_crash_after_atomic_shard_commit(tmp_path):
     dataset = tmp_path / "dataset.parquet"
     pd.DataFrame({"value": [1]}).to_parquet(dataset, index=False)
@@ -905,6 +923,8 @@ def test_cli_exposes_only_discovery_logit_lens_commands():
     assert run.batch_size == 32
     assert run.max_batch_tokens == 40000
     assert run.capture_chunk_size == 64
+    assert run.work_shard_count == 1
+    assert run.work_shard_index == 0
     assert analyze.command == "analyze"
     assert verify.mode == "partial"
     with pytest.raises(SystemExit):
