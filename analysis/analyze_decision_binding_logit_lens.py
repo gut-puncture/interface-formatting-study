@@ -1,4 +1,4 @@
-"""Frozen descriptive analysis for the Mistral two-contract logit lens.
+"""Frozen descriptive analysis for the pinned-profile two-contract logit lens.
 
 The verified merged input has one row per ``(block_work_key, contract, layer)``.
 Four-score arrays are in displayed-option order; this module maps them to the
@@ -97,22 +97,27 @@ def _margin(values: Sequence[float]) -> float:
 
 
 def _validate_trajectory(trajectory: Mapping[int, Sequence[float]]) -> dict[int, list[float]]:
-    if set(trajectory) != set(LAYERS):
-        raise ValueError("A trajectory must contain exactly layers 0 through 31")
-    return {layer: _four_finite(trajectory[layer]).tolist() for layer in LAYERS}
+    layers = tuple(range(len(trajectory)))
+    if len(layers) < 2 or set(trajectory) != set(layers):
+        raise ValueError("A trajectory must contain contiguous layers starting at 0")
+    return {layer: _four_finite(trajectory[layer]).tolist() for layer in layers}
 
 
 def stable_to_final_layer(trajectory: Mapping[int, Sequence[float]]) -> tuple[int, float] | None:
-    """Earliest pre-final layer with one winner persisting through layer 31."""
+    """Earliest pre-final layer with one winner persisting through the final layer."""
 
     scores = _validate_trajectory(trajectory)
-    final = argmax_set(scores[31])
+    layers = tuple(scores)
+    final_layer = layers[-1]
+    final = argmax_set(scores[final_layer])
     if len(final) != 1:
         return None
-    for start in PRE_FINAL_LAYERS:
-        subsequent = [argmax_set(scores[layer]) for layer in range(start, 32)]
+    for start in layers[:-1]:
+        subsequent = [argmax_set(scores[layer]) for layer in range(start, final_layer + 1)]
         if all(winners == final and len(winners) == 1 for winners in subsequent):
-            return start, min(_margin(scores[layer]) for layer in range(start, 32))
+            return start, min(
+                _margin(scores[layer]) for layer in range(start, final_layer + 1)
+            )
     return None
 
 
@@ -124,21 +129,25 @@ def plain_wrapped_separation_onset(
 
     plain_scores = _validate_trajectory(plain)
     wrapped_scores = _validate_trajectory(wrapped)
-    plain_final = argmax_set(plain_scores[31])
-    wrapped_final = argmax_set(wrapped_scores[31])
+    if tuple(plain_scores) != tuple(wrapped_scores):
+        raise ValueError("Plain and wrapped trajectories must use the same layers")
+    layers = tuple(plain_scores)
+    final_layer = layers[-1]
+    plain_final = argmax_set(plain_scores[final_layer])
+    wrapped_final = argmax_set(wrapped_scores[final_layer])
     if len(plain_final) != 1 or len(wrapped_final) != 1 or plain_final == wrapped_final:
         return None
-    for start in PRE_FINAL_LAYERS:
+    for start in layers[:-1]:
         if all(
             argmax_set(plain_scores[layer]) == plain_final
             and argmax_set(wrapped_scores[layer]) == wrapped_final
-            for layer in range(start, 32)
+            for layer in range(start, final_layer + 1)
         ):
             return start
     return None
 
 
-def _validate_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def _validate_frame(frame: pd.DataFrame, *, expected_layers: int = 32) -> pd.DataFrame:
     required = {
         "block_work_key",
         "item_id",
@@ -174,9 +183,14 @@ def _validate_frame(frame: pd.DataFrame) -> pd.DataFrame:
             raise ValueError(f"{column} must be boolean and non-null")
     if (table["first_token_contrast_evaluable"] & ~table["primary_contrast_evaluable"]).any():
         raise ValueError("first_token_contrast_evaluable requires primary_contrast_evaluable")
+    layers = tuple(range(int(expected_layers)))
+    if len(layers) < 2:
+        raise ValueError("expected_layers must be at least two")
     for key, group in table.groupby(["block_work_key", "contract"], sort=False):
-        if set(group["layer"]) != set(LAYERS) or len(group) != len(LAYERS):
-            raise ValueError(f"Each block-contract must contain exactly layers 0 through 31: {key}")
+        if set(group["layer"]) != set(layers) or len(group) != len(layers):
+            raise ValueError(
+                f"Each block-contract must contain exactly layers 0 through {layers[-1]}: {key}"
+            )
         if group["item_id"].astype(str).nunique() != 1 or group["wrapper_name"].astype(str).nunique() != 1:
             raise ValueError(f"Block identity changes across layers: {key}")
         if group["primary_contrast_evaluable"].nunique(dropna=False) != 1:
@@ -295,27 +309,33 @@ def _agreement_rows(pairs: pd.DataFrame, score_columns: Mapping[str, str]) -> pd
     return pd.DataFrame(rows)
 
 
-def _normalized_auc(layer_values: pd.Series) -> float:
+def _normalized_auc(layer_values: pd.Series, pre_final_layers: Sequence[int] = PRE_FINAL_LAYERS) -> float:
     indexed = layer_values.sort_index()
-    if tuple(int(value) for value in indexed.index) != PRE_FINAL_LAYERS:
-        raise ValueError("AUC requires one value for each pre-final layer 0 through 30")
+    expected = tuple(int(value) for value in pre_final_layers)
+    if tuple(int(value) for value in indexed.index) != expected:
+        raise ValueError("AUC requires one value for each authenticated pre-final layer")
     values = indexed.to_numpy(dtype=float)
-    return float((0.5 * values[0] + values[1:-1].sum() + 0.5 * values[-1]) / 30.0)
+    return float(
+        (0.5 * values[0] + values[1:-1].sum() + 0.5 * values[-1])
+        / float(expected[-1])
+    )
 
 
-def _pair_aucs(agreements: pd.DataFrame) -> pd.DataFrame:
+def _pair_aucs(
+    agreements: pd.DataFrame, *, pre_final_layers: Sequence[int] = PRE_FINAL_LAYERS
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for keys, group in agreements.groupby(
         ["item_id", "wrapper_name", "contract", "score_variant"], sort=True
     ):
-        per_layer = group.groupby("layer")["agreement"].mean().reindex(PRE_FINAL_LAYERS)
+        per_layer = group.groupby("layer")["agreement"].mean().reindex(pre_final_layers)
         rows.append(
             {
                 "item_id": keys[0],
                 "wrapper_name": keys[1],
                 "contract": keys[2],
                 "score_variant": keys[3],
-                "auc": _normalized_auc(per_layer),
+                "auc": _normalized_auc(per_layer, pre_final_layers),
             }
         )
     return pd.DataFrame(rows)
@@ -396,6 +416,7 @@ def _trajectory_summary(
     *,
     n_boot: int,
     seed: int,
+    layers: Sequence[int] = LAYERS,
 ) -> pd.DataFrame:
     item_layer = (
         agreements.groupby(["item_id", "contract", "score_variant", "layer"], as_index=False)
@@ -410,7 +431,7 @@ def _trajectory_summary(
     summary["simultaneous_ci_low"] = np.nan
     summary["simultaneous_ci_high"] = np.nan
     for (contract, variant), group in item_layer.groupby(["contract", "score_variant"], sort=True):
-        matrix = group.pivot(index="item_id", columns="layer", values="agreement").reindex(columns=LAYERS)
+        matrix = group.pivot(index="item_id", columns="layer", values="agreement").reindex(columns=layers)
         if matrix.isna().any().any():
             raise ValueError(f"Trajectory band requires complete item trajectories: {contract}/{variant}")
         values = matrix.to_numpy(dtype=float)
@@ -699,6 +720,7 @@ def evaluate_quality_gates(
     diagnostics: pd.DataFrame,
     *,
     population_items: int,
+    final_layer: int = 31,
 ) -> dict[str, object]:
     """Evaluate the frozen gates that must pass before any positive label."""
 
@@ -782,7 +804,7 @@ def evaluate_quality_gates(
 
     required_readouts = list(QUALITY_GATE_POLICY["required_final_layer_readouts"])
     final_diagnostics = diagnostics[
-        (pd.to_numeric(diagnostics.get("layer"), errors="coerce") == 31)
+        (pd.to_numeric(diagnostics.get("layer"), errors="coerce") == int(final_layer))
         & diagnostics.get(
             "contract", pd.Series(index=diagnostics.index, dtype=str)
         ).astype(str).isin(required_contracts)
@@ -834,7 +856,7 @@ def evaluate_quality_gates(
         },
         "numerical_fragility": {
             "passed": bool(fragility_passed),
-            "final_layer": 31,
+            "final_layer": int(final_layer),
             "ambiguity_reference": AMBIGUITY_THRESHOLD,
             "maximum_allowed_rate": maximum_ambiguity,
             "rows": fragility_details,
@@ -926,6 +948,9 @@ def _write_trajectory_figure(
     trajectories: pd.DataFrame,
     diagnostics: pd.DataFrame,
     output_path: Path,
+    *,
+    final_layer: int = 31,
+    model_name: str = "Mistral",
 ) -> None:
     import matplotlib
 
@@ -962,7 +987,7 @@ def _write_trajectory_figure(
                     alpha=0.14,
                     linewidth=0,
                 )
-            agreement_axis.axvline(31, color="0.5", linewidth=0.8, linestyle=":")
+            agreement_axis.axvline(final_layer, color="0.5", linewidth=0.8, linestyle=":")
             agreement_axis.set_ylim(0.0, 1.0)
             agreement_axis.set_ylabel("Plain/wrapped winner agreement")
             agreement_axis.set_title(f"{contract.capitalize()} output contract")
@@ -998,7 +1023,7 @@ def _write_trajectory_figure(
                     alpha=0.9,
                     label=f"{labels[variant]} wrapped margin",
                 )
-            diagnostic_axis.axvline(31, color="0.5", linewidth=0.8, linestyle=":")
+            diagnostic_axis.axvline(final_layer, color="0.5", linewidth=0.8, linestyle=":")
             diagnostic_axis.set_xlabel("Transformer layer")
             diagnostic_axis.set_ylabel("Restricted four-way JSD")
             margin_axis.set_ylabel("Top-two log-probability margin")
@@ -1006,7 +1031,7 @@ def _write_trajectory_figure(
             diagnostic_axis.legend(loc="upper left", frameon=False)
             margin_axis.legend(loc="upper right", frameon=False)
 
-        figure.suptitle("Mistral two-contract logit-lens trajectories", fontsize=13)
+        figure.suptitle(f"{model_name} two-contract logit-lens trajectories", fontsize=13)
         figure.tight_layout(rect=(0, 0, 1, 0.97))
         figure.savefig(
             output_path,
@@ -1017,12 +1042,21 @@ def _write_trajectory_figure(
         plt.close(figure)
 
 
-def analyze_frame(frame: pd.DataFrame, *, n_boot: int = 5000, seed: int = 1729) -> dict[str, object]:
-    table = _validate_frame(frame)
+def analyze_frame(
+    frame: pd.DataFrame,
+    *,
+    n_boot: int = 5000,
+    seed: int = 1729,
+    expected_layers: int = 32,
+) -> dict[str, object]:
+    layers = tuple(range(int(expected_layers)))
+    pre_final_layers = layers[:-1]
+    final_layer = layers[-1]
+    table = _validate_frame(frame, expected_layers=expected_layers)
     pairs = _pair_rows(table)
     score_columns = _active_score_columns(table)
     agreements = _agreement_rows(pairs, score_columns)
-    pair_aucs = _pair_aucs(agreements)
+    pair_aucs = _pair_aucs(agreements, pre_final_layers=pre_final_layers)
     primary = _contrast_rows(
         pair_aucs, "candidate_total", n_boot=n_boot, seed=seed
     )
@@ -1034,13 +1068,16 @@ def analyze_frame(frame: pd.DataFrame, *, n_boot: int = 5000, seed: int = 1729) 
         ],
         ignore_index=True,
     )
-    all_trajectories = _trajectory_summary(agreements, n_boot=n_boot, seed=seed)
+    all_trajectories = _trajectory_summary(
+        agreements, n_boot=n_boot, seed=seed, layers=layers
+    )
     calibrated_letter = all_trajectories[
         all_trajectories["score_variant"] == "letter_calibrated"
     ].copy()
     if not calibrated_letter.empty:
         calibrated_auc = _normalized_auc(
-            calibrated_letter.set_index("layer").loc[list(PRE_FINAL_LAYERS), "agreement"]
+            calibrated_letter.set_index("layer").loc[list(pre_final_layers), "agreement"],
+            pre_final_layers,
         )
         calibrated_letter["agreement_auc"] = calibrated_auc
     trajectories = all_trajectories[
@@ -1055,6 +1092,7 @@ def analyze_frame(frame: pd.DataFrame, *, n_boot: int = 5000, seed: int = 1729) 
         secondary,
         diagnostics,
         population_items=int(population_receipts["items"]),
+        final_layer=final_layer,
     )
     ungated_conclusion = classify_conclusion(primary, secondary, strata)
     conclusion = (
@@ -1069,8 +1107,8 @@ def analyze_frame(frame: pd.DataFrame, *, n_boot: int = 5000, seed: int = 1729) 
         "analysis_version": "decision_binding_logit_lens_v1",
         "bootstrap_samples": int(n_boot),
         "bootstrap_seed": int(seed),
-        "pre_final_layers": list(PRE_FINAL_LAYERS),
-        "final_parity_layer": 31,
+        "pre_final_layers": list(pre_final_layers),
+        "final_parity_layer": final_layer,
         "conclusion": conclusion,
         "quality_gates_passed": bool(quality_gates["all_passed"]),
         "claim_boundary": (
@@ -1118,8 +1156,21 @@ def _interpretation_memo(
     )
 
 
-def analyze(input_path: Path, output_dir: Path, *, n_boot: int = 5000, seed: int = 1729) -> dict[str, Path]:
-    result = analyze_frame(pd.read_parquet(input_path), n_boot=n_boot, seed=seed)
+def analyze(
+    input_path: Path,
+    output_dir: Path,
+    *,
+    n_boot: int = 5000,
+    seed: int = 1729,
+    expected_layers: int = 32,
+    model_name: str = "Mistral",
+) -> dict[str, Path]:
+    result = analyze_frame(
+        pd.read_parquet(input_path),
+        n_boot=n_boot,
+        seed=seed,
+        expected_layers=expected_layers,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs = {
         "analysis_summary": output_dir / "analysis_summary.json",
@@ -1158,7 +1209,11 @@ def analyze(input_path: Path, output_dir: Path, *, n_boot: int = 5000, seed: int
         result[name].to_csv(outputs[name], index=False)
     _timing_distributions(result["timing"]).to_csv(outputs["timing_distributions"], index=False)
     _write_trajectory_figure(
-        result["trajectories"], result["diagnostics"], outputs["trajectory_figure"]
+        result["trajectories"],
+        result["diagnostics"],
+        outputs["trajectory_figure"],
+        final_layer=int(result["summary"]["final_parity_layer"]),
+        model_name=model_name,
     )
     return outputs
 

@@ -12,14 +12,14 @@ FETCH = ROOT / "scripts/fetch_decision_binding_logit_lens_artifacts.sh"
 SYNC = ROOT / "scripts/sync_interface_formatting_study_to_gpu.sh"
 
 
-def test_logit_lens_runner_is_mistral_only_and_uses_runtime_configuration():
+def test_logit_lens_runner_uses_explicit_pinned_profile_and_runtime_configuration():
     script = RUN.read_text(encoding="utf-8")
 
     assert ".venv/bin/python" in script
     assert "interface_formatting_study.decision_binding_logit_lens_cli" in script
-    assert '--profile "mistral"' in script
-    assert "qwen" not in script.lower()
-    assert "phi" not in script.lower()
+    assert 'PROFILE="$2"' in script
+    assert '[[ "$PROFILE" =~ ^(mistral|phi|qwen)$ ]]' in script
+    assert '--profile "$PROFILE"' in script
     assert '[[ "$MODE" =~ ^(startup|full)$ ]]' in script
     assert 'BATCH_SIZE:-8' in script
     assert 'MAX_BATCH_TOKENS:-24000' in script
@@ -42,7 +42,7 @@ def test_logit_lens_runner_passes_frozen_arguments_through_real_entrypoint(tmp_p
     fake_python.chmod(0o755)
 
     subprocess.run(
-        ["bash", str(RUN), "startup", "/prepared/v4", "/prepared/tokenization"],
+        ["bash", str(RUN), "startup", "phi", "/prepared/v4", "/prepared/tokenization"],
         cwd=project,
         env={
             **os.environ,
@@ -57,7 +57,7 @@ def test_logit_lens_runner_passes_frozen_arguments_through_real_entrypoint(tmp_p
 
     args = log.read_text(encoding="utf-8")
     assert "-m interface_formatting_study.decision_binding_logit_lens_cli run-model" in args
-    assert "--profile mistral" in args
+    assert "--profile phi" in args
     assert "--bundle /prepared/v4" in args
     assert "--token-audit /prepared/tokenization" in args
     assert "--batch-size 3" in args
@@ -136,13 +136,13 @@ def test_logit_lens_control_keeps_live_startup_owned_when_status_requests_full(t
     fake_ps.write_text(
         "#!/usr/bin/env bash\n"
         "echo 'bash scripts/run_decision_binding_logit_lens_gpu.sh startup "
-        "/prepared/v4 /prepared/tokenization'\n",
+        "mistral /prepared/v4 /prepared/tokenization'\n",
         encoding="utf-8",
     )
     fake_ps.chmod(0o755)
 
     result = subprocess.run(
-        ["bash", str(CONTROL), "status", "full"],
+        ["bash", str(CONTROL), "status", "mistral", "full"],
         env={
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -169,6 +169,8 @@ def test_logit_lens_fetch_supports_partial_startup_and_complete_verification():
     assert '--mode "$MODE"' in script
     assert ".venv/bin/python" in script
     assert 'missing executable Python runtime' in script
+    assert 'phi-3.5-mini-instruct' in script
+    assert 'qwen2.5-1.5b-instruct' in script
 
 
 def test_logit_lens_operator_scripts_are_in_the_thin_gpu_sync_whitelist():

@@ -470,3 +470,50 @@ def test_cached_trie_matches_scalar_on_real_mistral_cache_api():
     for actual, expected in zip(cached, scalar, strict=True):
         assert torch.allclose(actual.total_logp, expected.total_logp, atol=PARITY_ATOL)
         assert torch.allclose(actual.letter_logp, expected.letter_logp, atol=PARITY_ATOL)
+
+
+@pytest.mark.parametrize("architecture", ["phi", "qwen"])
+def test_cached_trie_matches_scalar_and_final_native_on_cross_model_cache_apis(
+    architecture,
+):
+    if architecture == "phi":
+        from transformers import Phi3Config, Phi3ForCausalLM
+
+        config_class, model_class = Phi3Config, Phi3ForCausalLM
+    else:
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+
+        config_class, model_class = Qwen2Config, Qwen2ForCausalLM
+    model = model_class(
+        config_class(
+            vocab_size=96,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=1,
+        )
+    )
+    tokenizer = ExactTokenizer()
+    audits = [
+        audit_fixed_root_continuations(
+            tokenizer, prompt, ["A", "Berlin", "New York", "New York City"]
+        )
+        for prompt in ("Question\nAnswer: ", "Distinct\nAnswer: ")
+    ]
+
+    scalar = [
+        score_candidate_paths_scalar(model, audit, expected_layers=2)
+        for audit in audits
+    ]
+    cached = score_candidate_paths_cached_many(model, audits, expected_layers=2)
+
+    for actual, expected in zip(cached, scalar, strict=True):
+        assert actual.max_final_native_difference <= PARITY_ATOL
+        assert torch.allclose(actual.total_logp, expected.total_logp, atol=PARITY_ATOL)
+        assert torch.allclose(actual.mean_token_logp, expected.mean_token_logp, atol=PARITY_ATOL)
+        assert torch.allclose(actual.letter_logp, expected.letter_logp, atol=PARITY_ATOL)

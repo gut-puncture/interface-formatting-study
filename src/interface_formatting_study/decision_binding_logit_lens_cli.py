@@ -54,9 +54,6 @@ EXPECTED_FORMATS = (
     "toml_config",
 )
 EXPECTED_SPLIT_ITEMS = {"train": 1801, "validation": 600}
-MISTRAL_ID = "mistralai/Mistral-7B-Instruct-v0.3"
-MISTRAL_REVISION = "c170c708c41dac9275d15a8fff4eca08d52bab71"
-MISTRAL_SLUG = "mistral-7b-instruct-v0.3"
 CLAIM_BOUNDARY = "descriptive_layerwise_logit_lens_not_causal"
 TOKEN_AUDIT_SCHEMA_VERSION = 1
 RUN_SCHEMA_VERSION = 1
@@ -75,6 +72,30 @@ EXPECTED_ANALYSIS_ARTIFACTS = {
     "trajectory_figure": "analysis/trajectory_2x2.png",
     "strata": "analysis/strata.csv",
 }
+
+
+def _model_receipt(profile: ModelProfile) -> dict[str, object]:
+    return {
+        "id": profile.model_id,
+        "revision": profile.revision,
+        "slug": profile.slug,
+        "expected_layers": profile.expected_layers,
+    }
+
+
+def _require_profile_model(
+    profile: ModelProfile,
+    model: Mapping[str, object],
+    *,
+    source: str,
+) -> None:
+    for field, expected in _model_receipt(profile).items():
+        if field in {"slug", "expected_layers"} and field not in model:
+            continue
+        if model.get(field) != expected:
+            raise RuntimeError(
+                f"{source} is not bound to pinned profile {profile.name}: {field}"
+            )
 
 
 class GpuPhaseTelemetry:
@@ -898,6 +919,7 @@ def audit_tokenizer_bundle(
     *,
     tokenizer,
     max_context_tokens: int,
+    profile: ModelProfile | None = None,
     expected_split_items: Mapping[str, int] = EXPECTED_SPLIT_ITEMS,
     expected_formats: Sequence[str] = EXPECTED_FORMATS,
 ) -> dict[str, object]:
@@ -910,6 +932,10 @@ def audit_tokenizer_bundle(
         expected_split_items=expected_split_items,
         expected_formats=expected_formats,
     )
+    if profile is not None:
+        _require_profile_model(
+            profile, prepared.get("model", {}), source="prepared bundle"
+        )
     records: list[dict[str, object]] = []
     for source_row in ledger.to_dict("records"):
         displayed_candidates = _displayed_candidates(source_row)
@@ -1028,6 +1054,8 @@ def load_token_audit(
         or prepared.get("ledger_sha256") != manifest.get("prepared_ledger_sha256")
     ):
         raise RuntimeError("token audit prepared-bundle identity mismatch")
+    if manifest.get("model") != prepared.get("model"):
+        raise RuntimeError("token audit model identity mismatch")
     path = audit_root / "continuation_audit.parquet"
     if not path.exists() or sha256_file(path) != manifest.get("audit_sha256"):
         raise RuntimeError("token audit checksum mismatch")
@@ -1535,11 +1563,11 @@ def run_atomic_chunks(
     return processed
 
 
-def _runtime_environment() -> dict[str, object]:
+def _runtime_environment(profile: ModelProfile) -> dict[str, object]:
     if not torch.cuda.is_available():
-        raise RuntimeError("Mistral logit-lens execution requires a CUDA GPU")
+        raise RuntimeError(f"{profile.name} logit-lens execution requires a CUDA GPU")
     if not torch.cuda.is_bf16_supported():
-        raise RuntimeError("Mistral logit-lens execution requires CUDA BF16 support")
+        raise RuntimeError(f"{profile.name} logit-lens execution requires CUDA BF16 support")
     capability = torch.cuda.get_device_capability(0)
 
     def version(distribution: str) -> str:
@@ -1562,7 +1590,10 @@ def _runtime_environment() -> dict[str, object]:
     }
 
 
-def _analysis_spec() -> dict[str, object]:
+def _analysis_spec(expected_layers: int = 32) -> dict[str, object]:
+    if int(expected_layers) < 2:
+        raise ValueError("analysis requires at least two transformer layers")
+    final_layer = int(expected_layers) - 1
     return {
         "schema_version": 1,
         "primary_score": "candidate_path_total_logp",
@@ -1570,8 +1601,8 @@ def _analysis_spec() -> dict[str, object]:
         "root_diagnostic": "candidate_first_token_logp",
         "letter_primary": "raw_logp",
         "letter_secondary": "content_free_calibrated_logp",
-        "pre_final_layers": list(range(31)),
-        "parity_layer": 31,
+        "pre_final_layers": list(range(final_layer)),
+        "parity_layer": final_layer,
         "same_forward_final_native_parity_atol": PARITY_ATOL,
         "cross_forward_sensitivity_policy": CROSS_FORWARD_SENSITIVITY_POLICY,
         "ambiguity_reference": 0.04,
@@ -1747,8 +1778,6 @@ def _merge_parity_reports(
 
 def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
     profile = get_model_profile(args.profile)
-    if profile.name != "mistral":
-        raise ValueError("the logit-lens experiment is frozen to Mistral only")
     if args.batch_size < 1 or args.max_batch_tokens < 1 or args.capture_chunk_size < 1:
         raise ValueError("runtime batch size, token cap, and chunk size must be positive")
     work_shard_count = int(getattr(args, "work_shard_count", 1))
@@ -1769,12 +1798,20 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("max-chunks-this-invocation must be positive")
 
     prepared, ledger = load_prepared_bundle(args.bundle)
+    _require_profile_model(
+        profile, prepared.get("model", {}), source="prepared bundle"
+    )
     token_manifest, token_audit = load_token_audit(
         args.token_audit,
         bundle_root=args.bundle,
         expected_blocks=len(ledger),
     )
-    environment = _runtime_environment()
+    _require_profile_model(
+        profile,
+        token_manifest.get("model", {}),
+        source="token audit",
+    )
+    environment = _runtime_environment(profile)
     if args.startup_items is None:
         mode = "full"
         all_work_keys = ledger["block_work_key"].astype(str).tolist()
@@ -1790,7 +1827,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         work_keys = select_startup_work_keys(token_audit, count=args.startup_items)
         all_work_keys = work_keys
     config = {
-        "experiment": "mistral_two_contract_logit_lens_v4",
+        "experiment": f"{profile.name}_two_contract_logit_lens_v4",
         "stage": "discovery",
         "mode": mode,
         "prepared_manifest_sha256": sha256_file(
@@ -1814,7 +1851,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             "same_forward_final_native_parity_atol": PARITY_ATOL,
             "cross_forward_sensitivity_policy": CROSS_FORWARD_SENSITIVITY_POLICY,
         },
-        "analysis_policy": _analysis_spec(),
+        "analysis_policy": _analysis_spec(profile.expected_layers),
         "runtime_environment": environment,
         "batch_size": int(args.batch_size),
         "max_batch_tokens": int(args.max_batch_tokens),
@@ -1862,7 +1899,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         "expected_rows": len(all_work_keys) * profile.expected_layers * 2,
     }
     _atomic_json(work_plan, run_root / "work_plan.json")
-    _atomic_json(_analysis_spec(), run_root / "analysis_spec.json")
+    _atomic_json(_analysis_spec(profile.expected_layers), run_root / "analysis_spec.json")
 
     store = ShardStore(run_root / "shards" / "lens", identity)
     completed_before = store.completed_work_keys()
@@ -1929,10 +1966,12 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             trust_remote_code=profile.trust_remote_code,
         )
         if device.type != "cuda" or next(model.parameters()).dtype != torch.bfloat16:
-            raise RuntimeError("loaded Mistral does not match CUDA BF16 runtime identity")
+            raise RuntimeError(
+                f"loaded {profile.name} does not match CUDA BF16 runtime identity"
+            )
         current_tokenizer = _tokenizer_receipt(tokenizer)
         expected_tokenizer = token_manifest["tokenizer"]
-        for field in ("class", "special_token_ids", "backend_sha256"):
+        for field in ("receipt_sha256",):
             if current_tokenizer.get(field) != expected_tokenizer.get(field):
                 raise RuntimeError(f"loaded tokenizer differs from token audit: {field}")
         observed_context = int(getattr(model.config, "max_position_embeddings", -1))
@@ -2179,7 +2218,10 @@ def prepare_bundle(
     v3_bundle_root: str | Path,
     design_manifest_path: str | Path,
     output_dir: str | Path,
+    *,
+    profile: ModelProfile | str = "mistral",
 ) -> dict[str, object]:
+    profile = get_model_profile(profile) if isinstance(profile, str) else profile
     causal_root = Path(causal_run_root)
     run_manifest = _read_json(causal_root / "run_manifest.json", name="causal run manifest")
     identity = _read_json(causal_root / "semantic_identity.json", name="causal identity")
@@ -2192,8 +2234,7 @@ def prepare_bundle(
     if run_manifest.get("semantic_identity") != identity:
         raise RuntimeError("causal run identity mismatch")
     model = identity.get("model", {})
-    if model.get("id") != MISTRAL_ID or model.get("revision") != MISTRAL_REVISION:
-        raise RuntimeError("causal source is not the pinned Mistral run")
+    _require_profile_model(profile, model, source="causal source")
     identity_splits = set(
         map(str, identity.get("experiment_config", {}).get("design_splits", []))
     )
@@ -2208,13 +2249,11 @@ def prepare_bundle(
     v3 = _read_json(v3_root / "prepared_manifest.json", name="v3 prepared manifest")
     if v2.get("stage") != "discovery" or v3.get("stage") != "discovery":
         raise RuntimeError("source bundles must remain discovery-only")
+    _require_profile_model(profile, v2.get("model", {}), source="v2 bundle")
+    _require_profile_model(profile, v3.get("source_model", {}), source="v3 bundle")
     if (
-        v2.get("model", {}).get("id") != MISTRAL_ID
-        or v2.get("model", {}).get("revision") != MISTRAL_REVISION
-        or v2.get("source_scored_sha256") != raw_manifest.get("sha256")
+        v2.get("source_scored_sha256") != raw_manifest.get("sha256")
         or v3.get("source_readout_sha256") != v2.get("readout", {}).get("sha256")
-        or v3.get("source_model", {}).get("id") != MISTRAL_ID
-        or v3.get("source_model", {}).get("revision") != MISTRAL_REVISION
     ):
         raise RuntimeError("source bundle identity chain mismatch")
     audit_receipts = load_design_audit_receipts(
@@ -2273,8 +2312,8 @@ def prepare_bundle(
     manifest = {
         "schema_version": 1,
         "stage": "discovery",
-        "experiment": "mistral_two_contract_logit_lens_v4",
-        "model": {"id": MISTRAL_ID, "revision": MISTRAL_REVISION, "slug": MISTRAL_SLUG},
+        "experiment": f"{profile.name}_two_contract_logit_lens_v4",
+        "model": _model_receipt(profile),
         "rows": len(ledger),
         "items": int(ledger["item_id"].nunique()),
         "split_items": {str(k): int(v) for k, v in split_items.items()},
@@ -2765,13 +2804,12 @@ def _cmd_prepare(args: argparse.Namespace) -> None:
         args.v3_bundle,
         args.design_manifest,
         args.output_dir,
+        profile=get_model_profile(args.profile),
     )
     print(json.dumps(manifest, sort_keys=True))
 
 
 def _cmd_audit_tokenizer(args: argparse.Namespace) -> None:
-    if args.profile != "mistral":
-        raise ValueError("the tokenizer audit is frozen to Mistral only")
     from transformers import AutoConfig, AutoTokenizer
 
     profile = get_model_profile(args.profile)
@@ -2794,6 +2832,7 @@ def _cmd_audit_tokenizer(args: argparse.Namespace) -> None:
         args.output,
         tokenizer=tokenizer,
         max_context_tokens=max_context_tokens,
+        profile=profile,
     )
     print(json.dumps(manifest, sort_keys=True))
 
@@ -2835,6 +2874,8 @@ def _cmd_analyze(args: argparse.Namespace) -> None:
         output_dir,
         n_boot=int(args.bootstrap_samples),
         seed=int(args.seed),
+        expected_layers=int(identity.get("model", {}).get("expected_layers", -1)),
+        model_name=str(identity.get("model", {}).get("slug", "model")),
     )
     manifest = _read_json(run_root / "run_manifest.json", name="run manifest")
     artifacts = dict(manifest.get("artifacts", {}))
@@ -2867,6 +2908,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     prepare = sub.add_parser("prepare")
+    prepare.add_argument("--profile", choices=["mistral", "phi", "qwen"], default="mistral")
     prepare.add_argument("--causal-run", required=True)
     prepare.add_argument("--v2-bundle", required=True)
     prepare.add_argument("--v3-bundle", required=True)
@@ -2875,14 +2917,14 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.set_defaults(func=_cmd_prepare)
 
     audit = sub.add_parser("audit-tokenizer")
-    audit.add_argument("--profile", choices=["mistral"], default="mistral")
+    audit.add_argument("--profile", choices=["mistral", "phi", "qwen"], default="mistral")
     audit.add_argument("--bundle", required=True)
     audit.add_argument("--output", required=True)
     audit.add_argument("--local-files-only", action="store_true")
     audit.set_defaults(func=_cmd_audit_tokenizer)
 
     run = sub.add_parser("run-model")
-    run.add_argument("--profile", choices=["mistral"], default="mistral")
+    run.add_argument("--profile", choices=["mistral", "phi", "qwen"], default="mistral")
     run.add_argument("--bundle", required=True)
     run.add_argument("--token-audit", required=True)
     run.add_argument("--output-base", default="results/decision_binding_logit_lens_runs")

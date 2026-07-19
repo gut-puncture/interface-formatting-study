@@ -96,6 +96,17 @@ def test_content_mapping_and_per_item_wrapper_aggregation_drive_primary_auc():
     assert letter_layer["n_pairs"] == 4
 
 
+def test_qwen_analysis_uses_authenticated_28_layer_boundary():
+    frame = _frame()
+    frame = frame[frame["layer"] < 28].copy()
+
+    result = MODULE.analyze_frame(frame, n_boot=10, seed=17, expected_layers=28)
+
+    assert result["summary"]["pre_final_layers"] == list(range(27))
+    assert result["summary"]["final_parity_layer"] == 27
+    assert set(result["trajectories"]["layer"]) == set(range(28))
+
+
 def test_primary_population_is_identical_for_letter_and_candidate_scores():
     frame = _frame()
     frame.loc[frame["wrapper_name"] == "xml", "primary_contrast_evaluable"] = False

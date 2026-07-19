@@ -1077,6 +1077,7 @@ def test_cli_exposes_only_discovery_logit_lens_commands():
     ])
 
     assert prepared.command == "prepare"
+    assert prepared.profile == "mistral"
     assert audit.command == "audit-tokenizer"
     assert run.profile == "mistral"
     assert run.batch_size == 32
@@ -1086,6 +1087,20 @@ def test_cli_exposes_only_discovery_logit_lens_commands():
     assert run.work_shard_index == 0
     assert analyze.command == "analyze"
     assert verify.mode == "partial"
+    for profile in ("phi", "qwen"):
+        assert parser.parse_args([
+            "prepare", "--profile", profile, "--causal-run", "run",
+            "--v2-bundle", "v2", "--v3-bundle", "v3",
+            "--design-manifest", "design-manifest", "--output-dir", "out",
+        ]).profile == profile
+        assert parser.parse_args([
+            "audit-tokenizer", "--profile", profile,
+            "--bundle", "bundle", "--output", "audit",
+        ]).profile == profile
+        assert parser.parse_args([
+            "run-model", "--profile", profile,
+            "--bundle", "bundle", "--token-audit", "audit",
+        ]).profile == profile
     with pytest.raises(SystemExit):
         parser.parse_args([
             "run-model", "--bundle", "bundle", "--token-audit", "audit",
