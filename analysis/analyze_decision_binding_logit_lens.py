@@ -439,7 +439,12 @@ def _jensen_shannon(left: Sequence[float], right: Sequence[float]) -> float:
     p = _restricted_probabilities(left)
     q = _restricted_probabilities(right)
     midpoint = 0.5 * (p + q)
-    return float(0.5 * np.sum(p * np.log(p / midpoint)) + 0.5 * np.sum(q * np.log(q / midpoint)))
+    p_positive = p > 0.0
+    q_positive = q > 0.0
+    return float(
+        0.5 * np.sum(p[p_positive] * np.log(p[p_positive] / midpoint[p_positive]))
+        + 0.5 * np.sum(q[q_positive] * np.log(q[q_positive] / midpoint[q_positive]))
+    )
 
 
 def _diagnostic_summary(pairs: pd.DataFrame, score_columns: Mapping[str, str]) -> pd.DataFrame:
