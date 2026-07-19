@@ -312,16 +312,27 @@ def _forward_last_position(
         raise RuntimeError("not every transformer-block logit-lens hook ran")
 
     target_tensor = torch.tensor(target_token_ids, dtype=torch.long, device=input_ids.device)
-    layer_rows: list[torch.Tensor] = []
     with torch.inference_mode():
-        for layer in range(len(blocks)):
-            projected = head(norm(captured[layer])).float()
-            log_probs = torch.log_softmax(projected, dim=-1)
-            layer_rows.append(log_probs.index_select(-1, target_tensor))
+        layer_rows: list[torch.Tensor] = []
+        if len(blocks) > 1:
+            intermediate_hidden = torch.stack(
+                [captured[layer] for layer in range(len(blocks) - 1)], dim=1
+            )
+            intermediate_projected = head(norm(intermediate_hidden)).float()
+            layer_rows.append(
+                torch.log_softmax(intermediate_projected, dim=-1).index_select(
+                    -1, target_tensor
+                )
+            )
+        final_projected = head(norm(captured[len(blocks) - 1])).float()
+        final_scores = torch.log_softmax(final_projected, dim=-1).index_select(
+            -1, target_tensor
+        )
+        layer_rows.append(final_scores.unsqueeze(1))
         native = torch.log_softmax(outputs.logits[:, -1, :].float(), dim=-1).index_select(
             -1, target_tensor
         )
-    layer_scores = torch.stack(layer_rows, dim=1)
+    layer_scores = torch.cat(layer_rows, dim=1)
     if not torch.isfinite(layer_scores).all() or not torch.isfinite(native).all():
         raise ValueError("logit-lens projection contains non-finite values")
     final_difference = float((layer_scores[:, -1] - native).abs().max().detach().cpu())

@@ -149,6 +149,31 @@ def test_continuation_audit_keeps_exact_surfaces_and_classifies_identity_hazards
     }
 
 
+def test_logit_lens_batches_intermediate_layer_projections():
+    tokenizer = ExactTokenizer()
+    audit = audit_fixed_root_continuations(
+        tokenizer,
+        "Question\nAnswer: ",
+        ["A", "B", "C", "D"],
+    )
+    model = TinyCachedMistral(layers=4)
+    calls = 0
+
+    def count_head_calls(_module, _inputs, _output):
+        nonlocal calls
+        calls += 1
+
+    handle = model.lm_head.register_forward_hook(count_head_calls)
+    try:
+        score_candidate_paths_cached(model, audit, expected_layers=4)
+    finally:
+        handle.remove()
+
+    # One native model projection, one batched intermediate-layer lens
+    # projection, and one separately parity-anchored final-layer projection.
+    assert calls == 3
+
+
 def test_continuation_audit_rejects_malformed_candidates_and_marks_empty_without_dropping_it():
     tokenizer = ExactTokenizer()
     with pytest.raises(ValueError, match="exactly four"):
