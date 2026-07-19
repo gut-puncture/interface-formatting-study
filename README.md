@@ -1,5 +1,9 @@
 # Interface Formatting Study
 
+The current camera-ready scientific story, verified Mistral findings, reviewer
+response plan, visual system, and CAISc submission requirements are recorded in
+[`PAPER_STORY_AND_CAMERA_READY_PLAN.md`](PAPER_STORY_AND_CAMERA_READY_PLAN.md).
+
 This repository tests whether interface formatting alone can change how a language model answers the same multiple-choice question.
 
 The experiment uses eight intended pure-interface wrappers: `csv_inline`, `graphql_query`, `html_form`, `ini_file`, `key_equals`, `protobuf_msg`, `shell_heredoc`, and `toml_config`. Answer-label likelihood is the primary metric, content-free calibration is provenance-tracked, splits are by MMLU item, and mechanistic claims are restricted to focused semantic-anchor diagnostics and controls.
