@@ -2205,15 +2205,18 @@ def _frames_match(left: pd.DataFrame, right: pd.DataFrame) -> bool:
             if result[column].dtype != object:
                 continue
             result[column] = result[column].map(
-                lambda value: json.dumps(
-                    value,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                    default=json_default,
+                lambda value: (
+                    "nested:"
+                    + json.dumps(
+                        value,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        default=json_default,
+                    )
+                    if isinstance(value, (list, tuple, dict, np.ndarray))
+                    else "scalar:" + json.dumps(value, default=json_default)
                 )
-                if isinstance(value, (list, tuple, dict, np.ndarray))
-                else value
             )
         return result
 

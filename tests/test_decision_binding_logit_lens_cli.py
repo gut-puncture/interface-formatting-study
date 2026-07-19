@@ -1313,6 +1313,10 @@ def test_frame_reconciliation_handles_nested_parquet_arrays():
     right = pd.DataFrame({"candidate_token_ids": [[[1, 2], [3]]]})
 
     assert logit_cli._frames_match(left, right)
+    assert not logit_cli._frames_match(
+        pd.DataFrame({"candidate_token_ids": [[[1, 2]]]}),
+        pd.DataFrame({"candidate_token_ids": ['[[1,2]]']}),
+    )
 
 
 def test_expected_formats_are_exactly_the_existing_nine():
