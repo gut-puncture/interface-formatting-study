@@ -38,6 +38,11 @@ that a step happened, and it never authorizes access to the final 599 items.
   `0.02 * token_count` per total path, and `0.04` only as an ambiguity flag.
 - [ ] Primary contrasts, layers 0-30 AUC, bootstrap count 5,000, Holm scope,
   prior strata, timing algorithms, and interpretation categories are frozen.
+- [ ] Freeze the positive-interpretation gates: resolved primary estimates;
+  at least 200 and at least 80% of 2,401 unique items per contract; same nonzero
+  candidate-total/token-mean direction under both contracts; and no more than
+  20% layer-31 `0.04`-ambiguity in either plain or wrapped rows for raw-letter
+  or candidate-total readouts under either contract.
 
 ## Authenticated Preparation
 
@@ -85,7 +90,9 @@ that a step happened, and it never authorizes access to the final 599 items.
   punctuation, label-like, duplicate, identical-token, shared-first-token,
   strict-prefix, decode-failure, special-token, and context-overflow counts.
 - [ ] Verify contextual A/B/C/D are distinct single tokens.
-- [ ] Verify every eligible prompt/candidate round trip exactly and that no row
+- [ ] Verify the fixed-root Metaspace-without-implicit-prefix policy, count
+  prompt-only round-trip mismatches, and verify every eligible appended path
+  decodes to the decoded root plus the exact candidate surface. Confirm no row
   was silently removed.
 
 ## Local Implementation Proof
@@ -228,11 +235,16 @@ ssh -i <key> -p <port> ubuntu@<host> \
 - [ ] Record both co-primary estimates, 95% item-cluster intervals, Holm result,
   total/mean agreement, first-token diagnostic, train/validation replication,
   predeclared strata, and coverage counts.
+- [ ] Verify and hash `quality_gates.json`; no positive interpretation is valid
+  unless every frozen gate passes. Record every failed gate without changing a
+  threshold or dropping affected rows.
 - [ ] Record paths/hashes for the token census, 2x2 trajectory figure,
   sensitivity table, timing distributions, strata table, parity/reproducibility
   table, analysis summary, and bounded interpretation memo.
-- [ ] Select exactly one declared interpretation category and copy its bounded
-  claim. Do not open the final 599, tune another score, or invent another probe.
+- [ ] Select exactly one declared interpretation category, using the exact
+  artifact label `predeclared_stratum_heterogeneous` for qualified
+  heterogeneity, and copy its bounded claim from `interpretation_memo.md`. Do
+  not open the final 599, tune another score, or invent another probe.
 
 ## Teardown And Closeout
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -11,13 +12,16 @@ import torch
 
 from interface_formatting_study.decision_binding_logit_lens_cli import (
     EXPECTED_FORMATS,
+    _parity_report_from_frame,
     audit_tokenizer_bundle,
     build_parser,
     build_logit_lens_identity,
     build_source_ledger,
+    execute_model_run,
     load_design_audit_receipts,
     load_token_audit,
     load_prepared_bundle,
+    prepare_bundle,
     run_atomic_chunks,
     score_lens_chunk,
     select_startup_work_keys,
@@ -112,6 +116,62 @@ def test_build_source_ledger_refuses_protected_split_before_prompt_access():
             expected_split_items={"test": 1},
             expected_formats=("plain", "wrapped"),
         )
+
+
+def test_prepare_bundle_rejects_protected_causal_identity_before_parquet_access(
+    tmp_path, monkeypatch
+):
+    causal_root = tmp_path / "causal"
+    raw_path = causal_root / "raw" / "causal_behavior.parquet"
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_bytes(b"must-not-be-opened")
+    identity = {
+        "semantic_run_id": "protected-run",
+        "semantic_sha256": "a" * 64,
+        "model": {
+            "id": "mistralai/Mistral-7B-Instruct-v0.3",
+            "revision": "c170c708c41dac9275d15a8fff4eca08d52bab71",
+        },
+        "experiment_config": {"design_splits": ["test"]},
+    }
+    (causal_root / "semantic_identity.json").write_text(json.dumps(identity))
+    (causal_root / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "canary": False,
+                "semantic_identity": identity,
+                "design": {"sha256": "b" * 64, "applicability_sha256": "c" * 64},
+            }
+        )
+    )
+    raw_path.with_name(raw_path.name + ".manifest.json").write_text(
+        json.dumps(
+            {
+                "semantic_run_id": identity["semantic_run_id"],
+                "sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+                "row_count": 1,
+            }
+        )
+    )
+    parquet_reads = 0
+
+    def reject_parquet_read(*_args, **_kwargs):
+        nonlocal parquet_reads
+        parquet_reads += 1
+        pytest.fail("protected source parquet was opened")
+
+    monkeypatch.setattr(pd, "read_parquet", reject_parquet_read)
+
+    with pytest.raises(RuntimeError, match="protected split"):
+        prepare_bundle(
+            causal_root,
+            tmp_path / "v2",
+            tmp_path / "v3",
+            tmp_path / "design.json",
+            tmp_path / "output",
+        )
+    assert parquet_reads == 0
 
 
 def test_build_source_ledger_pairs_contracts_and_persists_identity_eligibility():
@@ -312,11 +372,16 @@ def test_token_audit_is_complete_hash_bound_and_persists_structural_eligibility(
     assert list(first["candidate_path_token_counts"]) == [5, 8, 1, 5]
     assert isinstance(first["observation_token_text"], str)
     assert len(first["observation_character_span"]) == 2
+    assert bool(first["prompt_roundtrip_exact"])
+    assert len(first["decoded_prompt_sha256"]) == 64
     assert "prefix_collision" in first["candidate_identity_ineligibility_reasons"]
     assert "label_like_candidate" in first["candidate_identity_ineligibility_reasons"]
     assert not bool(first["primary_contrast_evaluable"])
     assert manifest["final_599_opened"] is False
     assert manifest["rows"] == 6
+    assert manifest["continuation_tokenization_policy"].endswith(
+        "without_implicit_prefix"
+    )
     assert len(manifest["audit_sha256"]) == 64
 
     path = tmp_path / "tokenization" / "continuation_audit.parquet"
@@ -544,6 +609,75 @@ def test_atomic_chunk_resume_skips_completed_work_and_max_chunks_is_invocation_o
         )
 
 
+def test_parity_coverage_survives_crash_after_atomic_shard_commit(tmp_path):
+    dataset = tmp_path / "dataset.parquet"
+    pd.DataFrame({"value": [1]}).to_parquet(dataset, index=False)
+    source = tmp_path / "source.py"
+    source.write_text("VALUE = 1\n")
+    identity = build_logit_lens_identity(
+        get_model_profile("mistral"),
+        config={"stage": "discovery"},
+        dataset_path=dataset,
+        source_paths=[source],
+    )
+    store = ShardStore(tmp_path / "shards", identity)
+
+    def process(keys):
+        return pd.DataFrame(
+            {
+                "block_work_key": list(keys),
+                "parity_final_native_max": [0.001] * len(keys),
+                "parity_cached_scalar_letter_max": [0.002] * len(keys),
+                "parity_cached_scalar_first_token_max": [0.003] * len(keys),
+                "parity_cached_scalar_mean_token_max": [0.004] * len(keys),
+                "parity_cached_scalar_total_per_token_max": [0.005] * len(keys),
+                "scalar_oracle_evaluated": [True] * len(keys),
+            }
+        )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run_atomic_chunks(
+            store,
+            ["a", "b"],
+            chunk_size=1,
+            max_chunks_this_invocation=1,
+            process_chunk=process,
+            on_flush=lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("simulated crash")
+            ),
+        )
+    assert store.completed_work_keys() == {"a"}
+
+    run_atomic_chunks(
+        store,
+        ["a", "b"],
+        chunk_size=1,
+        max_chunks_this_invocation=None,
+        process_chunk=process,
+    )
+    report = _parity_report_from_frame(store.merge())
+
+    assert report["covered_work_keys"] == ["a", "b"]
+    assert report["scalar_oracle_work_keys"] == ["a", "b"]
+
+
+def test_execute_model_run_requires_the_frozen_eight_by_four_startup_shape():
+    common = {
+        "profile": "mistral",
+        "batch_size": 8,
+        "max_batch_tokens": 24000,
+        "max_chunks_this_invocation": None,
+    }
+    with pytest.raises(ValueError, match="eight items"):
+        execute_model_run(
+            SimpleNamespace(**common, startup_items=7, capture_chunk_size=4)
+        )
+    with pytest.raises(ValueError, match="four-work-unit chunks"):
+        execute_model_run(
+            SimpleNamespace(**common, startup_items=8, capture_chunk_size=2)
+        )
+
+
 def _write_prepared_bundle(root: Path, ledger: pd.DataFrame) -> None:
     root.mkdir(parents=True, exist_ok=True)
     path = root / "prompt_ledger.parquet"
@@ -633,10 +767,7 @@ def test_cli_exposes_only_discovery_logit_lens_commands():
 def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path):
     # Minimal one-block, two-contract, two-layer fixture exercises the public verifier
     # without manufacturing model behavior.
-    run_id = "run-id"
     identity = {
-        "semantic_run_id": run_id,
-        "semantic_sha256": "b" * 64,
         "model": {
             "id": "model", "revision": "revision", "slug": "mistral-7b-instruct-v0.3",
             "expected_layers": 2,
@@ -680,6 +811,15 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     identity["experiment_config"]["tokenization_manifest_sha256"] = sha256_file(
         tmp_path / "tokenization_manifest.json"
     )
+    semantic_digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    run_id = semantic_digest[:20]
+    identity = {
+        "semantic_run_id": run_id,
+        "semantic_sha256": semantic_digest,
+        **identity,
+    }
     (tmp_path / "semantic_identity.json").write_text(json.dumps(identity))
     (tmp_path / "analysis_spec.json").write_text(
         json.dumps(identity["experiment_config"]["analysis_policy"])
@@ -703,6 +843,7 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
             "candidate_path_total_logps": [-0.2, -1.1, -2.1, -3.1],
             "candidate_mean_token_logps": [-0.2, -1.1, -2.1, -3.1],
             "candidate_first_token_logps": [-0.2, -1.1, -2.1, -3.1],
+            "candidate_path_evaluable": [True, True, True, True],
             "candidate_ranking_evaluable": True,
             "primary_contrast_evaluable": True,
             "primary_contrast_exclusion_reason": "eligible",
@@ -715,6 +856,12 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
                 if contract == "letter"
                 else [float("nan")] * 4
             ),
+            "parity_final_native_max": 0.0,
+            "parity_cached_scalar_letter_max": 0.0,
+            "parity_cached_scalar_first_token_max": 0.0,
+            "parity_cached_scalar_mean_token_max": 0.0,
+            "parity_cached_scalar_total_per_token_max": 0.0,
+            "scalar_oracle_evaluated": False,
         }
         for contract in ("letter", "text") for layer in range(2)
     ])
@@ -724,7 +871,7 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     shard_manifest = {
         "shard_schema_version": 1,
         "semantic_run_id": run_id,
-        "semantic_sha256": "b" * 64,
+        "semantic_sha256": semantic_digest,
         "model_id": "model", "model_revision": "revision",
         "work_keys": ["item|plain"],
         "data_sha256": sha256_file(shard / "data.parquet"),
@@ -733,8 +880,10 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     (shard / "manifest.json").write_text(json.dumps(shard_manifest))
     scores.to_parquet(tmp_path / "layerwise_scores.parquet", index=False)
     parity = {
-        "schema_version": 1,
+        "schema_version": 2,
         "tolerance": 0.02,
+        "covered_work_keys": ["item|plain"],
+        "scalar_oracle_work_keys": [],
         "max_final_native_difference": 0.0,
         "max_cached_scalar_letter_difference": 0.0,
         "max_cached_scalar_first_token_difference": 0.0,
@@ -742,6 +891,39 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
         "max_cached_scalar_total_per_token_difference": 0.0,
     }
     (tmp_path / "parity_report.json").write_text(json.dumps(parity))
+    telemetry = {
+        "schema_version": 1,
+        "semantic_run_id": run_id,
+        "completed_work_units": 1,
+        "root_input_tokens": 10,
+        "branch_input_tokens": 2,
+        "peak_vram_bytes": 1024,
+        "phase_seconds": {"root": 1.0, "branch": 0.5, "scalar_oracle": 0.0},
+        "gpu_utilization": {
+            "root": {"samples": 2, "mean_percent": 70.0, "max_percent": 80.0},
+            "branch": {"samples": 1, "mean_percent": 60.0, "max_percent": 60.0},
+            "scalar_oracle": {"samples": 0, "mean_percent": None, "max_percent": None},
+        },
+    }
+    (tmp_path / "telemetry_report.json").write_text(json.dumps(telemetry))
+    progress = {
+        "semantic_run_id": run_id,
+        "completed_work_units": 1,
+        "root_input_tokens": 10,
+        "branch_input_tokens": 2,
+    }
+    (tmp_path / "progress.json").write_text(json.dumps(progress))
+    attempts = tmp_path / "attempts"
+    attempts.mkdir()
+    (attempts / "attempt.json").write_text(
+        json.dumps(
+            {
+                "semantic_run_id": run_id,
+                "status": "complete",
+                "completed_after": 1,
+            }
+        )
+    )
     manifest = {
         "status": "complete",
         "semantic_identity": identity,
@@ -751,6 +933,8 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
         "artifacts": {
             "layerwise_scores_sha256": sha256_file(tmp_path / "layerwise_scores.parquet"),
             "parity_report_sha256": sha256_file(tmp_path / "parity_report.json"),
+            "telemetry_report_sha256": sha256_file(tmp_path / "telemetry_report.json"),
+            "progress_sha256": sha256_file(tmp_path / "progress.json"),
         },
         "claim": "descriptive_layerwise_logit_lens_not_causal",
     }
@@ -759,6 +943,31 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     receipt = verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
 
     assert receipt == {"status": "complete", "work_units": 1, "rows": 4}
+    incomplete_parity = {**parity, "covered_work_keys": []}
+    (tmp_path / "parity_report.json").write_text(json.dumps(incomplete_parity))
+    manifest["artifacts"]["parity_report_sha256"] = sha256_file(
+        tmp_path / "parity_report.json"
+    )
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="parity coverage"):
+        verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
+    (tmp_path / "parity_report.json").write_text(json.dumps(parity))
+    manifest["artifacts"]["parity_report_sha256"] = sha256_file(
+        tmp_path / "parity_report.json"
+    )
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+
+    forged_identity = json.loads(json.dumps(identity))
+    forged_identity["experiment_config"]["runtime_environment"]["gpu_name"] = "A100"
+    (tmp_path / "semantic_identity.json").write_text(json.dumps(forged_identity))
+    manifest["semantic_identity"] = forged_identity
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="semantic identity digest"):
+        verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
+    (tmp_path / "semantic_identity.json").write_text(json.dumps(identity))
+    manifest["semantic_identity"] = identity
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+
     masked = scores.copy()
     candidate_columns = (
         "candidate_path_total_logps",
@@ -771,6 +980,20 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     masked["primary_contrast_exclusion_reason"] = "prefix_collision"
     masked["first_token_contrast_evaluable"] = False
     masked["first_token_contrast_exclusion_reason"] = "shared_or_ineligible_first_token"
+    masked.to_parquet(shard / "data.parquet", index=False)
+    shard_manifest["data_sha256"] = sha256_file(shard / "data.parquet")
+    (shard / "manifest.json").write_text(json.dumps(shard_manifest))
+    masked.to_parquet(tmp_path / "layerwise_scores.parquet", index=False)
+    manifest["artifacts"]["layerwise_scores_sha256"] = sha256_file(
+        tmp_path / "layerwise_scores.parquet"
+    )
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="non-finite candidate path"):
+        verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
+
+    masked["candidate_path_evaluable"] = pd.Series(
+        [[False, False, False, False] for _ in range(len(masked))]
+    )
     masked.to_parquet(shard / "data.parquet", index=False)
     shard_manifest["data_sha256"] = sha256_file(shard / "data.parquet")
     (shard / "manifest.json").write_text(json.dumps(shard_manifest))

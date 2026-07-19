@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 import torch
 
@@ -18,6 +18,7 @@ from .hooks import find_transformer_blocks
 
 PARITY_ATOL = 0.02
 LETTERS = ("A", "B", "C", "D")
+_FIXED_ROOT_TOKENIZER_CACHE: dict[int, tuple[object, object]] = {}
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,33 @@ def _decode(tokenizer, token_ids: Sequence[int]) -> str:
         return str(tokenizer.decode(list(token_ids)))
 
 
+def _fixed_root_continuation_tokenizer(tokenizer):
+    """Disable only Mistral's implicit standalone leading-space marker."""
+
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    pre_tokenizer = getattr(backend, "pre_tokenizer", None)
+    description = repr(pre_tokenizer)
+    if not description.startswith("Metaspace("):
+        return tokenizer
+    if (
+        'replacement="▁"' not in description
+        or "prepend_scheme=first" not in description
+        or "split=False" not in description
+    ):
+        raise ValueError("unexpected Mistral Metaspace tokenizer policy")
+    cached = _FIXED_ROOT_TOKENIZER_CACHE.get(id(tokenizer))
+    if cached is not None and cached[0] is tokenizer:
+        return cached[1]
+    from tokenizers.pre_tokenizers import Metaspace
+
+    continuation_tokenizer = copy.deepcopy(tokenizer)
+    continuation_tokenizer.backend_tokenizer.pre_tokenizer = Metaspace(
+        replacement="▁", prepend_scheme="never", split=False
+    )
+    _FIXED_ROOT_TOKENIZER_CACHE[id(tokenizer)] = (tokenizer, continuation_tokenizer)
+    return continuation_tokenizer
+
+
 def _token_hash(token_ids: Sequence[int]) -> str:
     payload = ",".join(str(int(value)) for value in token_ids).encode("ascii")
     return hashlib.sha256(payload).hexdigest()
@@ -99,10 +127,12 @@ def audit_fixed_root_continuations(
     """Freeze exact candidate token paths after an already-authenticated root.
 
     Prompt and candidate tokens are encoded separately and concatenated at the
-    ID boundary.  This preserves the historical experiment's fixed-root
-    contract while requiring the combined decode to reproduce the exact bytes.
-    No spelling, case, whitespace, punctuation, or tokenization variants are
-    introduced.
+    ID boundary. Mistral's implicit standalone Metaspace prefix is disabled for
+    the continuation because the fixed root already contains every real
+    boundary byte. The exact source prompt string and its exact tokenizer IDs
+    are both bound; the combined decode must reproduce the decoded fixed root
+    plus the exact surface. No spelling, case, whitespace, punctuation, or
+    tokenization variants are introduced.
     """
 
     if not isinstance(prompt, str) or not prompt:
@@ -115,17 +145,17 @@ def audit_fixed_root_continuations(
     prompt_ids = _encode(tokenizer, prompt)
     if not prompt_ids:
         raise ValueError("prompt must contain at least one token")
-    if _decode(tokenizer, prompt_ids) != prompt:
-        raise ValueError("prompt tokenization does not decode to the exact prompt")
+    decoded_prompt = _decode(tokenizer, prompt_ids)
 
-    label_ids = tuple(_encode(tokenizer, letter) for letter in LETTERS)
+    continuation_tokenizer = _fixed_root_continuation_tokenizer(tokenizer)
+    label_ids = tuple(_encode(continuation_tokenizer, letter) for letter in LETTERS)
     if any(len(values) != 1 for values in label_ids):
         raise ValueError("A/B/C/D must be distinct single-token continuations")
     flattened_labels = tuple(values[0] for values in label_ids)
     if len(set(flattened_labels)) != 4:
         raise ValueError("A/B/C/D must be distinct single-token continuations")
     if any(
-        _decode(tokenizer, (*prompt_ids, token_id)) != prompt + letter
+        _decode(tokenizer, (*prompt_ids, token_id)) != decoded_prompt + letter
         for letter, token_id in zip(LETTERS, flattened_labels, strict=True)
     ):
         raise ValueError("A/B/C/D token decoding changes at the exact prompt boundary")
@@ -133,7 +163,7 @@ def audit_fixed_root_continuations(
     special_ids = {int(value) for value in getattr(tokenizer, "all_special_ids", ())}
     candidates: list[CandidateContinuation] = []
     for surface in candidate_surfaces:
-        token_ids = _encode(tokenizer, surface)
+        token_ids = _encode(continuation_tokenizer, surface)
         reason = "eligible"
         if not surface or not token_ids:
             reason = "empty_candidate"
@@ -146,7 +176,7 @@ def audit_fixed_root_continuations(
             reason = "context_overflow"
         elif _decode(tokenizer, token_ids) != surface:
             reason = "candidate_decode_mismatch"
-        elif _decode(tokenizer, (*prompt_ids, *token_ids)) != prompt + surface:
+        elif _decode(tokenizer, (*prompt_ids, *token_ids)) != decoded_prompt + surface:
             reason = "combined_decode_mismatch"
         candidates.append(
             CandidateContinuation(
@@ -399,6 +429,7 @@ def score_candidate_paths_cached(
     audit: ContinuationAudit,
     *,
     expected_layers: int = 32,
+    phase_callback: Callable[[str], None] | None = None,
 ) -> LayerwisePathScores:
     """Production scorer: one root prefill plus batched shared-prefix frontiers."""
 
@@ -406,6 +437,7 @@ def score_candidate_paths_cached(
         model,
         [audit],
         expected_layers=expected_layers,
+        phase_callback=phase_callback,
     )[0]
 
 
@@ -414,6 +446,7 @@ def score_candidate_paths_cached_many(
     audits: Sequence[ContinuationAudit],
     *,
     expected_layers: int = 32,
+    phase_callback: Callable[[str], None] | None = None,
 ) -> list[LayerwisePathScores]:
     """Batch equal-length roots and all divergent trie frontiers.
 
@@ -444,13 +477,20 @@ def score_candidate_paths_cached_many(
             )
         )
     )
-    root_scores, parent_cache, max_difference = _forward_last_position(
-        model,
-        input_ids,
-        attention_mask=attention_mask,
-        target_token_ids=targets,
-        use_cache=True,
-    )
+    if phase_callback is not None:
+        phase_callback("root")
+    try:
+        root_scores, parent_cache, max_difference = _forward_last_position(
+            model,
+            input_ids,
+            attention_mask=attention_mask,
+            target_token_ids=targets,
+            use_cache=True,
+        )
+    except BaseException:
+        if phase_callback is not None:
+            phase_callback("idle")
+        raise
     if parent_cache is None:
         raise ValueError("model did not return a KV cache")
     target_index = {token_id: index for index, token_id in enumerate(targets)}
@@ -491,6 +531,8 @@ def score_candidate_paths_cached_many(
     parent_indices = [audit_index for audit_index, _prefix in frontier]
     depth = 1
     while frontier:
+        if phase_callback is not None:
+            phase_callback("branch")
         selected_cache = _select_cache_rows(parent_cache, parent_indices, device=device)
         branch_ids = torch.tensor(
             [[prefix[-1]] for _audit_index, prefix in frontier],
@@ -544,6 +586,9 @@ def score_candidate_paths_cached_many(
         frontier = next_frontier
         parent_cache = returned_cache
         depth += 1
+
+    if phase_callback is not None:
+        phase_callback("idle")
 
     results: list[LayerwisePathScores] = []
     for audit_index, _audit in enumerate(audits):

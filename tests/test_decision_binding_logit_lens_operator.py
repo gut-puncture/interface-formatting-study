@@ -23,9 +23,9 @@ def test_logit_lens_runner_is_mistral_only_and_uses_runtime_configuration():
     assert '[[ "$MODE" =~ ^(startup|full)$ ]]' in script
     assert 'BATCH_SIZE:-8' in script
     assert 'MAX_BATCH_TOKENS:-24000' in script
-    assert 'STARTUP_CAPTURE_CHUNK_SIZE:-4' in script
+    assert '--capture-chunk-size "4"' in script
     assert 'FULL_CAPTURE_CHUNK_SIZE:-64' in script
-    assert 'STARTUP_ITEMS:-8' in script
+    assert '--startup-items "8"' in script
     assert "--max-chunks-this-invocation" in script
 
 
@@ -62,7 +62,7 @@ def test_logit_lens_runner_passes_frozen_arguments_through_real_entrypoint(tmp_p
     assert "--token-audit /prepared/tokenization" in args
     assert "--batch-size 3" in args
     assert "--max-batch-tokens 1234" in args
-    assert "--capture-chunk-size 2" in args
+    assert "--capture-chunk-size 4" in args
     assert "--startup-items 8" in args
     assert "--max-chunks-this-invocation 1" in args
     assert "--local-files-only" in args
@@ -119,6 +119,42 @@ def test_logit_lens_control_is_owned_resumable_and_surfaces_progress(tmp_path):
     assert '"phase":"scoring"' in result.stdout
     assert '"completed":1' in result.stdout
     assert '"peak_vram_bytes":1234' in result.stdout
+
+
+def test_logit_lens_control_keeps_live_startup_owned_when_status_requests_full(tmp_path):
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    state.mkdir()
+    fake_bin.mkdir()
+    (state / "mistral.pid").write_text(str(os.getpid()), encoding="utf-8")
+    (state / "mistral.mode").write_text("startup", encoding="utf-8")
+    (state / "mistral.args").write_text(
+        "/prepared/v4\n/prepared/tokenization\n", encoding="utf-8"
+    )
+    (state / "mistral-startup.log").write_text("startup alive\n", encoding="utf-8")
+    fake_ps = fake_bin / "ps"
+    fake_ps.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'bash scripts/run_decision_binding_logit_lens_gpu.sh startup "
+        "/prepared/v4 /prepared/tokenization'\n",
+        encoding="utf-8",
+    )
+    fake_ps.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(CONTROL), "status", "full"],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DECISION_LOGIT_LENS_STATE_DIR": str(state),
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "running model=mistral mode=startup" in result.stdout
+    assert (state / "mistral.pid").read_text(encoding="utf-8") == str(os.getpid())
 
 
 def test_logit_lens_fetch_supports_partial_startup_and_complete_verification():

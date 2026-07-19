@@ -20,14 +20,6 @@ MODE="$1"
 BUNDLE="$2"
 TOKEN_AUDIT="$3"
 [[ "$MODE" =~ ^(startup|full)$ ]] || { echo "mode must be startup or full" >&2; exit 2; }
-if [[ -n "${CAPTURE_CHUNK_SIZE:-}" ]]; then
-  CHUNK_SIZE="$CAPTURE_CHUNK_SIZE"
-elif [[ "$MODE" == "startup" ]]; then
-  CHUNK_SIZE="${STARTUP_CAPTURE_CHUNK_SIZE:-4}"
-else
-  CHUNK_SIZE="${FULL_CAPTURE_CHUNK_SIZE:-64}"
-fi
-
 ARGS=(
   run-model
   --profile "mistral"
@@ -35,11 +27,12 @@ ARGS=(
   --token-audit "$TOKEN_AUDIT"
   --batch-size "${BATCH_SIZE:-8}"
   --max-batch-tokens "${MAX_BATCH_TOKENS:-24000}"
-  --capture-chunk-size "$CHUNK_SIZE"
   --local-files-only
 )
 if [[ "$MODE" == "startup" ]]; then
-  ARGS+=(--startup-items "${STARTUP_ITEMS:-8}")
+  ARGS+=(--capture-chunk-size "4" --startup-items "8")
+else
+  ARGS+=(--capture-chunk-size "${CAPTURE_CHUNK_SIZE:-${FULL_CAPTURE_CHUNK_SIZE:-64}}")
 fi
 if [[ -n "${MAX_CHUNKS_THIS_INVOCATION:-}" ]]; then
   ARGS+=(--max-chunks-this-invocation "$MAX_CHUNKS_THIS_INVOCATION")

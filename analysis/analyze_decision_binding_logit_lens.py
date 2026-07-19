@@ -26,6 +26,16 @@ SCORE_COLUMNS = {
 }
 CALIBRATED_COLUMN = "letter_calibrated_logps"
 AMBIGUITY_THRESHOLD = 0.04
+QUALITY_GATE_POLICY = {
+    "minimum_primary_items_per_contract": 200,
+    "minimum_primary_item_fraction": 0.8,
+    "maximum_final_layer_ambiguity_rate": 0.2,
+    "ambiguity_reference": AMBIGUITY_THRESHOLD,
+    "required_contracts": ["letter", "text"],
+    "required_final_layer_readouts": ["candidate_total", "letter_raw"],
+    "require_resolved_primary_estimates": True,
+    "require_total_mean_direction_agreement_by_contract": True,
+}
 FROZEN_STRATA_COLUMNS = (
     "wrapper_name",
     "split",
@@ -655,7 +665,7 @@ def classify_conclusion(
     ):
         return "contract_sensitive"
     if _has_qualified_heterogeneity(strata):
-        return "heterogeneous"
+        return "predeclared_stratum_heterogeneous"
     letter_secondary = secondary[secondary["contract"] == "letter"].set_index("score_variant")
     mean_supports_positive = (
         "candidate_mean" in letter_secondary.index
@@ -674,6 +684,168 @@ def classify_conclusion(
     if float(letter["ci_high"]) < 0 and mean_supports_negative:
         return "consistent_with_wrapper_dependent_answer_formation"
     return "uninformative"
+
+
+def _finite_estimate_rows(frame: pd.DataFrame, required_columns: Sequence[str]) -> bool:
+    if any(column not in frame.columns for column in required_columns):
+        return False
+    values = frame[list(required_columns)].apply(pd.to_numeric, errors="coerce")
+    return bool(np.isfinite(values.to_numpy(dtype=float)).all())
+
+
+def evaluate_quality_gates(
+    primary: pd.DataFrame,
+    secondary: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    *,
+    population_items: int,
+) -> dict[str, object]:
+    """Evaluate the frozen gates that must pass before any positive label."""
+
+    required_contracts = list(QUALITY_GATE_POLICY["required_contracts"])
+    primary_contracts = (
+        primary["contract"].astype(str)
+        if "contract" in primary
+        else pd.Series(dtype=str)
+    )
+    primary_shape_ok = (
+        len(primary) == len(required_contracts)
+        and primary_contracts.is_unique
+        and set(primary_contracts) == set(required_contracts)
+    )
+    primary_resolved = primary_shape_ok and _finite_estimate_rows(
+        primary,
+        ("contrast", "ci_low", "ci_high", "holm_p_value", "n_items", "n_pairs"),
+    )
+    if primary_resolved:
+        primary_resolved = bool(
+            (primary["ci_low"] <= primary["contrast"]).all()
+            and (primary["contrast"] <= primary["ci_high"]).all()
+            and (primary["n_items"] > 0).all()
+            and (primary["n_pairs"] > 0).all()
+        )
+
+    minimum_fraction = float(QUALITY_GATE_POLICY["minimum_primary_item_fraction"])
+    minimum_count = int(QUALITY_GATE_POLICY["minimum_primary_items_per_contract"])
+    required_items = max(minimum_count, int(np.ceil(population_items * minimum_fraction)))
+    items_by_contract = (
+        {
+            str(row.contract): int(row.n_items)
+            for row in primary[["contract", "n_items"]].itertuples(index=False)
+        }
+        if {"contract", "n_items"} <= set(primary.columns)
+        else {}
+    )
+    coverage_passed = (
+        primary_shape_ok
+        and population_items > 0
+        and all(
+            items_by_contract.get(contract, -1) >= required_items
+            for contract in required_contracts
+        )
+    )
+
+    mean = secondary[
+        secondary.get("score_variant", pd.Series(index=secondary.index, dtype=str)).astype(str)
+        == "candidate_mean"
+    ].copy()
+    mean_contracts = (
+        mean["contract"].astype(str)
+        if "contract" in mean
+        else pd.Series(dtype=str)
+    )
+    mean_shape_ok = (
+        len(mean) == len(required_contracts)
+        and mean_contracts.is_unique
+        and set(mean_contracts) == set(required_contracts)
+        and _finite_estimate_rows(mean, ("contrast",))
+    )
+    direction_details: dict[str, dict[str, object]] = {}
+    direction_passed = bool(primary_resolved and mean_shape_ok)
+    if direction_passed:
+        totals = primary.set_index("contract")["contrast"]
+        means = mean.set_index("contract")["contrast"]
+        for contract in required_contracts:
+            total_value = float(totals.loc[contract])
+            mean_value = float(means.loc[contract])
+            agrees = (
+                total_value != 0.0
+                and mean_value != 0.0
+                and np.sign(total_value) == np.sign(mean_value)
+            )
+            direction_details[contract] = {
+                "candidate_total_contrast": total_value,
+                "candidate_mean_contrast": mean_value,
+                "same_nonzero_direction": bool(agrees),
+            }
+            direction_passed = direction_passed and bool(agrees)
+
+    required_readouts = list(QUALITY_GATE_POLICY["required_final_layer_readouts"])
+    final_diagnostics = diagnostics[
+        (pd.to_numeric(diagnostics.get("layer"), errors="coerce") == 31)
+        & diagnostics.get(
+            "contract", pd.Series(index=diagnostics.index, dtype=str)
+        ).astype(str).isin(required_contracts)
+        & diagnostics.get(
+            "score_variant", pd.Series(index=diagnostics.index, dtype=str)
+        ).astype(str).isin(required_readouts)
+    ].copy()
+    expected_final_rows = len(required_contracts) * len(required_readouts)
+    fragility_shape_ok = (
+        len(final_diagnostics) == expected_final_rows
+        and not final_diagnostics.duplicated(["contract", "score_variant"]).any()
+        and set(final_diagnostics["contract"].astype(str)) == set(required_contracts)
+        and set(final_diagnostics["score_variant"].astype(str)) == set(required_readouts)
+        and _finite_estimate_rows(
+            final_diagnostics, ("plain_ambiguity_rate", "wrapped_ambiguity_rate")
+        )
+    )
+    maximum_ambiguity = float(QUALITY_GATE_POLICY["maximum_final_layer_ambiguity_rate"])
+    fragility_details: list[dict[str, object]] = []
+    fragility_passed = fragility_shape_ok
+    if fragility_shape_ok:
+        for row in final_diagnostics.sort_values(["contract", "score_variant"]).itertuples():
+            observed = max(float(row.plain_ambiguity_rate), float(row.wrapped_ambiguity_rate))
+            passed = observed <= maximum_ambiguity
+            fragility_details.append(
+                {
+                    "contract": str(row.contract),
+                    "score_variant": str(row.score_variant),
+                    "maximum_observed_ambiguity_rate": observed,
+                    "passed": bool(passed),
+                }
+            )
+            fragility_passed = fragility_passed and bool(passed)
+
+    checks = {
+        "primary_estimates_resolved": {
+            "passed": bool(primary_resolved),
+            "required_contracts": required_contracts,
+        },
+        "coverage": {
+            "passed": bool(coverage_passed),
+            "population_items": int(population_items),
+            "required_items_per_contract": int(required_items),
+            "items_by_contract": items_by_contract,
+        },
+        "total_mean_direction_agreement": {
+            "passed": bool(direction_passed),
+            "by_contract": direction_details,
+        },
+        "numerical_fragility": {
+            "passed": bool(fragility_passed),
+            "final_layer": 31,
+            "ambiguity_reference": AMBIGUITY_THRESHOLD,
+            "maximum_allowed_rate": maximum_ambiguity,
+            "rows": fragility_details,
+        },
+    }
+    return {
+        "schema_version": 1,
+        "policy": dict(QUALITY_GATE_POLICY),
+        "checks": checks,
+        "all_passed": bool(all(check["passed"] for check in checks.values())),
+    }
 
 
 def _population_receipts(table: pd.DataFrame, pairs: pd.DataFrame) -> dict[str, object]:
@@ -877,7 +1049,22 @@ def analyze_frame(frame: pd.DataFrame, *, n_boot: int = 5000, seed: int = 1729) 
     diagnostics = _diagnostic_summary(pairs, score_columns)
     timing = _timing_summary(table)
     strata = _strata_summary(pairs, pair_aucs, n_boot=n_boot, seed=seed)
-    conclusion = classify_conclusion(primary, secondary, strata)
+    population_receipts = _population_receipts(table, pairs)
+    quality_gates = evaluate_quality_gates(
+        primary,
+        secondary,
+        diagnostics,
+        population_items=int(population_receipts["items"]),
+    )
+    ungated_conclusion = classify_conclusion(primary, secondary, strata)
+    conclusion = (
+        ungated_conclusion if quality_gates["all_passed"] else "uninformative"
+    )
+    quality_gates["ungated_conclusion"] = ungated_conclusion
+    quality_gates["final_conclusion"] = conclusion
+    quality_gates["positive_interpretation_allowed"] = bool(
+        quality_gates["all_passed"] and conclusion != "uninformative"
+    )
     summary = {
         "analysis_version": "decision_binding_logit_lens_v1",
         "bootstrap_samples": int(n_boot),
@@ -885,11 +1072,12 @@ def analyze_frame(frame: pd.DataFrame, *, n_boot: int = 5000, seed: int = 1729) 
         "pre_final_layers": list(PRE_FINAL_LAYERS),
         "final_parity_layer": 31,
         "conclusion": conclusion,
+        "quality_gates_passed": bool(quality_gates["all_passed"]),
         "claim_boundary": (
             "Descriptive intermediate-state decodability only; not causal control, literal thought, "
             "factual understanding, or a unique mechanism."
         ),
-        **_population_receipts(table, pairs),
+        **population_receipts,
     }
     return {
         "summary": summary,
@@ -900,7 +1088,34 @@ def analyze_frame(frame: pd.DataFrame, *, n_boot: int = 5000, seed: int = 1729) 
         "diagnostics": diagnostics,
         "timing": timing,
         "strata": strata,
+        "quality_gates": quality_gates,
     }
+
+
+def _interpretation_memo(
+    summary: Mapping[str, object], gates: Mapping[str, object]
+) -> str:
+    gate_status = "passed" if gates["all_passed"] else "did not all pass"
+    failed = sorted(
+        str(name)
+        for name, receipt in gates["checks"].items()
+        if not receipt["passed"]
+    )
+    failure_sentence = "" if not failed else f" Failed gates: {', '.join(failed)}."
+    return (
+        "# Bounded Interpretation\n\n"
+        f"Predeclared conclusion: `{summary['conclusion']}`.\n\n"
+        f"The frozen quality gates {gate_status}.{failure_sentence} Any positive pattern "
+        "label is suppressed "
+        "unless primary estimates are resolved, coverage is adequate, total and token-mean "
+        "scores agree in direction under both contracts, and final-layer numerical ambiguity "
+        "stays below the predeclared limit.\n\n"
+        "This experiment is descriptive evidence about trajectories exposed by the final "
+        "normalization and output head. It does not establish causation, literal thought, "
+        "factual understanding, behavioral control, or a unique mechanism. Full candidate "
+        "paths measure teacher-forced continuation compatibility; they are not information "
+        "contained entirely at the original Answer: position.\n"
+    )
 
 
 def analyze(input_path: Path, output_dir: Path, *, n_boot: int = 5000, seed: int = 1729) -> dict[str, Path]:
@@ -908,6 +1123,8 @@ def analyze(input_path: Path, output_dir: Path, *, n_boot: int = 5000, seed: int
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs = {
         "analysis_summary": output_dir / "analysis_summary.json",
+        "interpretation_memo": output_dir / "interpretation_memo.md",
+        "quality_gates": output_dir / "quality_gates.json",
         "calibrated_letter": output_dir / "calibrated_letter.csv",
         "diagnostics": output_dir / "diagnostics.csv",
         "primary_contrasts": output_dir / "primary_contrasts.csv",
@@ -920,6 +1137,14 @@ def analyze(input_path: Path, output_dir: Path, *, n_boot: int = 5000, seed: int
     }
     outputs["analysis_summary"].write_text(
         json.dumps(result["summary"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    outputs["quality_gates"].write_text(
+        json.dumps(result["quality_gates"], indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    outputs["interpretation_memo"].write_text(
+        _interpretation_memo(result["summary"], result["quality_gates"]),
+        encoding="utf-8",
     )
     for name in (
         "calibrated_letter",

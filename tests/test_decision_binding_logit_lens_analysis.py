@@ -196,7 +196,9 @@ def test_secondary_and_frozen_strata_outputs_and_bounded_classification():
     assert "holm_p_value" not in result["strata"].columns
     non_wrapper = result["strata"][result["strata"]["stratum"] != "wrapper_name"]
     assert set(non_wrapper["n_items"]) == {1}
-    assert result["summary"]["conclusion"] == "consistent_with_later_output_binding_effects"
+    assert result["summary"]["conclusion"] == "uninformative"
+    assert not result["quality_gates"]["all_passed"]
+    assert not result["quality_gates"]["checks"]["coverage"]["passed"]
 
     uninformative = result["primary_contrasts"].copy()
     uninformative[["ci_low", "ci_high"]] = [-0.2, 0.2]
@@ -246,13 +248,107 @@ def test_heterogeneous_requires_large_opposite_total_strata_with_matching_mean_d
             {"stratum": "confidence_stratum", "value": "high", "contract": "letter", "score_variant": "candidate_mean", "contrast": 0.1, "ci_low": -0.1, "ci_high": 0.3, "n_items": 100},
         ]
     )
-    assert MODULE.classify_conclusion(primary, secondary, strata) == "heterogeneous"
+    assert (
+        MODULE.classify_conclusion(primary, secondary, strata)
+        == "predeclared_stratum_heterogeneous"
+    )
 
     strata.loc[
         (strata["value"] == "high") & (strata["score_variant"] == "candidate_mean"),
         "contrast",
     ] = -0.1
     assert MODULE.classify_conclusion(primary, secondary, strata) == "uninformative"
+
+
+def test_quality_gates_freeze_coverage_fragility_direction_and_resolved_estimates():
+    primary = pd.DataFrame(
+        [
+            {
+                "contract": contract,
+                "contrast": contrast,
+                "ci_low": contrast - 0.1,
+                "ci_high": contrast + 0.1,
+                "holm_p_value": 0.02,
+                "n_items": 2_000,
+                "n_pairs": 10_000,
+            }
+            for contract, contrast in (("letter", 0.3), ("text", 0.2))
+        ]
+    )
+    secondary = pd.DataFrame(
+        [
+            {
+                "contract": contract,
+                "score_variant": "candidate_mean",
+                "contrast": contrast,
+                "ci_low": contrast - 0.1,
+                "ci_high": contrast + 0.1,
+                "n_items": 2_000,
+                "n_pairs": 10_000,
+            }
+            for contract, contrast in (("letter", 0.2), ("text", 0.1))
+        ]
+    )
+    diagnostics = pd.DataFrame(
+        [
+            {
+                "contract": contract,
+                "score_variant": variant,
+                "layer": 31,
+                "plain_ambiguity_rate": 0.05,
+                "wrapped_ambiguity_rate": 0.10,
+            }
+            for contract in ("letter", "text")
+            for variant in ("letter_raw", "candidate_total")
+        ]
+    )
+
+    passed = MODULE.evaluate_quality_gates(
+        primary, secondary, diagnostics, population_items=2_401
+    )
+    assert passed["all_passed"]
+    assert passed["policy"] == {
+        "minimum_primary_items_per_contract": 200,
+        "minimum_primary_item_fraction": 0.8,
+        "maximum_final_layer_ambiguity_rate": 0.2,
+        "ambiguity_reference": 0.04,
+        "required_contracts": ["letter", "text"],
+        "required_final_layer_readouts": ["candidate_total", "letter_raw"],
+        "require_resolved_primary_estimates": True,
+        "require_total_mean_direction_agreement_by_contract": True,
+    }
+
+    weak = primary.copy()
+    weak["n_items"] = 1_900
+    weak_gates = MODULE.evaluate_quality_gates(
+        weak, secondary, diagnostics, population_items=2_401
+    )
+    assert not weak_gates["checks"]["coverage"]["passed"]
+
+    fragile = diagnostics.copy()
+    fragile.loc[
+        (fragile["contract"] == "letter")
+        & (fragile["score_variant"] == "candidate_total"),
+        "wrapped_ambiguity_rate",
+    ] = 0.21
+    fragile_gates = MODULE.evaluate_quality_gates(
+        primary, secondary, fragile, population_items=2_401
+    )
+    assert not fragile_gates["checks"]["numerical_fragility"]["passed"]
+
+    reversed_mean = secondary.copy()
+    reversed_mean.loc[reversed_mean["contract"] == "text", "contrast"] = -0.1
+    direction_gates = MODULE.evaluate_quality_gates(
+        primary, reversed_mean, diagnostics, population_items=2_401
+    )
+    assert not direction_gates["checks"]["total_mean_direction_agreement"]["passed"]
+
+    unresolved = primary.copy()
+    unresolved.loc[unresolved["contract"] == "text", "ci_high"] = np.nan
+    unresolved_gates = MODULE.evaluate_quality_gates(
+        unresolved, secondary, diagnostics, population_items=2_401
+    )
+    assert not unresolved_gates["checks"]["primary_estimates_resolved"]["passed"]
 
 
 def test_calibrated_letter_is_a_separate_optional_secondary():
@@ -408,6 +504,8 @@ def test_cli_writes_deterministic_machine_readable_outputs(tmp_path):
 
     assert set(outputs) == {
         "analysis_summary",
+        "interpretation_memo",
+        "quality_gates",
         "calibrated_letter",
         "diagnostics",
         "primary_contrasts",
@@ -423,6 +521,11 @@ def test_cli_writes_deterministic_machine_readable_outputs(tmp_path):
     assert summary["bootstrap_samples"] == 20
     assert summary["bootstrap_seed"] == 11
     assert summary["pre_final_layers"] == list(range(31))
+    gates = json.loads(outputs["quality_gates"].read_text())
+    assert gates["final_conclusion"] == "uninformative"
+    memo = outputs["interpretation_memo"].read_text()
+    assert "descriptive" in memo.lower()
+    assert "does not establish causation" in memo.lower()
     figure = outputs["trajectory_figure"]
     assert figure.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert figure.stat().st_size > 10_000

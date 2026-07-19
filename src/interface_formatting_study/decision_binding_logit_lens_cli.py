@@ -8,11 +8,13 @@ import math
 import os
 import shutil
 import signal
+import subprocess
+import threading
 import time
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -58,6 +60,116 @@ MISTRAL_SLUG = "mistral-7b-instruct-v0.3"
 CLAIM_BOUNDARY = "descriptive_layerwise_logit_lens_not_causal"
 TOKEN_AUDIT_SCHEMA_VERSION = 1
 RUN_SCHEMA_VERSION = 1
+
+
+class GpuPhaseTelemetry:
+    """Small task-local sampler for the root/branch execution phases."""
+
+    def __init__(self, semantic_run_id: str, *, sample_interval_seconds: float = 0.1):
+        self.semantic_run_id = semantic_run_id
+        self.sample_interval_seconds = sample_interval_seconds
+        self._phase = "idle"
+        self._phase_started = time.monotonic()
+        self._phase_seconds = {"root": 0.0, "branch": 0.0, "scalar_oracle": 0.0}
+        self._samples = {
+            phase: [] for phase in ("root", "branch", "scalar_oracle")
+        }
+        self._sample_errors = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def set_phase(self, phase: str) -> None:
+        if phase not in {"idle", "root", "branch", "scalar_oracle"}:
+            raise ValueError(f"unknown telemetry phase: {phase}")
+        now = time.monotonic()
+        with self._lock:
+            self._accrue_locked(now)
+            self._phase = phase
+            self._phase_started = now
+
+    def _accrue_locked(self, now: float) -> None:
+        if self._phase in self._phase_seconds:
+            self._phase_seconds[self._phase] += max(now - self._phase_started, 0.0)
+
+    @staticmethod
+    def _gpu_utilization() -> float:
+        if hasattr(torch.cuda, "utilization"):
+            try:
+                return float(torch.cuda.utilization(0))
+            except Exception:
+                pass
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+                "--id=0",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return float(completed.stdout.splitlines()[0].strip())
+
+    def _sample_loop(self) -> None:
+        while not self._stop.wait(self.sample_interval_seconds):
+            with self._lock:
+                phase = self._phase
+            if phase not in self._samples:
+                continue
+            try:
+                value = self._gpu_utilization()
+                if not math.isfinite(value) or not 0.0 <= value <= 100.0:
+                    raise ValueError("GPU utilization is outside [0, 100]")
+                with self._lock:
+                    self._samples[phase].append(value)
+            except Exception:
+                with self._lock:
+                    self._sample_errors += 1
+
+    def snapshot(
+        self,
+        *,
+        completed_work_units: int,
+        root_input_tokens: int,
+        branch_input_tokens: int,
+        peak_vram_bytes: int,
+    ) -> dict[str, object]:
+        now = time.monotonic()
+        with self._lock:
+            self._accrue_locked(now)
+            self._phase_started = now
+            seconds = dict(self._phase_seconds)
+            samples = {phase: list(values) for phase, values in self._samples.items()}
+            errors = self._sample_errors
+        utilization = {}
+        for phase, values in samples.items():
+            utilization[phase] = {
+                "samples": len(values),
+                "mean_percent": None if not values else float(np.mean(values)),
+                "max_percent": None if not values else float(max(values)),
+            }
+        return {
+            "schema_version": 1,
+            "semantic_run_id": self.semantic_run_id,
+            "completed_work_units": int(completed_work_units),
+            "root_input_tokens": int(root_input_tokens),
+            "branch_input_tokens": int(branch_input_tokens),
+            "peak_vram_bytes": int(peak_vram_bytes),
+            "phase_seconds": seconds,
+            "gpu_utilization": utilization,
+            "sample_errors": int(errors),
+        }
+
+    def stop(self) -> None:
+        self.set_phase("idle")
+        self._stop.set()
+        self._thread.join(timeout=3)
 
 
 def _atomic_json(payload: object, path: Path) -> None:
@@ -518,6 +630,8 @@ def _audit_record(
         "prompt_ids": [] if audit is None else list(audit.prompt_ids),
         "prompt_token_sha256": "" if audit is None else audit.prompt_token_sha256,
         "prompt_token_count": 0 if audit is None else len(audit.prompt_ids),
+        "prompt_roundtrip_exact": None,
+        "decoded_prompt_sha256": "",
         "observation_token_id": None if audit is None else int(audit.prompt_ids[-1]),
         "observation_token_text": "",
         "observation_character_span": [None, None],
@@ -576,6 +690,16 @@ def _add_observation_receipt(record: dict[str, object], tokenizer) -> dict[str, 
     if not bool(record["root_evaluable"]):
         return record
     token_id = int(record["observation_token_id"])
+    try:
+        decoded_prompt = tokenizer.decode(
+            list(record["prompt_ids"]),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        decoded_prompt = tokenizer.decode(list(record["prompt_ids"]))
+    record["prompt_roundtrip_exact"] = decoded_prompt == str(record["prompt"])
+    record["decoded_prompt_sha256"] = _sha256_text(str(decoded_prompt))
     try:
         token_text = tokenizer.decode(
             [token_id],
@@ -697,6 +821,12 @@ def audit_tokenizer_bundle(
         "prepared_ledger_sha256": prepared["ledger_sha256"],
         "max_context_tokens": int(max_context_tokens),
         "tokenizer": _tokenizer_receipt(tokenizer),
+        "continuation_tokenization_policy": (
+            "fixed_root_mistral_metaspace_without_implicit_prefix"
+        ),
+        "prompt_roundtrip_mismatches": int(
+            frame["prompt_roundtrip_exact"].eq(False).sum()
+        ),
         "candidate_paths": len(token_counts),
         "one_token_paths": sum(value == 1 for value in token_counts),
         "multi_token_paths": sum(value > 1 for value in token_counts),
@@ -876,6 +1006,7 @@ def score_lens_chunk(
     expected_layers: int,
     scorer=score_candidate_paths_cached_many,
     run_scalar_oracle: bool,
+    phase_callback: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Score atomic item-format work units through the authenticated audit."""
 
@@ -919,19 +1050,24 @@ def score_lens_chunk(
         while start < len(ordered):
             max_count = min(batch_size, max(1, max_batch_tokens // prompt_length))
             batch = ordered[start : start + max_count]
-            observed = scorer(
-                model,
-                [value[2] for value in batch],
-                expected_layers=expected_layers,
-            )
+            scorer_kwargs: dict[str, object] = {"expected_layers": expected_layers}
+            if phase_callback is not None:
+                scorer_kwargs["phase_callback"] = phase_callback
+            observed = scorer(model, [value[2] for value in batch], **scorer_kwargs)
             if len(observed) != len(batch):
                 raise RuntimeError("batched scorer returned the wrong number of rows")
             for task, result in zip(batch, observed, strict=True):
                 scores[(task[0], task[1])] = result
                 if run_scalar_oracle:
-                    reference = score_candidate_paths_scalar(
-                        model, task[2], expected_layers=expected_layers
-                    )
+                    if phase_callback is not None:
+                        phase_callback("scalar_oracle")
+                    try:
+                        reference = score_candidate_paths_scalar(
+                            model, task[2], expected_layers=expected_layers
+                        )
+                    finally:
+                        if phase_callback is not None:
+                            phase_callback("idle")
                     letter_difference = _max_finite_difference(
                         result.letter_logp, reference.letter_logp
                     )
@@ -1031,6 +1167,9 @@ def score_lens_chunk(
                         "candidate_path_token_counts": list(
                             metadata["candidate_path_token_counts"]
                         ),
+                        "candidate_path_evaluable": list(
+                            metadata["candidate_path_evaluable"]
+                        ),
                         "letter_raw_logps": result.letter_logp[layer].tolist(),
                         "letter_calibrated_logps": calibrated[layer].tolist(),
                         "candidate_path_total_logps": result.total_logp[layer].tolist(),
@@ -1077,6 +1216,20 @@ def score_lens_chunk(
         "max_final_native_difference": max_native,
         **oracle_maxima,
     }
+    frame["parity_final_native_max"] = float(max_native)
+    frame["parity_cached_scalar_letter_max"] = float(
+        oracle_maxima["max_cached_scalar_letter_difference"]
+    )
+    frame["parity_cached_scalar_first_token_max"] = float(
+        oracle_maxima["max_cached_scalar_first_token_difference"]
+    )
+    frame["parity_cached_scalar_mean_token_max"] = float(
+        oracle_maxima["max_cached_scalar_mean_token_difference"]
+    )
+    frame["parity_cached_scalar_total_per_token_max"] = float(
+        oracle_maxima["max_cached_scalar_total_per_token_difference"]
+    )
+    frame["scalar_oracle_evaluated"] = bool(run_scalar_oracle)
     return frame, parity
 
 
@@ -1170,6 +1323,16 @@ def _analysis_spec() -> dict[str, object]:
         "parity_layer": 31,
         "parity_atol": PARITY_ATOL,
         "ambiguity_reference": 0.04,
+        "quality_gates": {
+            "minimum_primary_items_per_contract": 200,
+            "minimum_primary_item_fraction": 0.8,
+            "maximum_final_layer_ambiguity_rate": 0.2,
+            "ambiguity_reference": 0.04,
+            "required_contracts": ["letter", "text"],
+            "required_final_layer_readouts": ["candidate_total", "letter_raw"],
+            "require_resolved_primary_estimates": True,
+            "require_total_mean_direction_agreement_by_contract": True,
+        },
         "bootstrap_samples": 5000,
         "bootstrap_seed": 1729,
         "claim": CLAIM_BOUNDARY,
@@ -1186,20 +1349,74 @@ def _run_source_paths() -> list[Path]:
     ]
 
 
-def _merge_parity(previous: Mapping[str, object], current: Mapping[str, object]) -> dict[str, object]:
-    names = {
-        "max_final_native_difference",
-        "max_cached_scalar_letter_difference",
-        "max_cached_scalar_first_token_difference",
-        "max_cached_scalar_mean_token_difference",
-        "max_cached_scalar_total_per_token_difference",
-    }
+PARITY_COLUMNS = {
+    "max_final_native_difference": "parity_final_native_max",
+    "max_cached_scalar_letter_difference": "parity_cached_scalar_letter_max",
+    "max_cached_scalar_first_token_difference": "parity_cached_scalar_first_token_max",
+    "max_cached_scalar_mean_token_difference": "parity_cached_scalar_mean_token_max",
+    "max_cached_scalar_total_per_token_difference": (
+        "parity_cached_scalar_total_per_token_max"
+    ),
+}
+
+
+def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
+    if frame.empty:
+        return {
+            "schema_version": 2,
+            "tolerance": PARITY_ATOL,
+            "covered_work_keys": [],
+            "scalar_oracle_work_keys": [],
+            **{name: 0.0 for name in PARITY_COLUMNS},
+        }
+    required = {"block_work_key", "scalar_oracle_evaluated", *PARITY_COLUMNS.values()}
+    if missing := required - set(frame.columns):
+        raise ValueError(f"parity receipts are missing from score shards: {sorted(missing)}")
+    covered = sorted(frame["block_work_key"].astype(str).unique().tolist())
+    scalar_by_key = frame.groupby("block_work_key", sort=False)[
+        "scalar_oracle_evaluated"
+    ].agg(["min", "max"])
+    if (scalar_by_key["min"] != scalar_by_key["max"]).any():
+        raise ValueError("scalar-oracle parity state changes within a work unit")
+    scalar_keys = sorted(
+        str(key) for key, row in scalar_by_key.iterrows() if bool(row["min"])
+    )
+    maxima: dict[str, float] = {}
+    for name, column in PARITY_COLUMNS.items():
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if values.isna().any() or not np.isfinite(values.to_numpy()).all():
+            raise ValueError("parity receipts contain non-finite values")
+        maxima[name] = float(values.max())
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "tolerance": PARITY_ATOL,
+        "covered_work_keys": covered,
+        "scalar_oracle_work_keys": scalar_keys,
+        **maxima,
+    }
+
+
+def _merge_parity_reports(
+    previous: Mapping[str, object], current: Mapping[str, object]
+) -> dict[str, object]:
+    if float(previous.get("tolerance", PARITY_ATOL)) != PARITY_ATOL or float(
+        current.get("tolerance", PARITY_ATOL)
+    ) != PARITY_ATOL:
+        raise ValueError("parity report tolerance drift")
+    return {
+        "schema_version": 2,
+        "tolerance": PARITY_ATOL,
+        "covered_work_keys": sorted(
+            set(map(str, previous.get("covered_work_keys", [])))
+            | set(map(str, current.get("covered_work_keys", [])))
+        ),
+        "scalar_oracle_work_keys": sorted(
+            set(map(str, previous.get("scalar_oracle_work_keys", [])))
+            | set(map(str, current.get("scalar_oracle_work_keys", [])))
+        ),
         **{
             name: max(float(previous.get(name, 0.0)), float(current.get(name, 0.0)))
-            for name in sorted(names)
+            for name in PARITY_COLUMNS
         },
     }
 
@@ -1212,6 +1429,10 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("runtime batch size, token cap, and chunk size must be positive")
     if args.startup_items is not None and args.startup_items < 1:
         raise ValueError("startup-items must be positive")
+    if args.startup_items is not None and args.startup_items != 8:
+        raise ValueError("the structural startup is frozen to exactly eight items")
+    if args.startup_items is not None and args.capture_chunk_size != 4:
+        raise ValueError("the structural startup is frozen to four-work-unit chunks")
     if (
         args.max_chunks_this_invocation is not None
         and args.max_chunks_this_invocation < 1
@@ -1311,6 +1532,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
     attempt = {
         "schema_version": 1,
         "attempt_id": attempt_id,
+        "semantic_run_id": identity.semantic_run_id,
         "started_at_unix": started,
         "max_chunks_this_invocation": args.max_chunks_this_invocation,
         "completed_before": len(completed_before),
@@ -1318,12 +1540,15 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
     }
     _atomic_json(attempt, attempt_path)
     parity_path = run_root / "parity_report.json"
-    parity = (
-        _read_json(parity_path, name="parity report") if parity_path.exists() else {}
-    )
-    if not parity_path.exists():
-        parity = _merge_parity({}, {})
-        _atomic_json(parity, parity_path)
+    if completed_before:
+        parity = _parity_report_from_frame(
+            store.merge(sort_by=["block_work_key", "contract", "layer"])
+        )
+    else:
+        parity = _parity_report_from_frame(pd.DataFrame())
+    _atomic_json(parity, parity_path)
+    telemetry = GpuPhaseTelemetry(identity.semantic_run_id)
+    telemetry.start()
     stop_requested = False
 
     def request_stop(_signum, _frame):
@@ -1333,7 +1558,6 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
     previous_handlers = {
         value: signal.signal(value, request_stop) for value in (signal.SIGTERM, signal.SIGINT)
     }
-    latest_parity: dict[str, object] = {}
     model = None
     try:
         model, tokenizer, device = load_model_and_tokenizer(
@@ -1365,8 +1589,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         ].copy()
 
         def process(keys: Sequence[str]) -> pd.DataFrame:
-            nonlocal latest_parity
-            frame, current_parity = score_lens_chunk(
+            frame, _current_parity = score_lens_chunk(
                 model=model,
                 ledger=ledger_subset,
                 token_audit=audit_subset,
@@ -1375,14 +1598,13 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
                 max_batch_tokens=int(args.max_batch_tokens),
                 expected_layers=profile.expected_layers,
                 run_scalar_oracle=mode == "startup",
+                phase_callback=telemetry.set_phase,
             )
-            latest_parity = _merge_parity(parity, current_parity)
             return frame
 
-        def on_flush(completed: set[str], shard_path: Path) -> None:
-            nonlocal parity
-            parity = _merge_parity(parity, latest_parity)
-            _atomic_json(parity, parity_path)
+        def write_runtime_receipts(
+            completed: set[str], shard_path: Path | None
+        ) -> None:
             elapsed = max(time.time() - started, 1e-9)
             completed_audit = audit_subset[
                 audit_subset["block_work_key"].astype(str).isin(completed)
@@ -1397,6 +1619,14 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
                     for depth in range(1, len(path))
                 }
                 branch_input_tokens += len(unique_prefixes)
+            peak_vram = int(torch.cuda.max_memory_allocated())
+            telemetry_report = telemetry.snapshot(
+                completed_work_units=len(completed),
+                root_input_tokens=root_input_tokens,
+                branch_input_tokens=branch_input_tokens,
+                peak_vram_bytes=peak_vram,
+            )
+            _atomic_json(telemetry_report, run_root / "telemetry_report.json")
             rate = len(completed - completed_before) / elapsed
             remaining = len(work_keys) - len(completed)
             progress = {
@@ -1407,21 +1637,32 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
                 "total_work_units": len(work_keys),
                 "work_units_per_second": rate,
                 "elapsed_seconds": elapsed,
-                "estimated_remaining_seconds": (
-                    None if rate <= 0 else remaining / rate
-                ),
+                "estimated_remaining_seconds": None if rate <= 0 else remaining / rate,
                 "root_prompts": int(len(completed_audit)),
                 "root_input_tokens": root_input_tokens,
                 "branch_input_tokens": int(branch_input_tokens),
                 "padding_tokens": 0,
-                "last_shard": str(shard_path.relative_to(run_root)),
-                "peak_vram_bytes": int(torch.cuda.max_memory_allocated()),
+                "last_shard": (
+                    None if shard_path is None else str(shard_path.relative_to(run_root))
+                ),
+                "peak_vram_bytes": peak_vram,
                 "batch_size": int(args.batch_size),
                 "max_batch_tokens": int(args.max_batch_tokens),
                 "capture_chunk_size": int(args.capture_chunk_size),
+                "phase_seconds": telemetry_report["phase_seconds"],
+                "gpu_utilization": telemetry_report["gpu_utilization"],
             }
             _atomic_json(progress, run_root / "progress.json")
             print(json.dumps(progress, sort_keys=True), flush=True)
+
+        def on_flush(completed: set[str], shard_path: Path) -> None:
+            nonlocal parity
+            shard_frame = pd.read_parquet(shard_path / "data.parquet")
+            parity = _merge_parity_reports(
+                parity, _parity_report_from_frame(shard_frame)
+            )
+            _atomic_json(parity, parity_path)
+            write_runtime_receipts(completed, shard_path)
 
         processed = run_atomic_chunks(
             store,
@@ -1433,19 +1674,28 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             on_flush=on_flush,
         )
         completed = store.completed_work_keys()
+        reconciled = (
+            store.merge(sort_by=["block_work_key", "contract", "layer"])
+            if completed
+            else pd.DataFrame()
+        )
+        parity = _parity_report_from_frame(reconciled)
+        _atomic_json(parity, parity_path)
+        write_runtime_receipts(completed, None)
         is_complete = completed == set(work_keys)
         artifacts: dict[str, object] = {
             "parity_report_sha256": sha256_file(parity_path),
+            "progress_sha256": sha256_file(run_root / "progress.json"),
+            "telemetry_report_sha256": sha256_file(
+                run_root / "telemetry_report.json"
+            ),
             "continuation_audit_sha256": sha256_file(
                 run_root / "continuation_audit.parquet"
             ),
         }
         if is_complete:
-            merged = store.merge(
-                sort_by=["block_work_key", "contract", "layer"]
-            )
             merged_path = run_root / "layerwise_scores.parquet"
-            merged.to_parquet(merged_path, index=False)
+            reconciled.to_parquet(merged_path, index=False)
             artifacts["layerwise_scores_sha256"] = sha256_file(merged_path)
         status = (
             "startup_complete"
@@ -1495,6 +1745,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
         _atomic_json(attempt, attempt_path)
         raise
     finally:
+        telemetry.stop()
         for value, handler in previous_handlers.items():
             signal.signal(value, handler)
         if model is not None:
@@ -1553,14 +1804,13 @@ def prepare_bundle(
     model = identity.get("model", {})
     if model.get("id") != MISTRAL_ID or model.get("revision") != MISTRAL_REVISION:
         raise RuntimeError("causal source is not the pinned Mistral run")
-    if (
-        raw_manifest.get("semantic_run_id") != identity.get("semantic_run_id")
-        or raw_manifest.get("sha256") != sha256_file(raw_path)
-    ):
-        raise RuntimeError("causal scored artifact identity or checksum mismatch")
-    source = pd.read_parquet(raw_path)
-    if len(source) != int(raw_manifest.get("row_count", -1)):
-        raise RuntimeError("causal scored artifact row count mismatch")
+    identity_splits = set(
+        map(str, identity.get("experiment_config", {}).get("design_splits", []))
+    )
+    if identity_splits != {"train", "validation"}:
+        raise RuntimeError(
+            "causal identity contains a protected split or omits discovery splits"
+        )
 
     v2_root = Path(v2_bundle_root)
     v3_root = Path(v3_bundle_root)
@@ -1588,6 +1838,17 @@ def prepare_bundle(
         "option_audit_manifest_sha256"
     ):
         raise RuntimeError("v3 bundle and causal design disagree on option-audit identity")
+
+    # Only after every metadata identity and protected-split receipt has passed
+    # may the scored causal table be opened.
+    if (
+        raw_manifest.get("semantic_run_id") != identity.get("semantic_run_id")
+        or raw_manifest.get("sha256") != sha256_file(raw_path)
+    ):
+        raise RuntimeError("causal scored artifact identity or checksum mismatch")
+    source = pd.read_parquet(raw_path)
+    if len(source) != int(raw_manifest.get("row_count", -1)):
+        raise RuntimeError("causal scored artifact row count mismatch")
 
     ledger = build_source_ledger(source)
     output = Path(output_dir)
@@ -1727,6 +1988,14 @@ def _four_array(value: object, *, column: str) -> np.ndarray:
     return array
 
 
+def _four_bools(value: object, *, column: str) -> np.ndarray:
+    if not isinstance(value, (list, tuple, np.ndarray)) or len(value) != 4:
+        raise ValueError(f"{column} contains a malformed four-way value")
+    if any(not isinstance(item, (bool, np.bool_)) for item in value):
+        raise ValueError(f"{column} must contain exactly four booleans")
+    return np.asarray(value, dtype=bool)
+
+
 def _validate_score_vectors(frame: pd.DataFrame) -> None:
     required = {
         "letter_raw_logps",
@@ -1734,12 +2003,15 @@ def _validate_score_vectors(frame: pd.DataFrame) -> None:
         "candidate_mean_token_logps",
         "candidate_first_token_logps",
         "letter_calibrated_logps",
+        "candidate_path_evaluable",
         "primary_contrast_evaluable",
         "first_token_contrast_evaluable",
         "letter_calibration_evaluable",
+        "scalar_oracle_evaluated",
         "primary_contrast_exclusion_reason",
         "first_token_contrast_exclusion_reason",
         "letter_calibration_exclusion_reason",
+        *PARITY_COLUMNS.values(),
     }
     if missing := required - set(frame.columns):
         raise ValueError(f"lens score artifact is missing columns: {sorted(missing)}")
@@ -1747,6 +2019,7 @@ def _validate_score_vectors(frame: pd.DataFrame) -> None:
         "primary_contrast_evaluable",
         "first_token_contrast_evaluable",
         "letter_calibration_evaluable",
+        "scalar_oracle_evaluated",
     ):
         if frame[column].isna().any() or not frame[column].map(
             lambda value: isinstance(value, (bool, np.bool_))
@@ -1758,15 +2031,20 @@ def _validate_score_vectors(frame: pd.DataFrame) -> None:
         letter = _four_array(row.letter_raw_logps, column="letter_raw_logps")
         if not np.isfinite(letter).all():
             raise ValueError("lens scores contain non-finite letter_raw_logps")
-        for column in ("candidate_path_total_logps", "candidate_mean_token_logps"):
-            values = _four_array(getattr(row, column), column=column)
-            if bool(row.primary_contrast_evaluable) and not np.isfinite(values).all():
-                raise ValueError(f"lens scores contain non-finite eligible {column}")
-        first = _four_array(
-            row.candidate_first_token_logps, column="candidate_first_token_logps"
+        path_evaluable = _four_bools(
+            row.candidate_path_evaluable, column="candidate_path_evaluable"
         )
-        if bool(row.first_token_contrast_evaluable) and not np.isfinite(first).all():
-            raise ValueError("lens scores contain non-finite eligible first-token values")
+        for column in (
+            "candidate_path_total_logps",
+            "candidate_mean_token_logps",
+            "candidate_first_token_logps",
+        ):
+            values = _four_array(getattr(row, column), column=column)
+            finite = np.isfinite(values)
+            if not np.array_equal(finite, path_evaluable):
+                raise ValueError(
+                    f"lens scores contain non-finite candidate path values in {column}"
+                )
         calibrated = _four_array(
             row.letter_calibrated_logps, column="letter_calibrated_logps"
         )
@@ -1783,11 +2061,33 @@ def _validate_score_vectors(frame: pd.DataFrame) -> None:
         "first_token_contrast_exclusion_reason",
         "letter_calibration_evaluable",
         "letter_calibration_exclusion_reason",
+        "candidate_path_evaluable",
+        "scalar_oracle_evaluated",
+        *PARITY_COLUMNS.values(),
     )
     for key, group in frame.groupby(["block_work_key", "contract"], sort=False):
         for column in stable_columns:
-            if group[column].nunique(dropna=False) != 1:
+            values = group[column]
+            if column == "candidate_path_evaluable":
+                values = values.map(
+                    lambda value: json.dumps([bool(item) for item in value])
+                )
+            if values.nunique(dropna=False) != 1:
                 raise ValueError(f"eligibility state changes across layers: {key}/{column}")
+
+
+def _validate_semantic_identity_digest(identity: Mapping[str, object]) -> None:
+    payload = {
+        str(key): value
+        for key, value in identity.items()
+        if key not in {"semantic_run_id", "semantic_sha256"}
+    }
+    digest = _canonical_sha256(payload)
+    if (
+        identity.get("semantic_sha256") != digest
+        or identity.get("semantic_run_id") != digest[:20]
+    ):
+        raise ValueError("semantic identity digest or run ID is invalid")
 
 
 def verify_run_root(
@@ -1798,6 +2098,7 @@ def verify_run_root(
     run_root = Path(root)
     identity = _read_json(run_root / "semantic_identity.json", name="semantic identity")
     manifest = _read_json(run_root / "run_manifest.json", name="run manifest")
+    _validate_semantic_identity_digest(identity)
     if identity.get("semantic_run_id") != expected_run_id:
         raise ValueError("semantic run ID mismatch")
     if manifest.get("semantic_identity") != identity:
@@ -1915,6 +2216,67 @@ def verify_run_root(
         ]
         if not maxima or not np.isfinite(maxima).all() or max(maxima) > PARITY_ATOL:
             raise ValueError("parity report exceeds the frozen tolerance")
+        expected_parity = _parity_report_from_frame(frame)
+        if parity != expected_parity:
+            raise ValueError("parity coverage or maxima do not reconcile with score shards")
+        if (
+            experiment_config.get("mode") == "startup"
+            and set(map(str, parity.get("scalar_oracle_work_keys", []))) != shard_keys
+        ):
+            raise ValueError("startup scalar parity coverage is incomplete")
+
+        artifacts = manifest.get("artifacts", {})
+        progress_path = run_root / "progress.json"
+        telemetry_path = run_root / "telemetry_report.json"
+        if (
+            not progress_path.exists()
+            or sha256_file(progress_path) != artifacts.get("progress_sha256")
+            or not telemetry_path.exists()
+            or sha256_file(telemetry_path) != artifacts.get("telemetry_report_sha256")
+        ):
+            raise ValueError("runtime telemetry receipts are missing or checksum-mismatched")
+        progress = _read_json(progress_path, name="progress receipt")
+        telemetry = _read_json(telemetry_path, name="telemetry report")
+        if (
+            progress.get("semantic_run_id") != identity.get("semantic_run_id")
+            or telemetry.get("semantic_run_id") != identity.get("semantic_run_id")
+            or int(progress.get("completed_work_units", -1)) != len(shard_keys)
+            or int(telemetry.get("completed_work_units", -1)) != len(shard_keys)
+            or int(telemetry.get("root_input_tokens", -1)) <= 0
+            or int(telemetry.get("branch_input_tokens", -1)) <= 0
+            or int(telemetry.get("peak_vram_bytes", -1)) < 0
+        ):
+            raise ValueError("runtime telemetry does not cover the verified shards")
+        phase_seconds = telemetry.get("phase_seconds", {})
+        utilization = telemetry.get("gpu_utilization", {})
+        for phase in ("root", "branch"):
+            seconds = float(phase_seconds.get(phase, -1.0))
+            phase_utilization = utilization.get(phase, {})
+            samples = int(phase_utilization.get("samples", -1))
+            mean = phase_utilization.get("mean_percent")
+            maximum = phase_utilization.get("max_percent")
+            if (
+                not math.isfinite(seconds)
+                or seconds <= 0
+                or samples < 1
+                or mean is None
+                or maximum is None
+                or not 0.0 <= float(mean) <= 100.0
+                or not 0.0 <= float(maximum) <= 100.0
+            ):
+                raise ValueError(f"runtime telemetry lacks valid {phase} utilization")
+        attempt_paths = sorted((run_root / "attempts").glob("*.json"))
+        valid_attempts = []
+        for path in attempt_paths:
+            receipt = _read_json(path, name="attempt receipt")
+            if (
+                receipt.get("semantic_run_id") == identity.get("semantic_run_id")
+                and receipt.get("status") in {"interrupted", "startup_complete", "complete"}
+                and int(receipt.get("completed_after", -1)) == len(shard_keys)
+            ):
+                valid_attempts.append(path)
+        if not valid_attempts:
+            raise ValueError("no completed attempt receipt covers the verified shards")
     sums = []
     for path in sorted(run_root.rglob("*")):
         if path.is_file() and path.name != "LOCAL_SHA256SUMS.txt":

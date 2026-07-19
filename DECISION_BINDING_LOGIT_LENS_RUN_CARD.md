@@ -83,8 +83,14 @@ Candidate scoring preserves the exact audited displayed bytes:
 
 - no trimming, Unicode normalization, case or punctuation variants, synonyms,
   paraphrases, chat template, BOS, EOS, or alternative-tokenization sum;
-- `add_special_tokens=False`, exact prompt boundary, exact decoded round trip,
-  pinned tokenizer identity, and no registered special token in a candidate;
+- `add_special_tokens=False`; the exact prompt string and exact resulting root
+  token IDs are both hash-bound. Mistral's implicit standalone Metaspace prefix
+  is disabled only for continuation encoding because the fixed root already
+  contains every real boundary byte;
+- the appended path must decode to the decoded fixed root plus the exact
+  candidate surface. Prompt-only round-trip differences such as a tokenizer
+  dropping an initial space are counted and hashed, not silently repaired;
+- pinned tokenizer identity and no registered special token in a candidate;
 - canonical token IDs, decoded suffix, UTF-8 hash, token count, byte count, and
   eligibility reason are persisted before model scoring;
 - a failed/empty/overflow continuation remains in the ledger and is explicitly
@@ -170,9 +176,23 @@ than 31 separate discoveries. Every output reports item/block/exclusion counts.
 
 Interpretation is limited to: consistent with later output/binding effects,
 consistent with wrapper-dependent formation, contract-sensitive,
-predeclared-stratum heterogeneous, or uninformative. Total/mean reversal,
-fragile projections, weak coverage, or unresolved intervals force the
-uninformative conclusion rather than another probe.
+`predeclared_stratum_heterogeneous`, or uninformative. Before any label other
+than uninformative is allowed, all four frozen quality gates must pass:
+
+1. Each contract has exactly one finite primary estimate with a finite,
+   ordered 95% interval, Holm value, positive item count, and positive pair
+   count.
+2. Each contract represents at least 200 unique items and at least 80% of the
+   2,401-item permitted population (therefore at least 1,921 items here).
+3. Candidate-total and candidate-token-mean AUC contrasts have the same
+   nonzero direction separately under both prompt contracts.
+4. At layer 31, the `0.04` ambiguity rate is at most 20% separately for plain
+   and wrapped rows for both raw-letter and candidate-total readouts under both
+   contracts.
+
+These thresholds are frozen before GPU outcomes. They do not remove rows or
+change the primary estimates; they only prevent a fragile, weakly covered, or
+internally inconsistent result from receiving a positive mechanism label.
 
 ## Runtime, Resume, And Artifact Contract
 
@@ -202,7 +222,8 @@ existing shard before skipping work.
 Required outputs are semantic identity, tokenization manifest, continuation
 audit, work plan, progress and attempt receipts, score shards, merged layerwise
 scores, parity report, frozen analysis specification, analysis summary,
-paper-ready tables/figures, run manifest, and independent local checksums.
+deterministic `quality_gates.json`, bounded `interpretation_memo.md`, paper-ready
+tables/figures, run manifest, and independent local checksums.
 
 ## Operator Lifecycle And Paid Gate
 

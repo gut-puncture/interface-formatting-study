@@ -188,6 +188,70 @@ def test_continuation_audit_rejects_label_tokens_that_change_at_prompt_boundary(
         )
 
 
+def test_audit_disables_mistral_metaspace_prefix_for_fixed_root_continuations():
+    class _Metaspace:
+        def __repr__(self):
+            return 'Metaspace(replacement="▁", prepend_scheme=first, split=False)'
+
+    class _Backend:
+        def __init__(self):
+            self.pre_tokenizer = _Metaspace()
+
+    class PrefixingTokenizer:
+        all_special_ids = []
+
+        def __init__(self):
+            self.backend_tokenizer = _Backend()
+
+        def encode(self, text, add_special_tokens=False):
+            assert not add_special_tokens
+            if text == "Answer: ":
+                return [10, 11]
+            no_prefix = "prepend_scheme=never" in repr(
+                self.backend_tokenizer.pre_tokenizer
+            )
+            table = {letter: 20 + index for index, letter in enumerate("ABCD")}
+            if text in table:
+                return [table[text] if no_prefix else table[text] + 10]
+            raise AssertionError(text)
+
+        def decode(self, ids, **_kwargs):
+            pieces = {
+                10: "Answer:",
+                11: " ",
+                **{20 + i: value for i, value in enumerate("ABCD")},
+                **{30 + i: " " + value for i, value in enumerate("ABCD")},
+            }
+            return "".join(pieces[int(value)] for value in ids)
+
+    audit = audit_fixed_root_continuations(
+        PrefixingTokenizer(), "Answer: ", ["A", "B", "C", "D"]
+    )
+
+    assert audit.label_token_ids == (20, 21, 22, 23)
+    assert [candidate.token_ids for candidate in audit.candidates] == [
+        (20,),
+        (21,),
+        (22,),
+        (23,),
+    ]
+
+
+def test_audit_binds_exact_prompt_ids_when_tokenizer_drops_initial_space_on_decode():
+    class LeadingSpaceDroppingTokenizer(ExactTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            if text.startswith(" "):
+                text = text[1:]
+            return super().encode(text, add_special_tokens=add_special_tokens)
+
+    audit = audit_fixed_root_continuations(
+        LeadingSpaceDroppingTokenizer(), " Answer: ", ["A", "B", "C", "D"]
+    )
+
+    assert audit.prompt == " Answer: "
+    assert audit.prompt_token_sha256
+
+
 def test_scalar_oracle_scores_every_layer_and_sums_teacher_forced_path():
     tokenizer = ExactTokenizer()
     model = TinyCachedMistral()
@@ -264,6 +328,28 @@ def test_cached_many_batches_equal_length_roots_and_matches_per_prompt_scores():
         assert torch.allclose(actual.total_logp, reference.total_logp, atol=PARITY_ATOL)
 
 
+def test_cached_scorer_labels_root_and_branch_phases_for_telemetry():
+    tokenizer = ExactTokenizer()
+    model = TinyCachedMistral()
+    audit = audit_fixed_root_continuations(
+        tokenizer,
+        "Question\nAnswer: ",
+        ["A", "Berlin", "New York", "New York City"],
+    )
+    phases: list[str] = []
+
+    score_candidate_paths_cached_many(
+        model,
+        [audit],
+        expected_layers=2,
+        phase_callback=phases.append,
+    )
+
+    assert phases[0] == "root"
+    assert "branch" in phases
+    assert phases[-1] == "idle"
+
+
 def test_cached_many_requires_equal_root_token_lengths():
     tokenizer = ExactTokenizer()
     model = TinyCachedMistral()
@@ -312,14 +398,21 @@ def test_cached_trie_matches_scalar_on_real_mistral_cache_api():
         )
     )
     tokenizer = ExactTokenizer()
-    audit = audit_fixed_root_continuations(
-        tokenizer,
-        "Question\nAnswer: ",
-        ["A", "Berlin", "New York", "New York City"],
-    )
+    audits = [
+        audit_fixed_root_continuations(
+            tokenizer,
+            prompt,
+            ["A", "Berlin", "New York", "New York City"],
+        )
+        for prompt in ("Question\nAnswer: ", "Distinct\nAnswer: ")
+    ]
 
-    scalar = score_candidate_paths_scalar(model, audit, expected_layers=2)
-    cached = score_candidate_paths_cached(model, audit, expected_layers=2)
+    scalar = [
+        score_candidate_paths_scalar(model, audit, expected_layers=2)
+        for audit in audits
+    ]
+    cached = score_candidate_paths_cached_many(model, audits, expected_layers=2)
 
-    assert torch.allclose(cached.total_logp, scalar.total_logp, atol=PARITY_ATOL)
-    assert torch.allclose(cached.letter_logp, scalar.letter_logp, atol=PARITY_ATOL)
+    for actual, expected in zip(cached, scalar, strict=True):
+        assert torch.allclose(actual.total_logp, expected.total_logp, atol=PARITY_ATOL)
+        assert torch.allclose(actual.letter_logp, expected.letter_logp, atol=PARITY_ATOL)

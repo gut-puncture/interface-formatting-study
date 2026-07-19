@@ -28,7 +28,7 @@ LOG_FILE="$STATE_DIR/mistral-${MODE}.log"
 
 running_pid() {
   [[ -f "$PID_FILE" ]] || return 1
-  local pid command expected_bundle expected_audit owned
+  local pid command expected_bundle expected_audit owned stored_mode
   pid="$(cat "$PID_FILE")"
   if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
     rm -f "$PID_FILE"
@@ -36,6 +36,9 @@ running_pid() {
   fi
   expected_bundle=""
   expected_audit=""
+  stored_mode=""
+  if [[ -f "$MODE_FILE" ]]; then stored_mode="$(cat "$MODE_FILE")"; fi
+  [[ "$stored_mode" =~ ^(startup|full)$ ]] || return 1
   if [[ -f "$ARGS_FILE" ]]; then
     expected_bundle="$(sed -n '1p' "$ARGS_FILE")"
     expected_audit="$(sed -n '2p' "$ARGS_FILE")"
@@ -43,7 +46,7 @@ running_pid() {
   command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
   owned=false
   if [[ "$command" == *"run_decision_binding_logit_lens_gpu.sh"* && \
-        "$command" == *"$MODE $expected_bundle $expected_audit"* ]]; then
+        "$command" == *"$stored_mode $expected_bundle $expected_audit"* ]]; then
     owned=true
   elif [[ "$command" == *"decision_binding_logit_lens_cli"* && \
           "$command" == *"--profile mistral"* && \
@@ -83,9 +86,11 @@ case "$ACTION" in
     ;;
   status)
     if pid="$(running_pid)"; then
-      echo "running model=mistral mode=$MODE pid=$pid log=$LOG_FILE"
-      if [[ -s "$LOG_FILE" ]]; then
-        grep '"phase"' "$LOG_FILE" | tail -n 1 || true
+      active_mode="$(cat "$MODE_FILE")"
+      active_log="$STATE_DIR/mistral-${active_mode}.log"
+      echo "running model=mistral mode=$active_mode pid=$pid log=$active_log"
+      if [[ -s "$active_log" ]]; then
+        grep '"phase"' "$active_log" | tail -n 1 || true
       fi
     else
       echo "stopped model=mistral mode=$MODE log=$LOG_FILE"
