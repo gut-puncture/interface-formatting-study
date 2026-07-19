@@ -449,7 +449,7 @@ compiled PDF and its bound source/artifact support the statement.
       region and no implication of a tuned transition point.
 - [ ] Ensure every axis, unit, denominator, layer convention, uncertainty band,
       and exclusion is explained in its caption.
-- [ ] Verify legibility at final two-column size and in grayscale.
+- [ ] Verify legibility at the prescribed 5.5-inch single-column size and in grayscale.
 - [ ] Remove redundant figures rather than shrinking them below legibility.
 
 ### Discussion, limitations, and conclusion
