@@ -11,9 +11,9 @@
   documents. The causal and candidate-reader systems remain unchanged.
 - The original 1,400-2,000-line estimate was rechecked when the implementation
   exceeded it. The final bounded scorer, authenticated CLI/verifier, and frozen
-  analysis are approximately 3,300 non-test lines because every eligibility,
-  resume, parity, and paper-output rule is explicit. No shared loader/shard
-  redesign or additional subsystem is authorized.
+  analysis and thin operators are approximately 4,600 production lines because
+  every eligibility, resume, parity, and paper-output rule is explicit. No
+  shared loader/shard redesign or additional subsystem is authorized.
 - Review tier: exactly two independent reviewers in one batch, one for
   scientific identity/scoring/analysis and one for cache/resume/operator
   behavior. One coordinated correction and focused re-review are allowed.
@@ -138,6 +138,11 @@ excluded only from the comparisons whose identity assumption they violate.
 Exact ties store the full argmax set and zero margin; no order-based tie-break
 is allowed.
 
+Score-shard candidate eligibility must exactly match the authenticated
+continuation audit; shard-local flags cannot redefine which paths require
+finite scores. Parity coverage/maxima live in the same atomic shards as the
+scores and are reconstructed on resume.
+
 ## Frozen Analysis
 
 All 2,401 permitted items are measured. Pooled train/validation is the primary
@@ -224,6 +229,12 @@ audit, work plan, progress and attempt receipts, score shards, merged layerwise
 scores, parity report, frozen analysis specification, analysis summary,
 deterministic `quality_gates.json`, bounded `interpretation_memo.md`, paper-ready
 tables/figures, run manifest, and independent local checksums.
+
+Startup telemetry is cumulative across the two invocations and carries exact
+covered work keys. Verification requires the frozen `0 -> 4 interrupted` then
+`4 -> 8 startup_complete` attempt chain, with each attempt's telemetry keys
+matching its processed keys. Paper-facing analysis outputs are accepted only
+when the complete declared set and every manifest hash verify.
 
 ## Operator Lifecycle And Paid Gate
 

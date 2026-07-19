@@ -12,7 +12,9 @@ import torch
 
 from interface_formatting_study.decision_binding_logit_lens_cli import (
     EXPECTED_FORMATS,
+    _merge_telemetry_reports,
     _parity_report_from_frame,
+    _validate_attempt_chain,
     audit_tokenizer_bundle,
     build_parser,
     build_logit_lens_identity,
@@ -661,6 +663,76 @@ def test_parity_coverage_survives_crash_after_atomic_shard_commit(tmp_path):
     assert report["scalar_oracle_work_keys"] == ["a", "b"]
 
 
+def test_telemetry_merge_covers_both_startup_halves_without_relabeling():
+    first = {
+        "covered_work_keys": ["a", "b", "c", "d"],
+        "phase_seconds": {"root": 2.0, "branch": 1.0, "scalar_oracle": 3.0},
+        "gpu_utilization": {
+            "root": {"samples": 2, "mean_percent": 50.0, "max_percent": 60.0},
+            "branch": {"samples": 1, "mean_percent": 40.0, "max_percent": 40.0},
+            "scalar_oracle": {"samples": 1, "mean_percent": 30.0, "max_percent": 30.0},
+        },
+        "sample_errors": 0,
+    }
+    second = {
+        "covered_work_keys": ["e", "f", "g", "h"],
+        "phase_seconds": {"root": 1.0, "branch": 2.0, "scalar_oracle": 2.0},
+        "gpu_utilization": {
+            "root": {"samples": 1, "mean_percent": 80.0, "max_percent": 80.0},
+            "branch": {"samples": 1, "mean_percent": 60.0, "max_percent": 60.0},
+            "scalar_oracle": {"samples": 1, "mean_percent": 50.0, "max_percent": 50.0},
+        },
+        "sample_errors": 1,
+    }
+
+    merged = _merge_telemetry_reports(first, second)
+
+    assert merged["covered_work_keys"] == list("abcdefgh")
+    assert merged["phase_seconds"]["root"] == pytest.approx(3.0)
+    assert merged["gpu_utilization"]["root"] == {
+        "samples": 3,
+        "mean_percent": 60.0,
+        "max_percent": 80.0,
+    }
+    assert merged["sample_errors"] == 1
+
+
+def test_startup_attempt_chain_requires_interrupted_four_then_resumed_four():
+    keys = list("abcdefgh")
+    one_shot = [
+        {
+            "started_at_unix": 1.0,
+            "status": "startup_complete",
+            "completed_before": 0,
+            "processed_work_keys": keys,
+            "completed_after": 8,
+            "telemetry_work_keys": keys,
+        }
+    ]
+    with pytest.raises(ValueError, match="four-plus-four"):
+        _validate_attempt_chain(one_shot, keys, mode="startup")
+
+    resumed = [
+        {
+            "started_at_unix": 1.0,
+            "status": "interrupted",
+            "completed_before": 0,
+            "processed_work_keys": keys[:4],
+            "completed_after": 4,
+            "telemetry_work_keys": keys[:4],
+        },
+        {
+            "started_at_unix": 2.0,
+            "status": "startup_complete",
+            "completed_before": 4,
+            "processed_work_keys": keys[4:],
+            "completed_after": 8,
+            "telemetry_work_keys": keys[4:],
+        },
+    ]
+    _validate_attempt_chain(resumed, keys, mode="startup")
+
+
 def test_execute_model_run_requires_the_frozen_eight_by_four_startup_shape():
     common = {
         "profile": "mistral",
@@ -793,7 +865,16 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
         },
     }
     (tmp_path / "prepared_manifest.json").write_text(json.dumps({"stage": "discovery"}))
-    (tmp_path / "continuation_audit.parquet").write_bytes(b"authenticated-audit-fixture")
+    pd.DataFrame(
+        [
+            {
+                "block_work_key": "item|plain",
+                "contract": contract,
+                "candidate_path_evaluable": [True, True, True, True],
+            }
+            for contract in ("letter", "text")
+        ]
+    ).to_parquet(tmp_path / "continuation_audit.parquet", index=False)
     (tmp_path / "tokenization_manifest.json").write_text(
         json.dumps(
             {
@@ -904,6 +985,7 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
             "branch": {"samples": 1, "mean_percent": 60.0, "max_percent": 60.0},
             "scalar_oracle": {"samples": 0, "mean_percent": None, "max_percent": None},
         },
+        "covered_work_keys": ["item|plain"],
     }
     (tmp_path / "telemetry_report.json").write_text(json.dumps(telemetry))
     progress = {
@@ -920,7 +1002,11 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
             {
                 "semantic_run_id": run_id,
                 "status": "complete",
+                "started_at_unix": 1.0,
+                "completed_before": 0,
+                "processed_work_keys": ["item|plain"],
                 "completed_after": 1,
+                "telemetry_work_keys": ["item|plain"],
             }
         )
     )
@@ -943,6 +1029,39 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     receipt = verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
 
     assert receipt == {"status": "complete", "work_units": 1, "rows": 4}
+    analysis_dir = tmp_path / "analysis"
+    analysis_dir.mkdir()
+    analysis_names = {
+        "analysis_summary": "analysis_summary.json",
+        "interpretation_memo": "interpretation_memo.md",
+        "quality_gates": "quality_gates.json",
+        "calibrated_letter": "calibrated_letter.csv",
+        "diagnostics": "diagnostics.csv",
+        "primary_contrasts": "primary_contrasts.csv",
+        "secondary_contrasts": "secondary_contrasts.csv",
+        "trajectories": "trajectories.csv",
+        "timing": "timing.csv",
+        "timing_distributions": "timing_distributions.csv",
+        "trajectory_figure": "trajectory_2x2.png",
+        "strata": "strata.csv",
+    }
+    for filename in analysis_names.values():
+        (analysis_dir / filename).write_bytes(f"fixture:{filename}".encode())
+    manifest["artifacts"]["analysis"] = {
+        name: {
+            "path": f"analysis/{filename}",
+            "sha256": sha256_file(analysis_dir / filename),
+        }
+        for name, filename in analysis_names.items()
+    }
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
+    assert verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")["rows"] == 4
+    (analysis_dir / "quality_gates.json").write_text("tampered")
+    with pytest.raises(ValueError, match="analysis artifact"):
+        verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
+    (analysis_dir / "quality_gates.json").write_bytes(
+        b"fixture:quality_gates.json"
+    )
     incomplete_parity = {**parity, "covered_work_keys": []}
     (tmp_path / "parity_report.json").write_text(json.dumps(incomplete_parity))
     manifest["artifacts"]["parity_report_sha256"] = sha256_file(
@@ -991,24 +1110,27 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
     with pytest.raises(ValueError, match="non-finite candidate path"):
         verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
 
-    masked["candidate_path_evaluable"] = pd.Series(
-        [[False, False, False, False] for _ in range(len(masked))]
+    corrupted_mask = masked.copy()
+    corrupted_mask["candidate_path_evaluable"] = pd.Series(
+        [[False, False, False, False] for _ in range(len(corrupted_mask))]
     )
-    masked.to_parquet(shard / "data.parquet", index=False)
+    corrupted_mask.to_parquet(shard / "data.parquet", index=False)
     shard_manifest["data_sha256"] = sha256_file(shard / "data.parquet")
     (shard / "manifest.json").write_text(json.dumps(shard_manifest))
-    masked.to_parquet(tmp_path / "layerwise_scores.parquet", index=False)
+    corrupted_mask.to_parquet(tmp_path / "layerwise_scores.parquet", index=False)
     manifest["artifacts"]["layerwise_scores_sha256"] = sha256_file(
         tmp_path / "layerwise_scores.parquet"
     )
     (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
-    assert verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")["rows"] == 4
+    with pytest.raises(ValueError, match="authenticated continuation audit"):
+        verify_run_root(tmp_path, expected_run_id=run_id, mode="complete")
 
-    masked.at[0, "letter_raw_logps"] = [float("nan"), -1.0, -2.0, -3.0]
-    masked.to_parquet(shard / "data.parquet", index=False)
+    letter_corrupt = scores.copy()
+    letter_corrupt.at[0, "letter_raw_logps"] = [float("nan"), -1.0, -2.0, -3.0]
+    letter_corrupt.to_parquet(shard / "data.parquet", index=False)
     shard_manifest["data_sha256"] = sha256_file(shard / "data.parquet")
     (shard / "manifest.json").write_text(json.dumps(shard_manifest))
-    masked.to_parquet(tmp_path / "layerwise_scores.parquet", index=False)
+    letter_corrupt.to_parquet(tmp_path / "layerwise_scores.parquet", index=False)
     manifest["artifacts"]["layerwise_scores_sha256"] = sha256_file(tmp_path / "layerwise_scores.parquet")
     (tmp_path / "run_manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="non-finite"):

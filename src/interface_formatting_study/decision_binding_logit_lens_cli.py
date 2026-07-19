@@ -60,6 +60,20 @@ MISTRAL_SLUG = "mistral-7b-instruct-v0.3"
 CLAIM_BOUNDARY = "descriptive_layerwise_logit_lens_not_causal"
 TOKEN_AUDIT_SCHEMA_VERSION = 1
 RUN_SCHEMA_VERSION = 1
+EXPECTED_ANALYSIS_ARTIFACTS = {
+    "analysis_summary",
+    "interpretation_memo",
+    "quality_gates",
+    "calibrated_letter",
+    "diagnostics",
+    "primary_contrasts",
+    "secondary_contrasts",
+    "trajectories",
+    "timing",
+    "timing_distributions",
+    "trajectory_figure",
+    "strata",
+}
 
 
 class GpuPhaseTelemetry:
@@ -170,6 +184,109 @@ class GpuPhaseTelemetry:
         self.set_phase("idle")
         self._stop.set()
         self._thread.join(timeout=3)
+
+
+def _merge_telemetry_reports(
+    previous: Mapping[str, object], current: Mapping[str, object]
+) -> dict[str, object]:
+    phases = ("root", "branch", "scalar_oracle")
+    previous_utilization = previous.get("gpu_utilization", {})
+    current_utilization = current.get("gpu_utilization", {})
+    utilization: dict[str, dict[str, object]] = {}
+    for phase in phases:
+        left = previous_utilization.get(phase, {})
+        right = current_utilization.get(phase, {})
+        left_count = int(left.get("samples", 0))
+        right_count = int(right.get("samples", 0))
+        count = left_count + right_count
+        left_mean = 0.0 if left_count == 0 else float(left["mean_percent"])
+        right_mean = 0.0 if right_count == 0 else float(right["mean_percent"])
+        maxima = [
+            float(value)
+            for value in (left.get("max_percent"), right.get("max_percent"))
+            if value is not None
+        ]
+        utilization[phase] = {
+            "samples": count,
+            "mean_percent": (
+                None
+                if count == 0
+                else (left_count * left_mean + right_count * right_mean) / count
+            ),
+            "max_percent": None if not maxima else max(maxima),
+        }
+    previous_seconds = previous.get("phase_seconds", {})
+    current_seconds = current.get("phase_seconds", {})
+    semantic_ids = {
+        str(value)
+        for value in (
+            previous.get("semantic_run_id"),
+            current.get("semantic_run_id"),
+        )
+        if value not in {None, ""}
+    }
+    if len(semantic_ids) > 1:
+        raise ValueError("telemetry reports have conflicting semantic identities")
+    return {
+        "schema_version": 2,
+        "semantic_run_id": next(iter(semantic_ids), ""),
+        "completed_work_units": int(current.get("completed_work_units", 0)),
+        "covered_work_keys": sorted(
+            set(map(str, previous.get("covered_work_keys", [])))
+            | set(map(str, current.get("covered_work_keys", [])))
+        ),
+        "root_input_tokens": int(current.get("root_input_tokens", 0)),
+        "branch_input_tokens": int(current.get("branch_input_tokens", 0)),
+        "peak_vram_bytes": max(
+            int(previous.get("peak_vram_bytes", 0)),
+            int(current.get("peak_vram_bytes", 0)),
+        ),
+        "phase_seconds": {
+            phase: float(previous_seconds.get(phase, 0.0))
+            + float(current_seconds.get(phase, 0.0))
+            for phase in phases
+        },
+        "gpu_utilization": utilization,
+        "sample_errors": int(previous.get("sample_errors", 0))
+        + int(current.get("sample_errors", 0)),
+    }
+
+
+def _validate_attempt_chain(
+    receipts: Sequence[Mapping[str, object]],
+    work_keys: Sequence[str],
+    *,
+    mode: str,
+) -> None:
+    ordered_keys = [str(value) for value in work_keys]
+    advancing: list[Mapping[str, object]] = []
+    cursor = 0
+    for receipt in sorted(receipts, key=lambda value: float(value["started_at_unix"])):
+        if receipt.get("status") not in {"interrupted", "startup_complete", "complete"}:
+            continue
+        before = int(receipt.get("completed_before", -1))
+        after = int(receipt.get("completed_after", -1))
+        processed = list(map(str, receipt.get("processed_work_keys", [])))
+        telemetry_keys = list(map(str, receipt.get("telemetry_work_keys", [])))
+        if before != cursor or after != before + len(processed):
+            raise ValueError("attempt receipts do not form a deterministic resume chain")
+        if processed != ordered_keys[before:after] or telemetry_keys != processed:
+            raise ValueError("attempt receipts do not bind work and telemetry coverage")
+        cursor = after
+        advancing.append(receipt)
+    if cursor != len(ordered_keys):
+        raise ValueError("attempt receipts do not cover the verified work prefix")
+    if mode == "startup" and len(ordered_keys) == 8:
+        shape = [
+            (
+                int(receipt["completed_before"]),
+                int(receipt["completed_after"]),
+                str(receipt["status"]),
+            )
+            for receipt in advancing
+        ]
+        if shape != [(0, 4, "interrupted"), (4, 8, "startup_complete")]:
+            raise ValueError("startup attempt receipts do not prove the frozen four-plus-four resume")
 
 
 def _atomic_json(payload: object, path: Path) -> None:
@@ -1547,6 +1664,19 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
     else:
         parity = _parity_report_from_frame(pd.DataFrame())
     _atomic_json(parity, parity_path)
+    telemetry_path = run_root / "telemetry_report.json"
+    telemetry_base = (
+        _read_json(telemetry_path, name="telemetry report")
+        if telemetry_path.exists()
+        else {}
+    )
+    if telemetry_base:
+        if telemetry_base.get("semantic_run_id") != identity.semantic_run_id:
+            raise RuntimeError("existing telemetry report has a different identity")
+        if not set(map(str, telemetry_base.get("covered_work_keys", []))).issubset(
+            completed_before
+        ):
+            raise RuntimeError("existing telemetry covers unauthenticated work keys")
     telemetry = GpuPhaseTelemetry(identity.semantic_run_id)
     telemetry.start()
     stop_requested = False
@@ -1626,7 +1756,13 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
                 branch_input_tokens=branch_input_tokens,
                 peak_vram_bytes=peak_vram,
             )
-            _atomic_json(telemetry_report, run_root / "telemetry_report.json")
+            telemetry_report["covered_work_keys"] = sorted(
+                completed - completed_before
+            )
+            telemetry_report = _merge_telemetry_reports(
+                telemetry_base, telemetry_report
+            )
+            _atomic_json(telemetry_report, telemetry_path)
             rate = len(completed - completed_before) / elapsed
             remaining = len(work_keys) - len(completed)
             progress = {
@@ -1687,7 +1823,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
             "parity_report_sha256": sha256_file(parity_path),
             "progress_sha256": sha256_file(run_root / "progress.json"),
             "telemetry_report_sha256": sha256_file(
-                run_root / "telemetry_report.json"
+                telemetry_path
             ),
             "continuation_audit_sha256": sha256_file(
                 run_root / "continuation_audit.parquet"
@@ -1721,6 +1857,7 @@ def execute_model_run(args: argparse.Namespace) -> dict[str, object]:
                 "finished_at_unix": time.time(),
                 "processed_work_keys": processed,
                 "completed_after": len(completed),
+                "telemetry_work_keys": processed,
             }
         )
         _atomic_json(attempt, attempt_path)
@@ -2140,6 +2277,12 @@ def verify_run_root(
         "continuation_audit_sha256"
     ):
         raise ValueError("tokenization manifest does not bind the continuation audit")
+    continuation_audit = pd.read_parquet(run_root / "continuation_audit.parquet")
+    audit_primary = continuation_audit[
+        continuation_audit["contract"].astype(str).isin(["letter", "text"])
+    ].copy()
+    if audit_primary.duplicated(["block_work_key", "contract"]).any():
+        raise ValueError("continuation audit has duplicate primary coordinates")
     analysis_spec = _read_json(run_root / "analysis_spec.json", name="analysis specification")
     if analysis_spec != experiment_config.get("analysis_policy"):
         raise ValueError("analysis specification differs from semantic identity")
@@ -2170,6 +2313,34 @@ def verify_run_root(
     frame = shard_frame if merged is None else merged
     if not frame.empty:
         _validate_score_vectors(frame)
+        score_masks = frame[
+            ["block_work_key", "contract", "candidate_path_evaluable"]
+        ].drop_duplicates(["block_work_key", "contract"])
+        audit_masks = audit_primary[
+            ["block_work_key", "contract", "candidate_path_evaluable"]
+        ]
+        mask_comparison = score_masks.merge(
+            audit_masks,
+            on=["block_work_key", "contract"],
+            how="left",
+            suffixes=("_score", "_audit"),
+            validate="one_to_one",
+            indicator=True,
+        )
+        if (mask_comparison["_merge"] != "both").any() or any(
+            not np.array_equal(
+                _four_bools(score, column="candidate_path_evaluable_score"),
+                _four_bools(audit, column="candidate_path_evaluable_audit"),
+            )
+            for score, audit in zip(
+                mask_comparison["candidate_path_evaluable_score"],
+                mask_comparison["candidate_path_evaluable_audit"],
+                strict=True,
+            )
+        ):
+            raise ValueError(
+                "score eligibility differs from the authenticated continuation audit"
+            )
     structural = ["block_work_key", "contract", "layer"]
     if set(structural) - set(frame.columns) or frame.duplicated(structural).any():
         raise ValueError("lens scores contain missing or duplicate structural coordinates")
@@ -2194,6 +2365,9 @@ def verify_run_root(
         raise ValueError("completed row count does not match the work plan")
     if int(manifest.get("completed_work_units", -1)) != len(shard_keys):
         raise ValueError("completed work-unit count mismatch")
+    verified_prefix = work_keys[: len(shard_keys)]
+    if shard_keys != set(verified_prefix):
+        raise ValueError("verified shards are not the deterministic work-plan prefix")
     if frame.empty and mode in {"startup", "complete"}:
         raise ValueError("completed run contains no score rows")
     parity_path = run_root / "parity_report.json"
@@ -2242,6 +2416,7 @@ def verify_run_root(
             or telemetry.get("semantic_run_id") != identity.get("semantic_run_id")
             or int(progress.get("completed_work_units", -1)) != len(shard_keys)
             or int(telemetry.get("completed_work_units", -1)) != len(shard_keys)
+            or set(map(str, telemetry.get("covered_work_keys", []))) != shard_keys
             or int(telemetry.get("root_input_tokens", -1)) <= 0
             or int(telemetry.get("branch_input_tokens", -1)) <= 0
             or int(telemetry.get("peak_vram_bytes", -1)) < 0
@@ -2265,18 +2440,28 @@ def verify_run_root(
                 or not 0.0 <= float(maximum) <= 100.0
             ):
                 raise ValueError(f"runtime telemetry lacks valid {phase} utilization")
-        attempt_paths = sorted((run_root / "attempts").glob("*.json"))
-        valid_attempts = []
-        for path in attempt_paths:
+        attempt_receipts = []
+        for path in sorted((run_root / "attempts").glob("*.json")):
             receipt = _read_json(path, name="attempt receipt")
-            if (
-                receipt.get("semantic_run_id") == identity.get("semantic_run_id")
-                and receipt.get("status") in {"interrupted", "startup_complete", "complete"}
-                and int(receipt.get("completed_after", -1)) == len(shard_keys)
-            ):
-                valid_attempts.append(path)
-        if not valid_attempts:
-            raise ValueError("no completed attempt receipt covers the verified shards")
+            if receipt.get("semantic_run_id") == identity.get("semantic_run_id"):
+                attempt_receipts.append(receipt)
+        _validate_attempt_chain(
+            attempt_receipts,
+            verified_prefix,
+            mode=str(experiment_config.get("mode", "full")),
+        )
+
+    analysis_artifacts = manifest.get("artifacts", {}).get("analysis")
+    if analysis_artifacts is not None:
+        if set(analysis_artifacts) != EXPECTED_ANALYSIS_ARTIFACTS:
+            raise ValueError("analysis artifact manifest is incomplete or contains extras")
+        for name, receipt in analysis_artifacts.items():
+            relative = Path(str(receipt.get("path", "")))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"analysis artifact path is unsafe: {name}")
+            path = run_root / relative
+            if not path.is_file() or sha256_file(path) != receipt.get("sha256"):
+                raise ValueError(f"analysis artifact checksum mismatch: {name}")
     sums = []
     for path in sorted(run_root.rglob("*")):
         if path.is_file() and path.name != "LOCAL_SHA256SUMS.txt":

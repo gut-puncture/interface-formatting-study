@@ -177,8 +177,14 @@ ssh -i <key> -p <port> ubuntu@<host> \
   `MAX_CHUNKS_THIS_INVOCATION`; record that completed work was skipped rather
   than recomputed.
 - [ ] Fetch in `startup` mode and verify all eight blocks.
+- [ ] Verify cumulative telemetry covers all eight exact work keys and the
+  authenticated attempts prove `0 -> 4 interrupted` then
+  `4 -> 8 startup_complete`; reject a one-shot startup receipt.
 - [ ] Record scalar/batch, cached/uncached, per-token/path-total, layer count,
   final-native, shape, finiteness, source hash, and resume parity receipts.
+- [ ] Verify shard-local candidate eligibility against the authenticated
+  continuation audit and every declared analysis artifact hash before accepting
+  paper-facing outputs.
 - [ ] Record measured shutdown/flush/fetch duration and a full-run runtime/cost
   forecast from useful-block throughput.
 - [ ] If any startup gate fails, stop before scale, diagnose that exact surface,
