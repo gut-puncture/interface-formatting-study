@@ -1549,6 +1549,12 @@ SENSITIVITY_ARGMAX_READOUTS = (
     "candidate_mean_token",
     "candidate_total",
 )
+SENSITIVITY_SCORE_COLUMNS = {
+    "letter": "letter_raw_logps",
+    "candidate_first_token": "candidate_first_token_logps",
+    "candidate_mean_token": "candidate_mean_token_logps",
+    "candidate_total": "candidate_path_total_logps",
+}
 
 
 def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
@@ -1576,6 +1582,7 @@ def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
         "scalar_oracle_evaluated",
         *PARITY_COLUMNS.values(),
         *sensitivity_columns,
+        *SENSITIVITY_SCORE_COLUMNS.values(),
     }
     if missing := required - set(frame.columns):
         raise ValueError(f"parity receipts are missing from score shards: {sorted(missing)}")
@@ -1594,13 +1601,25 @@ def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
         if values.isna().any() or not np.isfinite(values.to_numpy()).all():
             raise ValueError("parity receipts contain non-finite values")
         maxima[name] = float(values.max())
-    scalar_frame = frame[frame["scalar_oracle_evaluated"].astype(bool)]
+    scalar_mask = frame["scalar_oracle_evaluated"].astype(bool)
+    scalar_frame = frame[scalar_mask]
     argmax_counts: dict[str, int] = {}
     for readout in SENSITIVITY_ARGMAX_READOUTS:
-        comparable = scalar_frame[f"cached_scalar_{readout}_argmax_comparable"].astype(bool)
+        comparable_column = f"cached_scalar_{readout}_argmax_comparable"
+        disagreement_column = f"cached_scalar_{readout}_argmax_disagreement"
+        if frame.loc[~scalar_mask, [comparable_column, disagreement_column]].astype(bool).any().any():
+            raise ValueError("argmax sensitivity receipt exists without scalar evaluation")
+        comparable = scalar_frame[comparable_column].astype(bool)
         disagreement = scalar_frame[
-            f"cached_scalar_{readout}_argmax_disagreement"
+            disagreement_column
         ].astype(bool)
+        expected_comparable = scalar_frame[SENSITIVITY_SCORE_COLUMNS[readout]].map(
+            lambda values: bool(np.isfinite(np.asarray(values, dtype=float)).any())
+        )
+        if not comparable.equals(expected_comparable.astype(bool)):
+            raise ValueError("argmax comparability receipt mismatch")
+        if bool((disagreement & ~comparable).any()):
+            raise ValueError("argmax disagreement lacks a comparable score vector")
         argmax_counts[f"cached_scalar_{readout}_argmax_comparisons"] = int(
             comparable.sum()
         )

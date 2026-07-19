@@ -623,6 +623,11 @@ def test_score_chunk_records_bf16_cross_forward_drift_without_rejecting_valid_sa
     assert frame["cached_scalar_letter_argmax_disagreement"].all()
     assert frame["cached_scalar_candidate_total_argmax_disagreement"].all()
 
+    forged = frame.copy()
+    forged["cached_scalar_letter_argmax_comparable"] = False
+    with pytest.raises(ValueError, match="argmax comparability receipt mismatch"):
+        _parity_report_from_frame(forged)
+
 
 def test_atomic_chunk_resume_skips_completed_work_and_max_chunks_is_invocation_only(tmp_path):
     dataset = tmp_path / "dataset.parquet"
@@ -699,6 +704,10 @@ def test_parity_coverage_survives_crash_after_atomic_shard_commit(tmp_path):
                 "parity_cached_scalar_mean_token_max": [0.004] * len(keys),
                 "parity_cached_scalar_total_per_token_max": [0.005] * len(keys),
                 "scalar_oracle_evaluated": [True] * len(keys),
+                "letter_raw_logps": [[-0.1, -1.0, -2.0, -3.0]] * len(keys),
+                "candidate_first_token_logps": [[-0.2, -1.1, -2.1, -3.1]] * len(keys),
+                "candidate_mean_token_logps": [[-0.2, -1.1, -2.1, -3.1]] * len(keys),
+                "candidate_path_total_logps": [[-0.2, -1.1, -2.1, -3.1]] * len(keys),
             }
         for readout in (
             "letter",
