@@ -280,10 +280,13 @@ the manuscript itself.
 
 ## Figures and visual system
 
-Match the restrained visual language of *Semantic Gravity Wells: Why Negative
-Constraints Backfire* (arXiv:2601.08070): white background, compact serif paper
-typography, black axes and annotation, sparse grid use, direct captions, and a
-small consistent diverging palette.
+The prescribed CAISc template is authoritative for typography, margins, page
+layout, section styling, and bibliography. Do not copy the layout or paper
+format of *Semantic Gravity Wells: Why Negative Constraints Backfire*
+(arXiv:2601.08070). Use that paper only as the requested chart-color reference.
+Within the CAISc format, keep plots restrained: white backgrounds, black axes
+and annotation, sparse grids, direct captions, and a small consistent diverging
+palette.
 
 The dominant sampled colors in the reference PDF are:
 
@@ -314,6 +317,259 @@ Main-text visual plan:
 
 Avoid rainbow palettes, decorative gradients, oversized titles, and separate
 legends that force the reader to decode every panel repeatedly.
+
+## Complete paper worklist
+
+This is the working camera-ready checklist. A box is complete only when the
+compiled PDF and its bound source/artifact support the statement.
+
+### Evidence and result finalization
+
+- [ ] Finish, fetch, and completely verify the Phi logit-lens artifact.
+- [ ] Finish, fetch, and completely verify the Qwen logit-lens artifact.
+- [ ] Record each model's final quality-gate result, population, exclusions,
+      primary contrasts, sensitivities, timing, and parity receipt.
+- [ ] Decide the cross-model internal conclusion from the frozen rules; do not
+      average away opposite or uninformative outcomes.
+- [ ] Preserve the unopened final-599 boundary in methods and limitations.
+- [ ] Reconcile every number used in prose, tables, figures, abstract,
+      OpenReview metadata, and checklists against one canonical artifact.
+- [ ] Record exact compute environment, GPU, runtime, and cost for the new runs.
+
+### Scientific framing and claims
+
+- [ ] Rewrite the one-sentence thesis around heterogeneous answer formation and
+      answer-to-output binding.
+- [ ] Replace the old “modest negative” ending with the bounded causal-plus-
+      trajectory account.
+- [ ] State explicitly that the logit lens is descriptive, not causal or
+      literal thought access.
+- [ ] State explicitly that full candidate paths are teacher-forced continuation
+      compatibility, not information contained wholly at the answer prefix.
+- [ ] Keep first-token, total-path, and token-mean estimands separate.
+- [ ] Avoid claiming that late binding is universal, unique, or sufficient to
+      explain every wrapper conflict.
+- [ ] Avoid claiming free-form generation robustness from constrained
+      candidate scoring.
+- [ ] Explain that the text-output prompt is a counterfactual contract, not a
+      privileged view of the letter-output model's hidden answer.
+
+### Abstract, title, and introduction
+
+- [ ] Reassess whether the existing title remains the narrowest accurate title
+      after the new evidence; change it only if the final story requires it.
+- [ ] Rewrite the abstract with three-model behavior, confidence limitation,
+      causal rotations, logit-lens result, and bounded conclusion.
+- [ ] Update the abstract's model, prompt, item, and uncertainty counts.
+- [ ] Open the introduction with one concrete wrapper-induced answer flip.
+- [ ] Define answer-formation failure and binding/output failure in plain
+      language.
+- [ ] End the introduction with three precise contributions and claim limits.
+
+### Experimental setup and audit
+
+- [ ] Retain exact model revisions, MMLU population, wrappers, scoring, and
+      content-free calibration.
+- [ ] Explain the outcome-blind row audit in the main text, including 107
+      content-changing rows, four ambiguous rows, and removal sensitivity.
+- [ ] Explain item-level conflicts and why wrapper rows are clustered by item.
+- [ ] Add the controlled position-rotation and displayed-label-rotation design.
+- [ ] Add the two-contract/two-readout logit-lens design without calling it a
+      causal 2x2 factorial.
+- [ ] Document exact candidate identities, contextual tokenization,
+      multi-token teacher forcing, prefix collisions, duplicates, and explicit
+      eligibility.
+- [ ] Document the final-layer/native parity gate and numerical ambiguity policy.
+- [ ] Explain train/validation pooling, fixed split replication, bootstrap,
+      Holm correction, and predeclared strata.
+
+### Results sections
+
+- [ ] Consolidate the cross-model behavioral results into one lead figure and
+      one compact table.
+- [ ] Add the confidence analysis and show that rotation effects persist in all
+      confidence terciles.
+- [ ] Add position and displayed-label causal effects with item-clustered 95%
+      intervals, row-flip rates, and overlap strata.
+- [ ] Add answer-text/letter disagreement as bounded supporting evidence.
+- [ ] Add the Mistral primary AUC contrasts with item and pair denominators.
+- [ ] Add token-mean and first-token sensitivity results beside the primary
+      result.
+- [ ] Add winner-stability and separation-onset results with careful timing
+      language.
+- [ ] Add train-versus-validation replication and predeclared stratum results.
+- [ ] Add Phi/Qwen layerwise replication only if their complete artifacts and
+      frozen gates support it.
+- [ ] Compress old attention, cosine, and patching results into a “what simple
+      accounts were ruled out” section; move excess layer detail to appendix.
+
+### Statistical reporting
+
+- [ ] Add confidence intervals to every comparative mechanistic claim that
+      currently has only a point estimate.
+- [ ] Give deterministic rates denominators even where no sampling claim is
+      made.
+- [ ] Use item-clustered uncertainty wherever wrappers share an underlying
+      question.
+- [ ] Describe the 5,000-draw bootstrap and seed.
+- [ ] Report Holm adjustment only for the two declared co-primary contrasts.
+- [ ] Do not turn each layer into a separate significance claim; use complete
+      trajectories and simultaneous bands.
+- [ ] Update the reproducibility checklist's statistical-significance answer
+      from `No` if and only if the final manuscript actually reports the
+      declared intervals correctly.
+
+### Related work and bibliography
+
+- [ ] Add a concise related-work subsection covering prompt sensitivity and
+      format dependence, option-order and answer-label bias, content-free
+      calibration, logit-lens limitations, and causal intervention controls.
+- [ ] Connect each related work citation to the exact claim it supports; avoid
+      citation lists detached from prose.
+- [ ] Verify every existing and new reference against an authoritative
+      publisher, DOI, OpenReview, arXiv, or official model record.
+- [ ] Correct title, authors, venue, year, identifier, and URL where the current
+      BibTeX differs from the authoritative record.
+- [ ] Confirm every citation key used in `main.tex` exists exactly once and
+      every bibliography entry is cited or intentionally retained.
+- [ ] Remove any invented, unverifiable, duplicate, or claim-mismatched entry.
+- [ ] Recompile and inspect the rendered bibliography under the prescribed
+      CAISc style.
+
+### Figures and tables
+
+- [ ] Regenerate all main figures with the fixed `#2166AC` blue, `#B2182B`
+      red, `#D1771E` ochre, and neutral gray palette.
+- [ ] Keep semantic color assignments identical across every model and panel.
+- [ ] Add non-color encodings: line style, markers, labels, or hatching.
+- [ ] Add an overview schematic of content identity, position, displayed label,
+      and output token.
+- [ ] Add the causal rotation figure with intervals.
+- [ ] Add the logit-lens 2x2 trajectory figure with a lightly shaded late layer
+      region and no implication of a tuned transition point.
+- [ ] Ensure every axis, unit, denominator, layer convention, uncertainty band,
+      and exclusion is explained in its caption.
+- [ ] Verify legibility at final two-column size and in grayscale.
+- [ ] Remove redundant figures rather than shrinking them below legibility.
+
+### Discussion, limitations, and conclusion
+
+- [ ] Explain the heterogeneous mechanism account and unresolved population.
+- [ ] Separate causal evidence from descriptive internal evidence.
+- [ ] Retain one-dataset/eight-wrapper and imperfect-wrapper limitations.
+- [ ] Retain model-family/scale limits even if all three logit-lens runs agree.
+- [ ] Add constrained-candidate versus open-generation limitations.
+- [ ] Add tokenizer/surface-form and intermediate-unembedding limitations.
+- [ ] State positive reliability uses and possible adversarial misuse.
+- [ ] End with the bounded answer to the opening question, not a generic null.
+
+### Appendices and reproducibility
+
+- [ ] Move detailed wrapper audit, old probe layers, control donor tables,
+      continuation eligibility census, parity details, and additional strata to
+      appendices when they do not fit the main narrative.
+- [ ] Update the reproducibility bundle with the exact released code commit,
+      compact verified artifacts, commands, manifests, and checksums.
+- [ ] Update model/tokenizer revisions, package versions, runtime batching, GPU
+      provenance, elapsed time, and cost.
+- [ ] Ensure no final-599 outcomes, private credentials, GPU host details, or
+      irrelevant raw caches enter the public bundle.
+- [ ] Update the AI Involvement Checklist to name the actual systems in the
+      non-anonymous camera-ready as required by its own instructions.
+- [ ] Update every checklist explanation whose scientific story or statistical
+      evidence changed.
+- [ ] Rebuild the PDF, page previews, source archive, reproducibility bundle,
+      bundle README, and SHA-256 manifest together from one frozen source.
+- [ ] Delete or replace stale generated submission artifacts only through the
+      established packaging command; do not leave the May single-Qwen bundle
+      beside a July three-model camera-ready under an ambiguous name.
+- [ ] Reassess the checklist's current “open access to data and code: Yes” after
+      the new causal and logit-lens files enter the paper; it is supportable only
+      if the refreshed public bundle actually contains the required code,
+      compact evidence, and instructions.
+
+### Camera-ready formatting and metadata
+
+- [ ] Keep the prescribed `caisc_2026` template and switch only to its `final`
+      option.
+- [ ] Restore author name, affiliation, contact details if required by the
+      template, and acknowledgements.
+- [ ] Check the venue's page limit and any template diagnostics before final
+      upload; do not infer layout rules from the visual-reference paper.
+- [ ] Remove all anonymous-submission wording and stale “one model” language.
+- [ ] Compile from a clean state and inspect every page for overflow, floats,
+      broken links, bad citations, missing glyphs, and illegible figures.
+- [ ] Confirm PDF opens, fonts are embedded, links work, and no tracked changes,
+      comments, hidden annotations, or local paths remain.
+- [ ] Make OpenReview title, author list, keywords, TL;DR, and abstract match the
+      final PDF.
+- [ ] Upload only the final verified PDF and pause for explicit action-time
+      confirmation before pressing OpenReview Submit.
+
+## Reference audit and related-work plan
+
+The current bibliography was audited entry by entry on 19 July 2026 against
+authoritative OpenReview, arXiv, Hugging Face, NeurIPS, PMLR, ACL Anthology, and
+publisher records. All seven cited works are real. There are no duplicate keys,
+missing keys, unused entries, or existing citation claims contradicted by their
+sources.
+
+| Existing key | Audit result | Action |
+|---|---|---|
+| `hendrycks2021mmlu` | Verified: MMLU, ICLR 2021 | Keep. |
+| `qwen2025qwen25` | Real report; prior entry mismatched the current 2025 revision | Corrected to Qwen Team, 2025, arXiv:2412.15115. |
+| `microsoft2024phi35` | Verified official Microsoft model card | Keep; optionally pin the model revision in prose or manifest, not necessarily the citation. |
+| `mistralai2024mistral7bv03` | Verified official Mistral AI model card | Keep; optionally normalize the title wording. |
+| `zhang2024activationpatching` | Verified ICLR 2024 paper | Keep; directly supports patching-method sensitivity. |
+| `meng2022locating` | Verified NeurIPS 2022 paper | Keep; optional page/publisher metadata only. |
+| `wang2022interpretability` | Verified 2022 arXiv preprint | Keep or upgrade to the ICLR 2023 record; either is real. |
+
+The reviewer was correct that this real bibliography is too narrow. It has no
+focused Related Work section and does not cite the closest precedents for
+prompt formatting or content-free calibration. The minimum verified additions
+are:
+
+1. Sclar, Choi, Tsvetkov, and Suhr, “Quantifying Language Models' Sensitivity
+   to Spurious Features in Prompt Design or: How I Learned to Start Worrying
+   About Prompt Formatting,” ICLR 2024, OpenReview `RIu5lyNXjT`, arXiv:2310.11324.
+   Use for meaning-preserving prompt-format sensitivity and state our distinct
+   contribution rather than implying the phenomenon is wholly new.
+2. Mizrahi, Kaplan, Malkin, Dror, Shahaf, and Stanovsky, “State of What Art? A
+   Call for Multi-Prompt LLM Evaluation,” TACL 12 (2024), 933–949,
+   DOI `10.1162/tacl_a_00681`, arXiv:2401.00595. Use for multi-prompt benchmark
+   brittleness and the need to report variation across prompt realizations.
+3. Zhao, Wallace, Feng, Klein, and Singh, “Calibrate Before Use: Improving
+   Few-shot Performance of Language Models,” ICML 2021, 12697–12706. Use for
+   content-free contextual calibration; describe this paper's wrapper-specific
+   log-score subtraction as an adaptation, not an identical procedure.
+
+The new causal and logit-lens story additionally needs a few targeted, verified
+citations rather than a broad survey:
+
+4. Pezeshkpour and Hruschka, “Large Language Models Sensitivity to The Order of
+   Options in Multiple-Choice Questions,” Findings of NAACL 2024, 2006–2017,
+   DOI `10.18653/v1/2024.findings-naacl.130`. Use for option-position effects.
+5. Zhou, Wang, Xu, Chen, and Duan, “Revisiting the Self-Consistency Challenges
+   in Multi-Choice Question Formats for Large Language Model Evaluation,”
+   LREC-COLING 2024, 14103–14110. Use for knowledge-equivalent position and
+   label variants in multiple-choice evaluation.
+6. Belrose et al., “Eliciting Latent Predictions from Transformers with the
+   Tuned Lens,” arXiv:2303.08112. Use specifically to explain that a raw logit
+   lens can be brittle and intermediate states were not necessarily trained for
+   direct final-head decoding.
+
+Two further real works are optional if the corresponding prose remains:
+
+- Wei et al., “Unveiling Selection Biases: Exploring Order and Token
+  Sensitivity in Large Language Models,” Findings of ACL 2024,
+  DOI `10.18653/v1/2024.findings-acl.333`.
+- Holtzman et al., “Surface Form Competition: Why the Highest Probability
+  Answer Isn't Always Right,” EMNLP 2021,
+  DOI `10.18653/v1/2021.emnlp-main.564`.
+
+Add only references used by a specific sentence. Before final compile, copy
+BibTeX metadata from these authoritative records, then repeat the key,
+duplication, citation-use, and rendered-bibliography audit.
 
 ## Verified CAISc camera-ready requirements
 
@@ -397,4 +653,3 @@ metadata, author list, and final checks agree exactly.
 - Final cross-model internal-mechanism sentence and figure layout.
 - Exact final paper page count after the new results replace the old narrative.
 - Final acknowledgements, affiliation wording, and public repository URL.
-
