@@ -580,9 +580,14 @@ def test_score_chunk_records_bf16_cross_forward_drift_without_rejecting_valid_sa
         tmp_path / "tokenization", bundle_root=tmp_path / "bundle", expected_blocks=2
     )
 
-    def scores(value: float, layers: int) -> LayerwisePathScores:
+    def scores(value: float, layers: int, *, reverse_winner: bool = False) -> LayerwisePathScores:
+        row = (
+            [value - 1.0, value, value - 2.0, value - 3.0]
+            if reverse_winner
+            else [value, value - 1.0, value - 2.0, value - 3.0]
+        )
         tensor = torch.tensor(
-            [[value, value - 1.0, value - 2.0, value - 3.0]] * layers,
+            [row] * layers,
             dtype=torch.float32,
         )
         return LayerwisePathScores(tensor, tensor, tensor, tensor, 0.0)
@@ -593,7 +598,9 @@ def test_score_chunk_records_bf16_cross_forward_drift_without_rejecting_valid_sa
     monkeypatch.setattr(
         logit_cli,
         "score_candidate_paths_scalar",
-        lambda _model, _audit, *, expected_layers: scores(-0.225, expected_layers),
+        lambda _model, _audit, *, expected_layers: scores(
+            -0.225, expected_layers, reverse_winner=True
+        ),
     )
 
     frame, parity = score_lens_chunk(
@@ -609,8 +616,12 @@ def test_score_chunk_records_bf16_cross_forward_drift_without_rejecting_valid_sa
     )
 
     assert parity["max_final_native_difference"] == 0.0
-    assert parity["max_cached_scalar_letter_difference"] == pytest.approx(0.125)
-    assert np.allclose(frame["parity_cached_scalar_letter_max"], 0.125)
+    assert parity["max_cached_scalar_letter_difference"] == pytest.approx(1.125)
+    assert np.allclose(frame["parity_cached_scalar_letter_max"], 1.125)
+    assert parity["cached_scalar_letter_argmax_disagreements"] == 8
+    assert parity["cached_scalar_candidate_total_argmax_disagreements"] == 8
+    assert frame["cached_scalar_letter_argmax_disagreement"].all()
+    assert frame["cached_scalar_candidate_total_argmax_disagreement"].all()
 
 
 def test_atomic_chunk_resume_skips_completed_work_and_max_chunks_is_invocation_only(tmp_path):
@@ -680,8 +691,7 @@ def test_parity_coverage_survives_crash_after_atomic_shard_commit(tmp_path):
     store = ShardStore(tmp_path / "shards", identity)
 
     def process(keys):
-        return pd.DataFrame(
-            {
+        rows = {
                 "block_work_key": list(keys),
                 "parity_final_native_max": [0.001] * len(keys),
                 "parity_cached_scalar_letter_max": [0.002] * len(keys),
@@ -690,7 +700,15 @@ def test_parity_coverage_survives_crash_after_atomic_shard_commit(tmp_path):
                 "parity_cached_scalar_total_per_token_max": [0.005] * len(keys),
                 "scalar_oracle_evaluated": [True] * len(keys),
             }
-        )
+        for readout in (
+            "letter",
+            "candidate_first_token",
+            "candidate_mean_token",
+            "candidate_total",
+        ):
+            rows[f"cached_scalar_{readout}_argmax_comparable"] = [True] * len(keys)
+            rows[f"cached_scalar_{readout}_argmax_disagreement"] = [False] * len(keys)
+        return pd.DataFrame(rows)
 
     with pytest.raises(RuntimeError, match="simulated crash"):
         run_atomic_chunks(
@@ -1001,6 +1019,14 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
         }
         for contract in ("letter", "text") for layer in range(2)
     ])
+    for readout in (
+        "letter",
+        "candidate_first_token",
+        "candidate_mean_token",
+        "candidate_total",
+    ):
+        scores[f"cached_scalar_{readout}_argmax_comparable"] = False
+        scores[f"cached_scalar_{readout}_argmax_disagreement"] = False
     shard = tmp_path / "shards" / "lens" / "shard-fixture"
     shard.mkdir(parents=True)
     scores.to_parquet(shard / "data.parquet", index=False)
@@ -1026,6 +1052,16 @@ def test_verify_run_root_reconciles_complete_identity_shards_and_scores(tmp_path
         "max_cached_scalar_first_token_difference": 0.0,
         "max_cached_scalar_mean_token_difference": 0.0,
         "max_cached_scalar_total_per_token_difference": 0.0,
+        **{
+            f"cached_scalar_{readout}_argmax_{suffix}": 0
+            for readout in (
+                "letter",
+                "candidate_first_token",
+                "candidate_mean_token",
+                "candidate_total",
+            )
+            for suffix in ("comparisons", "disagreements")
+        },
     }
     (tmp_path / "parity_report.json").write_text(json.dumps(parity))
     telemetry = {

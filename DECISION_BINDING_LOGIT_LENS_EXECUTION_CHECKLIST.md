@@ -181,9 +181,10 @@ ssh -i <key> -p <port> ubuntu@<host> \
 - [ ] Verify cumulative telemetry covers all eight exact work keys and the
   authenticated attempts prove `0 -> 4 interrupted` then
   `4 -> 8 startup_complete`; reject a one-shot startup receipt.
-- [ ] Record scalar/batch and cached/uncached sensitivity maxima,
-  per-token/path-total values, layer count, same-forward final/native parity,
-  shape, finiteness, source hash, and resume receipts.
+- [ ] Record the combined cached-batched versus scalar-full-prefix sensitivity
+  maxima and per-layer argmax disagreement counts, plus per-token/path-total
+  values, layer count, same-forward final/native parity, shape, finiteness,
+  source hash, and resume receipts.
 - [ ] Verify shard-local candidate eligibility against the authenticated
   continuation audit and require the exact canonical analysis artifact set,
   paths, and hashes before accepting a public `complete` verification.
@@ -208,9 +209,10 @@ Freeze and record `BATCH_SIZE` and `MAX_BATCH_TOKENS` from the successful
 startup. The startup chunk size is predeclared as 4 so one invocation leaves
 half of the exact eight-block sample for a real resume; the full-run chunk size
 is predeclared as 64 to avoid thousands of tiny Parquet shards. Both values are
-identity-bound. The startup scalar/batch comparison must be complete, finite,
-and recorded before the larger full-run grouping is allowed; its BF16
-coordinate differences are sensitivity data, not a fatal threshold.
+identity-bound. The startup cached-batched versus scalar-full-prefix comparison
+must be complete, finite, and recorded before the larger full-run grouping is
+allowed; its BF16 coordinate and argmax differences are sensitivity data, not
+a fatal threshold.
 
 ```bash
 ssh -i <key> -p <port> ubuntu@<host> \

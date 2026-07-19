@@ -1113,6 +1113,25 @@ def _max_finite_difference(left: torch.Tensor, right: torch.Tensor) -> float:
     return float((left[finite] - right[finite]).abs().max())
 
 
+def _argmax_set_disagreement(
+    left: torch.Tensor, right: torch.Tensor
+) -> tuple[bool, bool]:
+    if left.shape != right.shape or left.ndim != 1:
+        raise ValueError("cached/scalar argmax comparison shape mismatch")
+    left_finite = torch.isfinite(left)
+    right_finite = torch.isfinite(right)
+    if not torch.equal(left_finite, right_finite):
+        raise ValueError("cached/scalar argmax eligibility masks differ")
+    if not bool(left_finite.any()):
+        return False, False
+    indices = torch.nonzero(left_finite, as_tuple=False).flatten()
+    left_values = left[indices]
+    right_values = right[indices]
+    left_winners = set(indices[left_values == left_values.max()].tolist())
+    right_winners = set(indices[right_values == right_values.max()].tolist())
+    return True, left_winners != right_winners
+
+
 def score_lens_chunk(
     *,
     model,
@@ -1153,6 +1172,7 @@ def score_lens_chunk(
         if bool(row["root_evaluable"]):
             tasks.append((key[0], key[1], _audit_from_record(row)))
     scores: dict[tuple[str, str], object] = {}
+    scalar_references: dict[tuple[str, str], object] = {}
     oracle_maxima = {
         "max_cached_scalar_letter_difference": 0.0,
         "max_cached_scalar_first_token_difference": 0.0,
@@ -1186,6 +1206,7 @@ def score_lens_chunk(
                     finally:
                         if phase_callback is not None:
                             phase_callback("idle")
+                    scalar_references[(task[0], task[1])] = reference
                     letter_difference = _max_finite_difference(
                         result.letter_logp, reference.letter_logp
                     )
@@ -1259,6 +1280,42 @@ def score_lens_chunk(
                 )
             )
             for layer in range(expected_layers):
+                sensitivity: dict[str, bool] = {}
+                if run_scalar_oracle:
+                    reference = scalar_references[(block_key, contract)]
+                    readouts = (
+                        ("letter", result.letter_logp[layer], reference.letter_logp[layer]),
+                        (
+                            "candidate_first_token",
+                            result.first_token_logp[layer],
+                            reference.first_token_logp[layer],
+                        ),
+                        (
+                            "candidate_mean_token",
+                            result.mean_token_logp[layer],
+                            reference.mean_token_logp[layer],
+                        ),
+                        (
+                            "candidate_total",
+                            result.total_logp[layer],
+                            reference.total_logp[layer],
+                        ),
+                    )
+                    for readout, cached_values, scalar_values in readouts:
+                        comparable, disagreement = _argmax_set_disagreement(
+                            cached_values, scalar_values
+                        )
+                        sensitivity[f"cached_scalar_{readout}_argmax_comparable"] = comparable
+                        sensitivity[f"cached_scalar_{readout}_argmax_disagreement"] = disagreement
+                else:
+                    for readout in (
+                        "letter",
+                        "candidate_first_token",
+                        "candidate_mean_token",
+                        "candidate_total",
+                    ):
+                        sensitivity[f"cached_scalar_{readout}_argmax_comparable"] = False
+                        sensitivity[f"cached_scalar_{readout}_argmax_disagreement"] = False
                 output.append(
                     {
                         "block_work_key": block_key,
@@ -1320,6 +1377,7 @@ def score_lens_chunk(
                             source_row["candidate_surfaces_match_plain"]
                         ),
                         "audit_provenance": str(source_row["choice_provenance"]),
+                        **sensitivity,
                     }
                 )
     frame = pd.DataFrame.from_records(output)
@@ -1327,6 +1385,20 @@ def score_lens_chunk(
         "max_final_native_difference": max_native,
         **oracle_maxima,
     }
+    for readout in (
+        "letter",
+        "candidate_first_token",
+        "candidate_mean_token",
+        "candidate_total",
+    ):
+        comparable_column = f"cached_scalar_{readout}_argmax_comparable"
+        disagreement_column = f"cached_scalar_{readout}_argmax_disagreement"
+        parity[f"cached_scalar_{readout}_argmax_comparisons"] = int(
+            frame[comparable_column].sum()
+        )
+        parity[f"cached_scalar_{readout}_argmax_disagreements"] = int(
+            (frame[comparable_column] & frame[disagreement_column]).sum()
+        )
     frame["parity_final_native_max"] = float(max_native)
     frame["parity_cached_scalar_letter_max"] = float(
         oracle_maxima["max_cached_scalar_letter_difference"]
@@ -1471,6 +1543,13 @@ PARITY_COLUMNS = {
     ),
 }
 
+SENSITIVITY_ARGMAX_READOUTS = (
+    "letter",
+    "candidate_first_token",
+    "candidate_mean_token",
+    "candidate_total",
+)
+
 
 def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
     if frame.empty:
@@ -1481,8 +1560,23 @@ def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
             "covered_work_keys": [],
             "scalar_oracle_work_keys": [],
             **{name: 0.0 for name in PARITY_COLUMNS},
+            **{
+                f"cached_scalar_{readout}_argmax_{suffix}": 0
+                for readout in SENSITIVITY_ARGMAX_READOUTS
+                for suffix in ("comparisons", "disagreements")
+            },
         }
-    required = {"block_work_key", "scalar_oracle_evaluated", *PARITY_COLUMNS.values()}
+    sensitivity_columns = {
+        f"cached_scalar_{readout}_argmax_{suffix}"
+        for readout in SENSITIVITY_ARGMAX_READOUTS
+        for suffix in ("comparable", "disagreement")
+    }
+    required = {
+        "block_work_key",
+        "scalar_oracle_evaluated",
+        *PARITY_COLUMNS.values(),
+        *sensitivity_columns,
+    }
     if missing := required - set(frame.columns):
         raise ValueError(f"parity receipts are missing from score shards: {sorted(missing)}")
     covered = sorted(frame["block_work_key"].astype(str).unique().tolist())
@@ -1500,6 +1594,19 @@ def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
         if values.isna().any() or not np.isfinite(values.to_numpy()).all():
             raise ValueError("parity receipts contain non-finite values")
         maxima[name] = float(values.max())
+    scalar_frame = frame[frame["scalar_oracle_evaluated"].astype(bool)]
+    argmax_counts: dict[str, int] = {}
+    for readout in SENSITIVITY_ARGMAX_READOUTS:
+        comparable = scalar_frame[f"cached_scalar_{readout}_argmax_comparable"].astype(bool)
+        disagreement = scalar_frame[
+            f"cached_scalar_{readout}_argmax_disagreement"
+        ].astype(bool)
+        argmax_counts[f"cached_scalar_{readout}_argmax_comparisons"] = int(
+            comparable.sum()
+        )
+        argmax_counts[f"cached_scalar_{readout}_argmax_disagreements"] = int(
+            (comparable & disagreement).sum()
+        )
     return {
         "schema_version": 2,
         "tolerance": PARITY_ATOL,
@@ -1507,6 +1614,7 @@ def _parity_report_from_frame(frame: pd.DataFrame) -> dict[str, object]:
         "covered_work_keys": covered,
         "scalar_oracle_work_keys": scalar_keys,
         **maxima,
+        **argmax_counts,
     }
 
 
@@ -1538,6 +1646,14 @@ def _merge_parity_reports(
         **{
             name: max(float(previous.get(name, 0.0)), float(current.get(name, 0.0)))
             for name in PARITY_COLUMNS
+        },
+        **{
+            f"cached_scalar_{readout}_argmax_{suffix}": int(
+                previous.get(f"cached_scalar_{readout}_argmax_{suffix}", 0)
+            )
+            + int(current.get(f"cached_scalar_{readout}_argmax_{suffix}", 0))
+            for readout in SENSITIVITY_ARGMAX_READOUTS
+            for suffix in ("comparisons", "disagreements")
         },
     }
 

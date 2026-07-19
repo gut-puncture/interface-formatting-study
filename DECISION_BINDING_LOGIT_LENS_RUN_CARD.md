@@ -132,7 +132,8 @@ Frozen tolerances:
 - final block lens/native target log probabilities: maximum absolute coordinate
   difference `0.02`;
 - cached/uncached and scalar/batched differences: finite and fully recorded,
-  with no tuned acceptance threshold;
+  as one combined cached-batched versus scalar-full-prefix comparison, with
+  per-layer argmax disagreement counts and no tuned acceptance threshold;
 - token IDs, prompt/source hashes, shapes, layer count, and finite values have
   zero tolerance.
 
