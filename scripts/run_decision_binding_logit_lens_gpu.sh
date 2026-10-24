@@ -3,26 +3,28 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run_decision_binding_logit_lens_gpu.sh <startup|full> <prepared-bundle> <token-audit>
+Usage: scripts/run_decision_binding_logit_lens_gpu.sh <startup|full> <mistral|phi|qwen> <prepared-bundle> <token-audit>
 
-Runs the pinned Mistral logit-lens scorer. Runtime knobs are BATCH_SIZE (8),
+Runs the pinned profile's logit-lens scorer. Runtime knobs are BATCH_SIZE (8),
 MAX_BATCH_TOKENS (24000), CAPTURE_CHUNK_SIZE (startup 4; full 64),
 STARTUP_ITEMS (8), and the optional MAX_CHUNKS_THIS_INVOCATION stop/resume seam.
 USAGE
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 3 ]]; then
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 4 ]]; then
   usage
   exit 0
 fi
 
 MODE="$1"
-BUNDLE="$2"
-TOKEN_AUDIT="$3"
+PROFILE="$2"
+BUNDLE="$3"
+TOKEN_AUDIT="$4"
 [[ "$MODE" =~ ^(startup|full)$ ]] || { echo "mode must be startup or full" >&2; exit 2; }
+[[ "$PROFILE" =~ ^(mistral|phi|qwen)$ ]] || { echo "invalid profile" >&2; exit 2; }
 ARGS=(
   run-model
-  --profile "mistral"
+  --profile "$PROFILE"
   --bundle "$BUNDLE"
   --token-audit "$TOKEN_AUDIT"
   --batch-size "${BATCH_SIZE:-8}"

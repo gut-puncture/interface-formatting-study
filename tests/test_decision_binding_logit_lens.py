@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from interface_formatting_study import decision_binding_logit_lens as lens_module
 from interface_formatting_study.decision_binding_logit_lens import (
     PARITY_ATOL,
     audit_fixed_root_continuations,
@@ -283,6 +284,65 @@ def test_audit_disables_mistral_metaspace_prefix_for_fixed_root_continuations():
     )
 
     assert audit.label_token_ids == (20, 21, 22, 23)
+    assert lens_module.continuation_tokenization_policy(PrefixingTokenizer()) == (
+        "fixed_root_metaspace_without_implicit_prefix"
+    )
+    assert [candidate.token_ids for candidate in audit.candidates] == [
+        (20,),
+        (21,),
+        (22,),
+        (23,),
+    ]
+
+
+def test_audit_disables_phi_sentencepiece_normalizer_prefix_at_fixed_root():
+    class _Normalizer:
+        def __repr__(self):
+            return (
+                'Sequence(normalizers=[Prepend(prepend="▁"), '
+                'Replace(pattern=String(" "), content="▁")])'
+            )
+
+    class _Backend:
+        def __init__(self):
+            self.pre_tokenizer = None
+            self.normalizer = _Normalizer()
+
+    class PrefixingTokenizer:
+        all_special_ids = []
+
+        def __init__(self):
+            self.backend_tokenizer = _Backend()
+
+        def encode(self, text, add_special_tokens=False):
+            assert not add_special_tokens
+            if text == "Answer: ":
+                return [10, 11]
+            has_implicit_prefix = "Prepend" in repr(
+                self.backend_tokenizer.normalizer
+            )
+            table = {letter: 20 + index for index, letter in enumerate("ABCD")}
+            if text in table:
+                return [table[text] + 10 if has_implicit_prefix else table[text]]
+            raise AssertionError(text)
+
+        def decode(self, ids, **_kwargs):
+            pieces = {
+                10: "Answer:",
+                11: " ",
+                **{20 + i: value for i, value in enumerate("ABCD")},
+                **{30 + i: " " + value for i, value in enumerate("ABCD")},
+            }
+            return "".join(pieces[int(value)] for value in ids)
+
+    audit = audit_fixed_root_continuations(
+        PrefixingTokenizer(), "Answer: ", ["A", "B", "C", "D"]
+    )
+
+    assert audit.label_token_ids == (20, 21, 22, 23)
+    assert lens_module.continuation_tokenization_policy(PrefixingTokenizer()) == (
+        "fixed_root_sentencepiece_without_implicit_prefix"
+    )
     assert [candidate.token_ids for candidate in audit.candidates] == [
         (20,),
         (21,),
@@ -469,4 +529,51 @@ def test_cached_trie_matches_scalar_on_real_mistral_cache_api():
 
     for actual, expected in zip(cached, scalar, strict=True):
         assert torch.allclose(actual.total_logp, expected.total_logp, atol=PARITY_ATOL)
+        assert torch.allclose(actual.letter_logp, expected.letter_logp, atol=PARITY_ATOL)
+
+
+@pytest.mark.parametrize("architecture", ["phi", "qwen"])
+def test_cached_trie_matches_scalar_and_final_native_on_cross_model_cache_apis(
+    architecture,
+):
+    if architecture == "phi":
+        from transformers import Phi3Config, Phi3ForCausalLM
+
+        config_class, model_class = Phi3Config, Phi3ForCausalLM
+    else:
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+
+        config_class, model_class = Qwen2Config, Qwen2ForCausalLM
+    model = model_class(
+        config_class(
+            vocab_size=96,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=1,
+        )
+    )
+    tokenizer = ExactTokenizer()
+    audits = [
+        audit_fixed_root_continuations(
+            tokenizer, prompt, ["A", "Berlin", "New York", "New York City"]
+        )
+        for prompt in ("Question\nAnswer: ", "Distinct\nAnswer: ")
+    ]
+
+    scalar = [
+        score_candidate_paths_scalar(model, audit, expected_layers=2)
+        for audit in audits
+    ]
+    cached = score_candidate_paths_cached_many(model, audits, expected_layers=2)
+
+    for actual, expected in zip(cached, scalar, strict=True):
+        assert actual.max_final_native_difference <= PARITY_ATOL
+        assert torch.allclose(actual.total_logp, expected.total_logp, atol=PARITY_ATOL)
+        assert torch.allclose(actual.mean_token_logp, expected.mean_token_logp, atol=PARITY_ATOL)
         assert torch.allclose(actual.letter_logp, expected.letter_logp, atol=PARITY_ATOL)

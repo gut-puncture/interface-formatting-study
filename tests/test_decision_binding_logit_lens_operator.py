@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -10,16 +11,19 @@ RUN = ROOT / "scripts/run_decision_binding_logit_lens_gpu.sh"
 CONTROL = ROOT / "scripts/control_decision_binding_logit_lens_gpu.sh"
 FETCH = ROOT / "scripts/fetch_decision_binding_logit_lens_artifacts.sh"
 SYNC = ROOT / "scripts/sync_interface_formatting_study_to_gpu.sh"
+CHECKLIST = ROOT / "DECISION_BINDING_LOGIT_LENS_EXECUTION_CHECKLIST.md"
+RUN_CARD = ROOT / "DECISION_BINDING_LOGIT_LENS_RUN_CARD.md"
+NORTH_STAR = ROOT / "SCIENTIFIC_NORTH_STAR.md"
 
 
-def test_logit_lens_runner_is_mistral_only_and_uses_runtime_configuration():
+def test_logit_lens_runner_uses_explicit_pinned_profile_and_runtime_configuration():
     script = RUN.read_text(encoding="utf-8")
 
     assert ".venv/bin/python" in script
     assert "interface_formatting_study.decision_binding_logit_lens_cli" in script
-    assert '--profile "mistral"' in script
-    assert "qwen" not in script.lower()
-    assert "phi" not in script.lower()
+    assert 'PROFILE="$2"' in script
+    assert '[[ "$PROFILE" =~ ^(mistral|phi|qwen)$ ]]' in script
+    assert '--profile "$PROFILE"' in script
     assert '[[ "$MODE" =~ ^(startup|full)$ ]]' in script
     assert 'BATCH_SIZE:-8' in script
     assert 'MAX_BATCH_TOKENS:-24000' in script
@@ -42,7 +46,7 @@ def test_logit_lens_runner_passes_frozen_arguments_through_real_entrypoint(tmp_p
     fake_python.chmod(0o755)
 
     subprocess.run(
-        ["bash", str(RUN), "startup", "/prepared/v4", "/prepared/tokenization"],
+        ["bash", str(RUN), "startup", "phi", "/prepared/v4", "/prepared/tokenization"],
         cwd=project,
         env={
             **os.environ,
@@ -57,7 +61,7 @@ def test_logit_lens_runner_passes_frozen_arguments_through_real_entrypoint(tmp_p
 
     args = log.read_text(encoding="utf-8")
     assert "-m interface_formatting_study.decision_binding_logit_lens_cli run-model" in args
-    assert "--profile mistral" in args
+    assert "--profile phi" in args
     assert "--bundle /prepared/v4" in args
     assert "--token-audit /prepared/tokenization" in args
     assert "--batch-size 3" in args
@@ -78,6 +82,7 @@ def test_logit_lens_control_is_owned_resumable_and_surfaces_progress(tmp_path):
     assert "decision_binding_logit_lens" in script
     assert "run_decision_binding_logit_lens_gpu.sh" in script
     assert "flock -n" in script
+    assert 'HOST_GPU_LOCK_FILE="$STATE_DIR/gpu.lock"' in script
     assert "stop)" in script and "status)" in script and "tail)" in script
 
     state = tmp_path / "state"
@@ -136,13 +141,13 @@ def test_logit_lens_control_keeps_live_startup_owned_when_status_requests_full(t
     fake_ps.write_text(
         "#!/usr/bin/env bash\n"
         "echo 'bash scripts/run_decision_binding_logit_lens_gpu.sh startup "
-        "/prepared/v4 /prepared/tokenization'\n",
+        "mistral /prepared/v4 /prepared/tokenization'\n",
         encoding="utf-8",
     )
     fake_ps.chmod(0o755)
 
     result = subprocess.run(
-        ["bash", str(CONTROL), "status", "full"],
+        ["bash", str(CONTROL), "status", "mistral", "full"],
         env={
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -157,6 +162,149 @@ def test_logit_lens_control_keeps_live_startup_owned_when_status_requests_full(t
     assert (state / "mistral.pid").read_text(encoding="utf-8") == str(os.getpid())
 
 
+def test_canonical_checklist_uses_profile_before_mode_and_documented_launch_parses(
+    tmp_path,
+):
+    checklist = CHECKLIST.read_text(encoding="utf-8")
+    assert "control_decision_binding_logit_lens_gpu.sh start mistral startup" in checklist
+    assert "control_decision_binding_logit_lens_gpu.sh status mistral" in checklist
+    assert "control_decision_binding_logit_lens_gpu.sh tail mistral" in checklist
+    assert "control_decision_binding_logit_lens_gpu.sh start mistral full" in checklist
+    assert "fetch_decision_binding_logit_lens_artifacts.sh \\\n  mistral ubuntu@<host>" in checklist
+
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    runner = scripts / "run_decision_binding_logit_lens_gpu.sh"
+    runner.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    runner.chmod(0o755)
+    result = subprocess.run(
+        [
+            "bash",
+            str(CONTROL),
+            "start",
+            "mistral",
+            "startup",
+            "/prepared/v4",
+            "/prepared/tokenization",
+        ],
+        cwd=project,
+        env={
+            **os.environ,
+            "DECISION_LOGIT_LENS_STATE_DIR": str(tmp_path / "state"),
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "started model=mistral mode=startup" in result.stdout
+
+
+def test_governing_docs_authorize_only_the_pinned_cross_model_extension():
+    run_card = RUN_CARD.read_text(encoding="utf-8")
+    north_star = NORTH_STAR.read_text(encoding="utf-8")
+    normalized_run_card = " ".join(run_card.split())
+    normalized_north_star = " ".join(north_star.split())
+
+    assert "Mistral-only" not in run_card
+    assert "one Mistral logit-lens scorer" not in run_card
+    assert "all 32 layers" not in run_card
+    assert "Phi and Mistral use 32 transformer blocks (layers 0-31)" in normalized_run_card
+    assert "Qwen uses 28 transformer blocks (layers 0-27)" in normalized_run_card
+    assert "profile-bound final layer" in normalized_run_card
+    assert "final 599" in normalized_run_card
+    assert "same scoring, eligibility, parity, and claim boundaries" in normalized_run_card
+    assert "one host-wide gpu lock" in normalized_run_card.lower()
+
+    assert "Mistral-only internal diagnostic" not in north_star
+    assert "pinned Mistral, Phi, and Qwen" in normalized_north_star
+    assert "final 599" in normalized_north_star
+
+
+def test_single_gpu_host_lock_prevents_phi_and_qwen_running_together(tmp_path):
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    state = tmp_path / "state"
+    marker = tmp_path / "started.txt"
+    fake_bin = tmp_path / "bin"
+    fake_locks = tmp_path / "fake-locks"
+    scripts.mkdir(parents=True)
+    fake_bin.mkdir()
+    fake_locks.mkdir()
+    runner = scripts / "run_decision_binding_logit_lens_gpu.sh"
+    runner.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$2" >> "$LOGIT_LENS_TEST_MARKER"\n'
+        "sleep 30\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o755)
+    fake_flock = fake_bin / "flock"
+    fake_flock.write_text(
+        "#!/usr/bin/env bash\n"
+        'command="$(ps -p "$PPID" -o command=)"\n'
+        'case "$command" in\n'
+        '  *gpu.lock*) key=gpu ;;\n'
+        '  *phi.lock*) key=phi ;;\n'
+        '  *qwen.lock*) key=qwen ;;\n'
+        '  *) key=unknown ;;\n'
+        'esac\n'
+        'mkdir "$FAKE_FLOCK_ROOT/$key.held"\n',
+        encoding="utf-8",
+    )
+    fake_flock.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DECISION_LOGIT_LENS_STATE_DIR": str(state),
+        "LOGIT_LENS_TEST_MARKER": str(marker),
+        "FAKE_FLOCK_ROOT": str(fake_locks),
+    }
+
+    try:
+        subprocess.run(
+            [
+                "bash", str(CONTROL), "start", "phi", "startup",
+                "/prepared/phi", "/audit/phi",
+            ],
+            cwd=project,
+            env=environment,
+            check=True,
+        )
+        for _ in range(100):
+            if marker.exists():
+                break
+            time.sleep(0.01)
+        assert marker.read_text(encoding="utf-8").splitlines() == ["phi"]
+
+        subprocess.run(
+            [
+                "bash", str(CONTROL), "start", "qwen", "startup",
+                "/prepared/qwen", "/audit/qwen",
+            ],
+            cwd=project,
+            env=environment,
+            check=True,
+        )
+        for _ in range(100):
+            qwen_log = state / "qwen-startup.log"
+            if qwen_log.exists() and "host GPU lock is held" in qwen_log.read_text(
+                encoding="utf-8"
+            ):
+                break
+            time.sleep(0.01)
+        assert marker.read_text(encoding="utf-8").splitlines() == ["phi"]
+        assert "host GPU lock is held" in qwen_log.read_text(encoding="utf-8")
+    finally:
+        for profile in ("phi", "qwen"):
+            pid_path = state / f"{profile}.pid"
+            if pid_path.exists():
+                try:
+                    os.kill(int(pid_path.read_text(encoding="utf-8")), 9)
+                except (ProcessLookupError, ValueError):
+                    pass
+
+
 def test_logit_lens_fetch_supports_partial_startup_and_complete_verification():
     script = FETCH.read_text(encoding="utf-8")
 
@@ -169,6 +317,8 @@ def test_logit_lens_fetch_supports_partial_startup_and_complete_verification():
     assert '--mode "$MODE"' in script
     assert ".venv/bin/python" in script
     assert 'missing executable Python runtime' in script
+    assert 'phi-3.5-mini-instruct' in script
+    assert 'qwen2.5-1.5b-instruct' in script
 
 
 def test_logit_lens_operator_scripts_are_in_the_thin_gpu_sync_whitelist():

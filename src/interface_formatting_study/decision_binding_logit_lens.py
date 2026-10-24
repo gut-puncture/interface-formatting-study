@@ -78,29 +78,54 @@ def _decode(tokenizer, token_ids: Sequence[int]) -> str:
         return str(tokenizer.decode(list(token_ids)))
 
 
-def _fixed_root_continuation_tokenizer(tokenizer):
-    """Disable only Mistral's implicit standalone leading-space marker."""
-
+def continuation_tokenization_policy(tokenizer) -> str:
+    """Describe the exact fixed-root continuation backend behavior."""
     backend = getattr(tokenizer, "backend_tokenizer", None)
     pre_tokenizer = getattr(backend, "pre_tokenizer", None)
     description = repr(pre_tokenizer)
-    if not description.startswith("Metaspace("):
-        return tokenizer
+    if description.startswith("Metaspace("):
+        if (
+            'replacement="▁"' not in description
+            or "prepend_scheme=first" not in description
+            or "split=False" not in description
+        ):
+            raise ValueError("unexpected Metaspace tokenizer policy")
+        return "fixed_root_metaspace_without_implicit_prefix"
+
+    normalizer = repr(getattr(backend, "normalizer", None))
     if (
-        'replacement="▁"' not in description
-        or "prepend_scheme=first" not in description
-        or "split=False" not in description
+        normalizer.startswith("Sequence(normalizers=[Prepend(")
+        and 'prepend="▁"' in normalizer
+        and 'Replace(pattern=String(" "), content="▁")' in normalizer
     ):
-        raise ValueError("unexpected Mistral Metaspace tokenizer policy")
+        return "fixed_root_sentencepiece_without_implicit_prefix"
+    return "unchanged_canonical_backend"
+
+
+def _fixed_root_continuation_tokenizer(tokenizer):
+    """Disable an implicit standalone word prefix at the fixed boundary."""
+
+    policy = continuation_tokenization_policy(tokenizer)
+    if policy == "unchanged_canonical_backend":
+        return tokenizer
     cached = _FIXED_ROOT_TOKENIZER_CACHE.get(id(tokenizer))
     if cached is not None and cached[0] is tokenizer:
         return cached[1]
-    from tokenizers.pre_tokenizers import Metaspace
-
     continuation_tokenizer = copy.deepcopy(tokenizer)
-    continuation_tokenizer.backend_tokenizer.pre_tokenizer = Metaspace(
-        replacement="▁", prepend_scheme="never", split=False
-    )
+    if policy == "fixed_root_metaspace_without_implicit_prefix":
+        from tokenizers.pre_tokenizers import Metaspace
+
+        continuation_tokenizer.backend_tokenizer.pre_tokenizer = Metaspace(
+            replacement="▁", prepend_scheme="never", split=False
+        )
+    elif policy == "fixed_root_sentencepiece_without_implicit_prefix":
+        from tokenizers.normalizers import Replace, Sequence as NormalizerSequence
+
+        continuation_tokenizer.backend_tokenizer.normalizer = NormalizerSequence(
+            [Replace(" ", "▁")]
+        )
+    else:  # pragma: no cover - policy is exhaustive and bound above
+        raise AssertionError(f"unsupported continuation tokenizer policy: {policy}")
     _FIXED_ROOT_TOKENIZER_CACHE[id(tokenizer)] = (tokenizer, continuation_tokenizer)
     return continuation_tokenizer
 
@@ -127,11 +152,11 @@ def audit_fixed_root_continuations(
     """Freeze exact candidate token paths after an already-authenticated root.
 
     Prompt and candidate tokens are encoded separately and concatenated at the
-    ID boundary. Mistral's implicit standalone Metaspace prefix is disabled for
-    the continuation because the fixed root already contains every real
-    boundary byte. The exact source prompt string and its exact tokenizer IDs
-    are both bound; the combined decode must reproduce the decoded fixed root
-    plus the exact surface. No spelling, case, whitespace, punctuation, or
+    ID boundary. An implicit standalone Metaspace or SentencePiece prefix is
+    disabled for the continuation because the fixed root already contains every
+    real boundary byte. The exact source prompt string and its exact tokenizer
+    IDs are both bound; the combined decode must reproduce the decoded fixed
+    root plus the exact surface. No spelling, case, whitespace, punctuation, or
     tokenization variants are introduced.
     """
 
