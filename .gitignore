@@ -3,31 +3,20 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
 *.egg-info/
-uv.lock
-
-# Local and historical run material. The public repo keeps compact final
-# results under results/ and paper/, not raw GPU logs or retired archives.
-gpu_artifacts/
-tmp/
-reference/
-docs/
-run_logs/
-artifacts/
-
-# Generated paper build outputs and bundled submission zips.
-paper/build/
-paper/main.pdf
-paper/submission/*.zip
-paper/submission/SHA256SUMS.txt
-results/metadata/plot_cache/
-analysis/semantic_anchor_patching/
-
-# Large model/cache artifacts should be downloaded by tools, not committed.
 .cache/
+
+# Raw run outputs live outside git; compact results are committed under results/.
+runs/
 *.safetensors
 *.bin
 *.pt
 *.pth
+*.npy
+*.npz
+
+# Paper build outputs
+paper/build/
+paper/*.aux
+paper/*.log
+paper/*.out

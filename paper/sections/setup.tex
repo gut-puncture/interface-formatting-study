@@ -1,0 +1,68 @@
+\section{Setup}
+\label{sec:setup}
+
+Appendix~\ref{app:details} gives the details needed to reproduce the results.
+
+\subsection{Questions the model knows}
+\label{sec:items}
+A wrapper can only hide an answer that the model has. We therefore use short questions with one correct answer and keep, for each model, only those it answers correctly without a wrapper. We built \NItems{} such questions in three families from public datasets:
+\begin{itemize}
+\item \emph{Facts} (\NFact{}): the capital of a country~\citep{todd2024function}; the country of a landmark, the city of a company's headquarters, the constellation of a star and the real name of a superhero~\citep{hernandez2024linearity}.
+\item \emph{Arithmetic} (\NArith{}): sums, differences and products of two numbers, such as ``What is 64 plus 22?''.
+\item \emph{Translation} (\NTrans{}): an English word in French, German or Russian~\citep{wendler2024llamas}.
+\end{itemize}
+Each item is worded either as a question (``What is the capital city of Mongolia?'') or as an instruction (``Name the capital city of Mongolia.''), at random.
+
+In the \emph{plain prompt}, the item follows ``Question:'' and is followed by one instruction, ``Answer the question above. Reply with only the answer, in plain text.'' The model's reply is then started with ``Answer:''. An item is \emph{known} to a model if the model's greedy reply to the plain prompt is correct and the model gives the full answer a probability of at least 0.5. Each model knows \KnownMin{}--\KnownMax{} of the items. We split items by subject, number pair or English word into a development set (30\%), used only to choose settings, and a test set (70\%), which gives every reported number.
+
+\subsection{Wrappers}
+\label{sec:wrappers}
+A wrapper places the plain prompt's question line inside text of the kind an assistant reads through tools. There are four interface formats and one control:
+\begin{itemize}
+\item \emph{Tool result}: the JSON output of an inbox search; the question is the text of one message.
+\item \emph{Web page}: the HTML of a forum thread; the question is one post.
+\item \emph{Server log}: timestamped log lines, with occasional errors and stack traces; the question is the payload of one request.
+\item \emph{Email thread}: a chain of replies; the question is the body of one email.
+\item \emph{Plain prose} (control): paragraphs of ordinary sentences without any markup.
+\end{itemize}
+The surrounding text is bland office news, such as ``The heating in the north wing was serviced at the end of the day.'' It never contains an item's answer and asks no questions. Each format has 16 such texts, written by a seeded generator.
+
+After the question come about \TailTokens{} more tokens of the same wrapper and then the closing instruction of the plain prompt. We vary the amount of text \emph{before} the question in three steps, so that the whole prompt has about \LenS{}, \LenM{} or \LenL{} tokens. Everything from the question onward is the same at every length. Figure~\ref{fig:example} shows part of one wrapper. We fixed in advance that the wrappers must lose clearly more answers than the noise floor before we study where the loss happens; a first layout, with only about 64 tokens after the question, lost too few in Qwen3-4B, so we used this one (Appendix~\ref{app:details}).
+
+\begin{figure}[t]
+\centering
+\begin{minipage}{0.98\columnwidth}
+\scriptsize
+\begin{verbatim}
+==> /var/log/app/mailer.log <==
+  ...
+09:38:05 INFO  [scheduler] cache hit ttl=300
+09:38:08 WARN  [mailer] /v1/files/upload 200
+09:38:11 INFO  [gateway] /v1/messages user_message:
+  Question: Name the capital city of Mongolia.
+09:38:14 WARN  [scheduler] /v1/contacts 404
+09:38:19 ERROR [auth] Unhandled exception in job
+  sync_contacts
+Traceback (most recent call last):
+  File "/srv/app/clients/crm.py", line 117
+    raise TimeoutError("upstream timed out")
+TimeoutError: upstream timed out after 30s
+  ...
+
+Answer the question above. Reply with only
+the answer, in plain text.
+\end{verbatim}
+\end{minipage}
+\caption{\textbf{A question inside a server-log wrapper.} Part of a 2{,}000-token wrapper, with most lines cut and the rest shortened. Without the wrapper, Qwen3-4B answers ``Ulaanbaatar''. With it, Qwen3-4B replies ``The logs show that multiple jobs---notify\_contacts, export\_contacts, and sync\_contacts---are failing with a TimeoutError''.}
+\label{fig:example}
+\end{figure}
+
+To measure how often an answer is lost for reasons unrelated to the wrapper, two \emph{null wrappers} add one neutral sentence to the plain prompt, before the question (``Something I have been wondering about.'') or after it (``Thanks in advance.''). Their loss rate is the \emph{noise floor}.
+
+\subsection{Kept answers}
+\label{sec:kept}
+For every known item and every condition, the model replies greedily with up to 24 tokens, stopping at the first line break. The answer is \emph{kept} if the known answer appears in the reply as a whole word, in any format; otherwise it is \emph{lost}. Kept answers include replies such as ``The capital city of Mongolia is Ulaanbaatar.'', which ignore the request for only the answer. We count these as kept because the model still reached the answer. A program that expects only the answer would see more failures: averaged over models, only \ExactMin{}--\ExactMax{} of wrapped replies are exactly the answer, depending on the wrapper (Appendix~\ref{app:exact}).
+
+\subsection{Models}
+\label{sec:models}
+We study four recent open instruction-tuned models from three developers: Qwen3-4B-Instruct-2507 and Qwen3-8B~\citep{qwen2025qwen3}, OLMo-3-7B-Instruct~\citep{olmo2025olmo3} and Gemma-4-12B-it~\citep{gemma2026gemma4}. Each model uses its own chat template, with reasoning turned off, and runs in 16-bit precision.

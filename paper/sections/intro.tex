@@ -1,0 +1,18 @@
+\section{Introduction}
+\label{sec:intro}
+
+Ask Qwen3-4B ``Name the capital city of Mongolia.'' and it answers ``Ulaanbaatar''. Put the same line inside 2{,}000 tokens of a server log, followed by the same request to answer the question, and it replies ``The logs show that multiple jobs \ldots{} are failing with a TimeoutError'' (Figure~\ref{fig:example}). The model has not forgotten the capital of Mongolia. Something in the wrapper keeps it from giving the answer.
+
+Language models now often meet questions inside such wrappers: the output of a tool, a web page, an email thread, a log file. Changing only the format of a prompt can move accuracy by tens of points~\citep{sclar2024quantifying,he2024does}, and much of that change comes from replies that break the requested format~\citep{mehta2026format}. Two questions remain open:
+\begin{enumerate}
+\item How often does a wrapper make a model lose an answer it knows, rather than only change how the answer is written?
+\item Where in the network is the answer lost?
+\end{enumerate}
+
+We asked four recent open models (Qwen3-4B, Qwen3-8B, OLMo-3-7B and Gemma-4-12B) \NItems{} short questions about facts, arithmetic and translation. For each model we kept only the questions it answers correctly when asked plainly. We placed each question inside five kinds of text, at three lengths, and counted how often the known answer was missing from the reply. To find where it goes missing, we copied internal states from the plain prompt into failed wrapped prompts. We find the following.
+\begin{itemize}
+\item \emph{Wrappers hide known answers} (Section~\ref{sec:lost}). Tool results, web pages and email threads hide \LostStruct{} of known answers, depending on the model, against a noise floor of \FloorLost{}. Plain prose of the same length hides about as many. Server logs hide the most in \NLogWorstWord{} of the four models.
+\item \emph{Logs change the task; other wrappers change the answer} (Section~\ref{sec:types}). Most answers lost to logs are replaced by a description of the log. Answers lost to other wrappers become wrong answers, or claims that the text does not contain the answer.
+\item \emph{Wrong answers replace weakly held ones} (Section~\ref{sec:confidence}). Wrong answers and claims that the answer is not there almost disappear when the model gives the answer a probability above 0.999 without a wrapper. Replies about the log do not: they replace firm and weak answers alike.
+\item \emph{The model reads the question; the answer is lost later} (Section~\ref{sec:where}). Swapping another question's internal states into a failed prompt makes the model give that other question's answer, as often as when the other question is asked in the wrapper. Restoring the failed question's own states helps much less. Restoring the last position does help, but only once the question's content has reached it, at \HandoffDepth{} of the network's depth.
+\end{itemize}
