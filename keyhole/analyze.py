@@ -206,6 +206,25 @@ def patching(pt, units, L, beh):
     dk = [float(ret.get((d, c), np.nan)) for d, c in zip(pairs_cond.donor_id.reindex(pairs_t.index),
                                                          pairs_cond.condition.reindex(pairs_t.index))]
     top1["donor_kept_in_wrapper"] = boot.mean(dk)
+    # same measure as the patches: in the other question's own wrapped prompt, is its answer's first token on top?
+    am = beh.set_index(["item_id", "condition"]).argmax1.to_dict()
+    dt = [float(am.get((d, c), -1) == g1.get(d)) if (d, c) in am else np.nan
+          for d, c in zip(pairs_cond.donor_id.reindex(pairs_t.index), pairs_cond.condition.reindex(pairs_t.index))]
+    top1["donor_top1_in_wrapper"] = boot.mean(dt)
+    # the same curves for log wrappers and for the other wrappers separately
+    grp = {}
+    for name, sel in [("log", pairs_t.wrapper == "log"), ("other", pairs_t.wrapper != "log")]:
+        idx = pairs_t.index[sel]
+        if len(idx) < 10:
+            continue
+        b2 = Boot(pairs_t.loc[idx, "unit"].values, n=2000)
+        g = {}
+        for nm, site, col in [("A_own", "A", "own1"), ("D_donor", "D", "donor1"), ("B_own", "B", "own1")]:
+            w = t[t.site == site].pivot_table(index="pair_id", columns="layer", values=col).reindex(idx)
+            g[nm] = [{"layer": int(l), "depth": (l + 1) / L, **b2.mean(w[l].values)} for l in grid]
+        g["n"] = int(len(idx))
+        grp[name] = g
+    top1["by_group"] = grp
     res["top1"] = top1
     # where the question's information reaches the last position: first depth at which restoring the
     # last position gives back at least half of the lost answer (R, test pairs)
@@ -325,6 +344,31 @@ def pooled(behs, units):
         out["type_by_confidence"][t] = [{"bin": k, **Boot(units_[bins_ == k], n=2000).mean(x[bins_ == k])}
                                         for k in range(len(CONF_EDGES) - 1)]
     out["type_bin_n"] = [int((d.bin == k).sum()) for k in range(len(CONF_EDGES) - 1)]
+    # the same, separately for log wrappers and for the other wrappers
+    out["type_by_confidence_group"] = {}
+    for name, sel in [("log", d.wrapper == "log"), ("other", d.wrapper != "log")]:
+        sel = sel.to_numpy()
+        gg = {}
+        for t in ("kept", "task", "scope", "wrong"):
+            x = (d.type == t).to_numpy(dtype=float)
+            gg[t] = [{"bin": k, **Boot(units_[sel & (bins_ == k)], n=2000).mean(x[sel & (bins_ == k)])}
+                     for k in range(len(CONF_EDGES) - 1)]
+        gg["n"] = [int((sel & (bins_ == k)).sum()) for k in range(len(CONF_EDGES) - 1)]
+        out["type_by_confidence_group"][name] = gg
+    # noise floor by the same bins: share lost with one neutral sentence
+    nrows = []
+    for key, beh in behs.items():
+        known = beh[(beh.condition == "plain") & (beh.known == True) & (beh.split == "test")]
+        pp = np.exp(known.set_index("item_id").lp_g.astype(float))
+        z = beh[beh.item_id.isin(set(known.item_id)) & beh.condition.isin(C.NULLS)].copy()
+        z["bin"] = np.digitize(z.item_id.map(pp), CONF_EDGES[1:-1])
+        z["unit"] = key + "|" + z.item_id.map(units)
+        nrows.append(z)
+    z = pd.concat(nrows, ignore_index=True)
+    out["null_lost_by_confidence"] = [{"bin": k, **Boot(z.unit[z.bin == k].to_numpy(), n=2000).mean(
+        (~z.retained[z.bin == k]).to_numpy(dtype=float))} for k in range(len(CONF_EDGES) - 1)]
+    out["n_known_test"] = {key: int(((beh.condition == "plain") & (beh.known == True) & (beh.split == "test")).sum())
+                           for key, beh in behs.items()}
     return out
 
 

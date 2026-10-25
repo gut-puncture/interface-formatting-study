@@ -20,13 +20,18 @@ from keyhole import config as C
 from keyhole import style
 
 NAMES = {"q4": "Qwen3-4B", "olmo": "OLMo-3-7B", "q8": "Qwen3-8B", "g12": "Gemma-4-12B"}
-MCOL = {"q4": "#2471a3", "olmo": "#c0392b", "q8": "#1e8449", "g12": "#d68910"}
 FAM = {"json": "Tool result", "html": "Web page", "log": "Server log", "email": "Email thread",
        "prose": "Plain prose"}
-FCOL = {"json": "#2471a3", "html": "#1e8449", "log": "#c0392b", "email": "#7d3c98", "prose": "#8a8a8a"}
-SITE = {"A": ("Own question, plain prompt", "#b2182b", "-"),
-        "D": ("Other question, plain prompt", "#8a8a8a", "-"),
-        "B": ("Last position, plain prompt", "#2471a3", "--")}
+# wrappers (Figure 2)
+FCOL = {"json": "#2471a3", "html": "#1e8449", "log": "#c0392b", "email": "#7d3c98", "prose": "#d68910"}
+# what replaces a lost answer (Figure 3): a palette not used for wrappers or patches
+TYPES = {"wrong": ("Wrong answer", "#8c510a"), "scope": ("Not there", "#35978f"),
+         "task": ("About the wrapper", "#c51b7d")}
+# patches (Figures 4 and 5)
+PATCH = {"A": ("Own question restored", "#b2182b", "-"),
+         "D": ("Other question swapped in", "#222222", "-"),
+         "B": ("Last position restored", "#2166ac", "--")}
+REF = "#8a8a8a"
 DEPTH = "Depth"
 
 
@@ -38,40 +43,41 @@ def axes_grid(fig, rows, cols, left, right, bottom, top, wgap, hgap, **kw):
             for r in range(rows)]
 
 
-def band(ax, x, rows, color, lw=1.6, ls="-", label=None, alpha=0.15):
+def band(ax, x, rows, color, lw=1.6, ls="-", alpha=0.15, marker=None):
     x = np.asarray(x, float)
     m = np.array([r["mean"] if r and r.get("mean") is not None else np.nan for r in rows])
     lo = np.array([r["lo"] if r else np.nan for r in rows])
     hi = np.array([r["hi"] if r else np.nan for r in rows])
-    ax.fill_between(x, lo, hi, color=color, alpha=alpha, linewidth=0)
-    ax.plot(x, m, color=color, lw=lw, ls=ls, label=label)
+    if alpha:
+        ax.fill_between(x, lo, hi, color=color, alpha=alpha, linewidth=0)
+    ax.plot(x, m, color=color, lw=lw, ls=ls, marker=marker, ms=2.8)
 
 
-def models_in(res):
-    return [k for k in C.MODEL_ORDER if k in res["models"]]
+def models_in(res, need=None):
+    return [k for k in C.MODEL_ORDER if k in res["models"] and (need is None or need in res["models"][k])]
+
+
+def panel_row(n, height, bottom, top=0.9):
+    fig = plt.figure(figsize=(style.PAGEW, height))
+    return fig, axes_grid(fig, 1, n, 0.07, 0.995, bottom, top, 0.035, 0)[0]
 
 
 def behaviour(res, out):
-    """Figure: share of known answers still given, by prompt length, per wrapper family and model."""
+    """Share of known answers still given, by prompt length, per wrapper and model."""
     keys = models_in(res)
-    fig = plt.figure(figsize=(style.PAGEW, 2.05))
-    axs = axes_grid(fig, 1, len(keys), 0.07, 0.995, 0.33, 0.9, 0.035, 0)[0]
+    fig, axs = panel_row(len(keys), 2.05, 0.33)
     for i, (ax, k) in enumerate(zip(axs, keys)):
         b = res["models"][k]["behaviour"]
-        fl = b["floor"]
-        ax.axhspan(fl["lo"], fl["hi"], color="#bdbdbd", alpha=0.45, linewidth=0)
-        ax.axhline(fl["mean"], color="#7a7a7a", lw=0.9, ls=":")
+        ax.axhline(b["floor"]["mean"], color=REF, lw=0.9, ls=":")
         for f in C.FAMILIES:
             rows = [b["conditions"][f"{f}_{d}"] for d in C.DOSES]
-            x = [r["tokens"] for r in rows]
-            band(ax, x, [r["retained"] for r in rows], FCOL[f], lw=1.5)
-            ax.plot(x, [r["retained"]["mean"] for r in rows], "o", color=FCOL[f], ms=2.8)
+            band(ax, [r["tokens"] for r in rows], [r["retained"] for r in rows], FCOL[f], lw=1.5, marker="o")
         ax.set_xscale("log", base=2)
         med = [np.median([b["conditions"][f"{f}_{d}"]["tokens"] for f in C.FAMILIES]) for d in C.DOSES]
         ax.set_xticks(med, [f"{round(med[0], -2):.0f}", f"{med[1] / 1000:.0f}k", f"{med[2] / 1000:.0f}k"])
         ax.minorticks_off()
         ax.set_xlim(med[0] / 1.5, med[2] * 1.5)
-        ax.set_ylim(0.0, 1.03)
+        ax.set_ylim(0.25, 1.02)
         ax.set_xlabel("Prompt tokens")
         if i == 0:
             ax.set_ylabel("Known answers kept")
@@ -79,95 +85,93 @@ def behaviour(res, out):
             ax.set_yticklabels([])
         style.title(ax, chr(65 + i), NAMES[k])
     handles = [Line2D([], [], color=FCOL[f], marker="o", ms=2.8, lw=1.5, label=FAM[f]) for f in C.FAMILIES]
-    handles.append(Line2D([], [], color="#7a7a7a", lw=0.9, ls=":", label="Noise floor"))
+    handles.append(Line2D([], [], color=REF, lw=0.9, ls=":", label="Noise floor"))
     fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.53, 0.0), ncol=6, columnspacing=1.2,
                handlelength=1.8, handletextpad=0.4)
     style.save(fig, out / "fig_behaviour.pdf")
 
 
-def repair(res, out):
-    """Main figure: how much of the lost answer comes back when one site is restored, by depth."""
-    keys = [k for k in models_in(res) if "patching" in res["models"][k]]
+def confidence(res, out):
+    """What wrapped prompts produce, by how sure the model is of the answer without a wrapper."""
+    p = res["pooled"]
+    labels = ["0.5–0.8", "0.8–0.95", "0.95–0.99", "0.99–0.999", "> 0.999"]
     fig = plt.figure(figsize=(style.PAGEW, 2.15))
-    axs = axes_grid(fig, 1, len(keys), 0.07, 0.995, 0.3, 0.9, 0.035, 0)[0]
+    axs = axes_grid(fig, 1, 2, 0.07, 0.995, 0.33, 0.9, 0.06, 0)[0]
+    x = np.arange(len(labels))
+    top = max(r["hi"] for g in ("log", "other") for t in TYPES for r in p["type_by_confidence_group"][g][t])
+    for i, (ax, g, title) in enumerate(zip(axs, ("log", "other"), ("Server logs", "Other wrappers"))):
+        tb = p["type_by_confidence_group"][g]
+        band(ax, x, p["null_lost_by_confidence"], REF, lw=0.9, ls=":", alpha=0.0)
+        for t in ("wrong", "scope", "task"):
+            band(ax, x, tb[t], TYPES[t][1], lw=1.5, marker="o")
+        ax.set_xticks(x, labels)
+        ax.set_xlim(-0.2, len(labels) - 0.8)
+        ax.set_ylim(0, top * 1.05)
+        ax.set_xlabel("Probability of the answer without a wrapper")
+        if i == 0:
+            ax.set_ylabel("Share of wrapped prompts")
+        else:
+            ax.set_yticklabels([])
+        style.title(ax, chr(65 + i), title)
+    handles = [Line2D([], [], color=TYPES[t][1], marker="o", ms=2.8, lw=1.5, label=TYPES[t][0])
+               for t in ("wrong", "scope", "task")]
+    handles.append(Line2D([], [], color=REF, lw=0.9, ls=":", label="Lost with one neutral sentence"))
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.53, 0.0), ncol=4, columnspacing=1.6,
+               handlelength=1.8, handletextpad=0.4)
+    style.save(fig, out / "fig_confidence.pdf")
+
+
+def swap(res, out):
+    """Main figure: what a failed wrapped prompt answers after one patch, by the depth of the patch."""
+    keys = models_in(res, "patching")
+    fig, axs = panel_row(len(keys), 2.3, 0.34)
+    for i, (ax, k) in enumerate(zip(axs, keys)):
+        t = res["models"][k]["patching"]["top1"]
+        ax.axhline(t["donor_top1_in_wrapper"]["mean"], color=PATCH["D"][1], lw=0.9, ls=":")
+        ax.axhline(t["BASE_own"]["mean"], color=REF, lw=0.9, ls=":")
+        for s, key in (("D", "D_donor"), ("B", "B_own"), ("A", "A_own")):
+            rows = t[key]
+            band(ax, [r["depth"] for r in rows], rows, PATCH[s][1], ls=PATCH[s][2], lw=1.6)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.02)
+        ax.set_xlabel(DEPTH)
+        if i == 0:
+            ax.set_ylabel("Predicts the target answer")
+        else:
+            ax.set_yticklabels([])
+        style.title(ax, chr(65 + i), NAMES[k])
+    handles = [Line2D([], [], color=PATCH[s][1], ls=PATCH[s][2], lw=1.6, label=PATCH[s][0]) for s in "ADB"]
+    handles += [Line2D([], [], color=PATCH["D"][1], lw=0.9, ls=":", label="Other question, own wrapped prompt"),
+                Line2D([], [], color=REF, lw=0.9, ls=":", label="No patch")]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.53, 0.0), ncol=5, columnspacing=1.3,
+               handlelength=2.0, handletextpad=0.4)
+    style.save(fig, out / "fig_swap.pdf")
+
+
+def repair(res, out):
+    """Appendix: share of the lost answer's log-probability restored, by depth."""
+    keys = models_in(res, "patching")
+    fig, axs = panel_row(len(keys), 2.2, 0.32)
     for i, (ax, k) in enumerate(zip(axs, keys)):
         p = res["models"][k]["patching"]
-        ax.axhline(0, color=style.AXIS, lw=0.6)
-        ax.axhline(1, color="#bdbdbd", lw=0.6)
+        ax.axhline(0, color=REF, lw=0.7, ls=":")
         for s in ("D", "B", "A"):
             rows = p["curves"][s]
-            lab, c, ls = SITE[s]
-            band(ax, [r["depth"] for r in rows], rows, c, ls=ls, lw=1.6)
-        ax.plot([p["depth_star"]] * 2, [-0.42, -0.34], color=style.INK, lw=1.6, solid_capstyle="butt",
-                clip_on=False)
+            band(ax, [r["depth"] for r in rows], rows, PATCH[s][1], ls=PATCH[s][2], lw=1.6)
+        ax.plot([p["depth_star"]] * 2, [-1.05, -0.93], color=style.INK, lw=2.2, solid_capstyle="butt")
         ax.set_xlim(0, 1)
-        ax.set_ylim(-0.35, 1.15)
+        ax.set_ylim(-1.05, 1.1)
         ax.set_xlabel(DEPTH)
         if i == 0:
             ax.set_ylabel("Share of lost answer restored")
         else:
             ax.set_yticklabels([])
         style.title(ax, chr(65 + i), NAMES[k])
-    handles = [Line2D([], [], color=SITE[s][1], ls=SITE[s][2], lw=1.6, label=SITE[s][0]) for s in ("A", "D", "B")]
-    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.53, 0.0), ncol=3, columnspacing=1.6,
-               handlelength=2.2)
+    handles = [Line2D([], [], color=PATCH[s][1], ls=PATCH[s][2], lw=1.6, label=PATCH[s][0]) for s in "ADB"]
+    handles.append(Line2D([], [], color=style.INK, lw=2.2, label="Layer chosen on development items"))
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.53, 0.0), ncol=4, columnspacing=1.6,
+               handlelength=2.0)
     style.save(fig, out / "fig_repair.pdf")
-
-
-SWAP = [("A_own", "Own question restored: gives its answer", "#b2182b", "-"),
-        ("D_donor", "Other question swapped in: gives the other answer", "#2c2c2c", "-"),
-        ("B_own", "Last position restored: gives its answer", "#2471a3", "--")]
-
-
-def swap(res, out):
-    """Main figure: what a failed wrapped prompt answers after one patch, by the depth of the patch."""
-    keys = [k for k in models_in(res) if "patching" in res["models"][k]]
-    fig = plt.figure(figsize=(style.PAGEW, 2.2))
-    axs = axes_grid(fig, 1, len(keys), 0.07, 0.995, 0.31, 0.9, 0.035, 0)[0]
-    for i, (ax, k) in enumerate(zip(axs, keys)):
-        t = res["models"][k]["patching"]["top1"]
-        for key, lab, c, ls in SWAP:
-            rows = t[key]
-            band(ax, [r["depth"] for r in rows], rows, c, ls=ls, lw=1.6)
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1.02)
-        ax.set_xlabel(DEPTH)
-        if i == 0:
-            ax.set_ylabel("Gives the target answer")
-        else:
-            ax.set_yticklabels([])
-        style.title(ax, chr(65 + i), NAMES[k])
-    handles = [Line2D([], [], color=c, ls=ls, lw=1.6, label=lab) for _, lab, c, ls in SWAP]
-    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.53, 0.0), ncol=3, columnspacing=1.4,
-               handlelength=2.2)
-    style.save(fig, out / "fig_swap.pdf")
-
-
-def confidence(res, out):
-    """Kept answers by how sure the model was of the answer without a wrapper (all models)."""
-    p = res["pooled"]["type_by_confidence"]
-    labels = ["0.5–0.8", "0.8–0.95", "0.95–0.99", "0.99–0.999", "> 0.999"]
-    fig = plt.figure(figsize=(style.COLW, 2.1))
-    ax = fig.add_axes([0.15, 0.29, 0.83, 0.68])
-    x = np.arange(len(labels))
-    for t in ("wrong", "scope", "task"):
-        lab, c = TYPES[t]
-        band(ax, x, p[t], c, lw=1.5)
-        ax.plot(x, [r["mean"] for r in p[t]], "o", color=c, ms=2.8)
-    ax.set_xticks(x, labels)
-    ax.set_xlim(-0.25, len(labels) - 0.75)
-    ax.set_ylim(0, None)
-    ax.set_xlabel("Probability of the answer without a wrapper")
-    ax.set_ylabel("Share of wrapped prompts")
-    handles = [Line2D([], [], color=TYPES[t][1], marker="o", ms=2.8, lw=1.5, label=TYPES[t][0])
-               for t in ("wrong", "scope", "task")]
-    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.55, 0.0), ncol=3, columnspacing=1.0,
-               handlelength=1.6, handletextpad=0.4)
-    style.save(fig, out / "fig_confidence.pdf")
-
-
-TYPES = {"wrong": ("Wrong answer", "#b2182b"), "scope": ("Not there", "#7d3c98"),
-         "task": ("About the wrapper", "#2471a3")}
 
 
 def main():
@@ -181,9 +185,9 @@ def main():
     res = json.load(open(Path(a.results) / "results.json"))
     behaviour(res, out)
     confidence(res, out)
-    if any("patching" in res["models"][k] for k in res["models"]):
-        repair(res, out)
+    if models_in(res, "patching"):
         swap(res, out)
+        repair(res, out)
 
 
 if __name__ == "__main__":

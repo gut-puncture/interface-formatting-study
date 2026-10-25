@@ -41,6 +41,10 @@ def pooled_rate(conds, names, key):
     return num / den
 
 
+def prange_int(xs):
+    return str(min(xs)) if min(xs) == max(xs) else f"{min(xs)}--{max(xs)}"
+
+
 def thousands(n):
     return f"{n:,}".replace(",", "{,}")
 
@@ -140,17 +144,29 @@ def main():
     m["ScopeLow"], m["ScopeHigh"] = pct(tc["scope"][0]["mean"]), pct(tc["scope"][-1]["mean"], 1)
     m["TaskRange"] = prange([r["mean"] for r in tc["task"]], 1)
     m["KeptLowAll"], m["KeptHighAll"] = pct(tc["kept"][0]["mean"]), pct(tc["kept"][-1]["mean"])
+    tg = P_["type_by_confidence_group"]
+    m["LogTaskLow"], m["LogTaskHigh"] = pct(tg["log"]["task"][0]["mean"]), pct(tg["log"]["task"][-1]["mean"])
+    m["OtherWrongLow"], m["OtherWrongHigh"] = pct(tg["other"]["wrong"][0]["mean"]), pct(tg["other"]["wrong"][-1]["mean"], 1)
+    m["OtherScopeLow"], m["OtherScopeHigh"] = pct(tg["other"]["scope"][0]["mean"]), pct(tg["other"]["scope"][-1]["mean"], 1)
+    m["OtherScopeMid"] = pct(tg["other"]["scope"][3]["mean"])
+    m["NullLow"] = pct(P_["null_lost_by_confidence"][0]["mean"])
+    m["NullRest"] = pct(max(r["mean"] for r in P_["null_lost_by_confidence"][1:]), 1)
+    m["BinN"] = ", ".join(thousands(n) for n in P_["type_bin_n"])
+    m["KnownTestMin"] = thousands(min(P_["n_known_test"].values()))
+    m["KnownTestMax"] = thousands(max(P_["n_known_test"].values()))
 
     # exact-format accuracy vs kept (pooled over models and lengths)
-    rows = []
+    rows, ex_all = [], []
     for f in C.FAMILIES:
         names = [f"{f}_{d}" for d in C.DOSES]
         kept = np.mean([pooled_rate(M[k]["behaviour"]["conditions"], names, "retained") for k in keys])
         exact = np.mean([pooled_rate(M[k]["behaviour"]["conditions"], names, "correct") for k in keys])
+        ex_all.append(exact)
         rows.append(f"{FAM[f]} & {pct(kept)} & {pct(exact)} \\\\")
     nul = np.mean([pooled_rate(M[k]["behaviour"]["conditions"], C.NULLS, "correct") for k in keys])
     nulk = np.mean([pooled_rate(M[k]["behaviour"]["conditions"], C.NULLS, "retained") for k in keys])
     rows.append(f"Neutral sentence & {pct(nulk)} & {pct(nul)} \\\\")
+    m["ExactMin"], m["ExactMax"] = pct(min(ex_all)), pct(max(ex_all))
     tab = ["\\begin{tabular}{@{}lcc@{}}", "\\toprule", "Wrapper & Kept & Exactly right \\\\", "\\midrule", *rows,
            "\\bottomrule", "\\end{tabular}"]
     (out / "table_exact.tex").write_text("\n".join(tab) + "\n")
@@ -161,8 +177,8 @@ def main():
         b = M[k]["behaviour"]
         npairs = M[k]["patching"]["n_pairs_test"] if k in pkeys else 0
         rows.append(f"{NAMES[k]} & {M[k]['L']} & {thousands(b['n_known'])} ({pct(b['n_known'] / b['n_items'])}) & "
-                    f"{npairs} \\\\")
-    tab = ["\\begin{tabular}{@{}lccc@{}}", "\\toprule", "Model & Layers & Known & Pairs \\\\", "\\midrule", *rows,
+                    f"{thousands(b['n_known_test'])} & {npairs} \\\\")
+    tab = ["\\begin{tabular}{@{}lcccc@{}}", "\\toprule", "Model & Layers & Known & Known test & Pairs \\\\", "\\midrule", *rows,
            "\\bottomrule", "\\end{tabular}"]
     (out / "table_models.tex").write_text("\n".join(tab) + "\n")
 
@@ -176,7 +192,7 @@ def main():
         for k in pkeys:
             p = M[k]["patching"]
             t = p["top1"]
-            first = [r["mean"] for r in t["D_donor"] if r["depth"] <= 1 / 3 + 1e-9]
+            first = [r["mean"] for r in t["D_donor"] if r["depth"] <= 0.5]
             swap_peak.append(max(first))
             donor_kept.append(t["donor_kept_in_wrapper"]["mean"])
             restore_peak.append(max(r["mean"] for r in t["A_own"]))
@@ -185,6 +201,15 @@ def main():
             handoff.append(next(r["depth"] for r in b if r["mean"] >= 0.5))
             astar.append(p["A_star"]["mean"])
             dstar.append(-p["D_star"]["mean"])
+        m["NPairsTest"] = prange_int([M[k]["patching"]["n_pairs_test"] for k in pkeys])
+        m["DonorTopOne"] = prange([M[k]["patching"]["top1"]["donor_top1_in_wrapper"]["mean"] for k in pkeys])
+        m["NoPatch"] = prange([M[k]["patching"]["top1"]["BASE_own"]["mean"] for k in pkeys])
+        grp = lambda k, g: M[k]["patching"]["top1"]["by_group"].get(g)
+        m["RestorePeakOther"] = prange([max(r["mean"] for r in grp(k, "other")["A_own"]) for k in pkeys if grp(k, "other")])
+        m["RestorePeakLog"] = prange([max(r["mean"] for r in grp(k, "log")["A_own"]) for k in pkeys if grp(k, "log")])
+        m["NLogPairs"] = prange_int([grp(k, "log")["n"] for k in pkeys if grp(k, "log")])
+        m["SwapPeakOther"] = prange([max(r["mean"] for r in grp(k, "other")["D_donor"] if r["depth"] <= 0.5)
+                                     for k in pkeys if grp(k, "other")])
         m["SwapPeak"] = prange(swap_peak)
         m["DonorKept"] = prange(donor_kept)
         m["RestorePeak"] = pct(max(restore_peak))
@@ -192,6 +217,7 @@ def main():
         m["HandoffDepth"] = frange(handoff, 2)
         m["AStar"] = prange(astar)
         m["DStar"] = prange(dstar)
+        m["DStarNeg"] = f"$-{max(dstar):.2f}$ to $-{min(dstar):.2f}$"
         rows = []
         for k in pkeys:
             p = M[k]["patching"]
@@ -201,6 +227,9 @@ def main():
                "\\midrule", *rows, "\\bottomrule", "\\end{tabular}"]
         (out / "table_repair.tex").write_text("\n".join(tab) + "\n")
 
+    man = json.load(open(Path(a.run) / "manifest.json"))
+    sk = [len(man["models"][k]["patch"]["skipped"]) for k in pkeys]
+    m["NSkipped"] = ", ".join(str(x) for x in sk[:-1]) + " and " + str(sk[-1])
     g = res.get("gate") or {}
     if "tb64" in g:
         m["GateShortDrop"] = f"{100 * g['tb64']['drop']:.1f}"
