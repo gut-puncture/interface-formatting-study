@@ -6,6 +6,7 @@ Intervals: 95% percentile bootstrap over clusters (the item's unit: subject, ope
 """
 import argparse
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,26 @@ class Boot:
         bs = (self.w @ s) / np.maximum(self.w @ c, 1e-12)
         return {"mean": float(v[ok].mean()) if ok.any() else None, "lo": float(np.percentile(bs, 2.5)),
                 "hi": float(np.percentile(bs, 97.5)), "n": int(ok.sum()), "p_le0": float((bs <= 0).mean())}
+
+
+# What replaced a lost answer, judged on the first line of the reply (rules fixed after reading Qwen3-4B replies).
+_SCOPE = re.compile(r"(provided|given|above|this) (text|data|context|information|content|logs?|messages?|emails?|thread|"
+                    r"page|document|search results|results)|does not (contain|include|mention|provide)|"
+                    r"not (mentioned|provided|included)|no (information|mention)|unrelated|not related|not a real|"
+                    r"fictional|does not exist|not exist|is not a (known|recognized|valid)|not possible|"
+                    r"cannot be determined|n.est pas", re.I)
+_HIJACK = re.compile(r"\b(logs?|jobs?|errors?|timeouts?|timeouterror|traceback|exceptions?|"
+                     r"the (email|thread|messages?|posts?|search|results|page|board|tool))\b", re.I)
+
+
+def lost_type(text):
+    """'task' = replies about the wrapper's content; 'scope' = says the text holds no answer; 'wrong' = another answer."""
+    s = text.strip().split("\n")[0][:300]
+    if _SCOPE.search(s):
+        return "scope"
+    if _HIJACK.search(s):
+        return "task"
+    return "wrong"
 
 
 def winsor(x):
@@ -71,11 +92,35 @@ def behaviour(beh, units):
     for (f, cond), g in d.groupby(["family", "condition"]):
         fam.setdefault(f, {})[cond] = float(g.retained.mean())
     out["by_task_family"] = fam
+    # what replaced the lost answers, per wrapper family (all doses pooled), test items
+    lost = d[~d.retained & d.condition.isin(C.WRAPPED)].copy()
+    lost["type"] = lost.gen_text.map(lost_type)
+    lost["wrapper"] = lost.condition.str.rsplit("_", n=1).str[0]
+    out["lost_types"] = {f: {t: int(n) for t, n in g.type.value_counts().items()} for f, g in lost.groupby("wrapper")}
+    out["n_trials_by_wrapper"] = {f: int(d.condition.str.startswith(f + "_").sum()) for f in C.FAMILIES}
+    # kept answers by how sure the model is of the answer in the plain prompt (test items, all doses)
+    pp = np.exp(known.set_index("item_id").lp_g.astype(float))
+    w = d[d.condition.isin(C.WRAPPED)].copy()
+    w["p_plain"] = w.item_id.map(pp)
+    w["bin"] = np.digitize(w.p_plain, CONF_EDGES[1:-1])
+    w["wrapper"] = w.condition.str.rsplit("_", n=1).str[0]
+    conf = {}
+    for f, g in w.groupby("wrapper"):
+        conf[f] = []
+        for k in range(len(CONF_EDGES) - 1):
+            gk = g[g.bin == k]
+            conf[f].append({"bin": k, **Boot(gk.unit, n=2000).mean(gk.retained.astype(float))} if len(gk) else None)
+    out["by_confidence"] = conf
+    out["conf_bin_n"] = [int((w[w.wrapper == "json"].bin == k).sum()) for k in range(len(CONF_EDGES) - 1)]
     return out
 
 
+# bins of the plain-prompt probability of the answer; known items have p >= 0.5
+CONF_EDGES = [0.5, 0.8, 0.95, 0.99, 0.999, 1.0001]
+
+
 # ------------------------------------------------------------------ patching
-def patching(pt, units, L):
+def patching(pt, units, L, beh):
     pt = pt.copy()
     pt["R"] = winsor(pt.R)
     pt["unit"] = pt.item_id.map(units)
@@ -142,6 +187,30 @@ def patching(pt, units, L):
     dl = test[(test.site == "D") & (test.layer == lstar)].set_index("pair_id").lp_donor_g1.reindex(pairs_t.index)
     bl = test[test.site == "BASE"].set_index("pair_id").lp_donor_g1.reindex(pairs_t.index)
     res["donor_g1_shift"] = boot.mean((dl - bl).values)
+    # the same patches judged by the model's most likely next token: is it the first token of the target answer?
+    plain = beh[(beh.condition == "plain") & (beh.known == True)]
+    g1 = dict(zip(plain.item_id, [int(x[0]) for x in plain.g_ids]))
+    t = test.copy()
+    t["own1"] = (t.argmax1 == t.item_id.map(g1)).astype(float)
+    t["donor1"] = (t.argmax1 == t.donor_id.map(g1)).astype(float)
+    top1 = {}
+    for name, site, col in [("A_own", "A", "own1"), ("D_donor", "D", "donor1"), ("D_own", "D", "own1"),
+                            ("B_own", "B", "own1")]:
+        w = t[t.site == site].pivot_table(index="pair_id", columns="layer", values=col).reindex(pairs_t.index)
+        top1[name] = [{"layer": int(l), "depth": (l + 1) / L, **boot.mean(w[l].values)} for l in grid]
+    for name, site in [("BASE_own", "BASE"), ("AFULL_own", "AFULL")]:
+        top1[name] = boot.mean(t[t.site == site].set_index("pair_id").own1.reindex(pairs_t.index).values)
+    # how often the donor's answer survives when the donor itself is asked inside the same wrapper
+    ret = beh.set_index(["item_id", "condition"]).retained.to_dict()
+    pairs_cond = test[test.site == "BASE"].drop_duplicates("pair_id").set_index("pair_id")
+    dk = [float(ret.get((d, c), np.nan)) for d, c in zip(pairs_cond.donor_id.reindex(pairs_t.index),
+                                                         pairs_cond.condition.reindex(pairs_t.index))]
+    top1["donor_kept_in_wrapper"] = boot.mean(dk)
+    res["top1"] = top1
+    # where the question's information reaches the last position: first depth at which restoring the
+    # last position gives back at least half of the lost answer (R, test pairs)
+    bm = [r["mean"] for r in curves["B"]]
+    res["handoff_depth"] = next((curves["B"][i]["depth"] for i, v in enumerate(bm) if v >= 0.5), None)
     return res
 
 
@@ -192,6 +261,7 @@ def main():
     units = {it["id"]: f'{it["family"]}|{it["unit"]}' for it in items}
     res = {"layout": layout, "gate": man.get("gate"), "guard": man.get("guard"), "gpu": man.get("gpu"),
            "hours": man.get("hours"), "models": {}}
+    behs = {}
     for key in C.MODEL_ORDER:
         bp = run / f"behavior_{key}_{layout}.parquet"
         if not bp.exists():
@@ -204,12 +274,58 @@ def main():
         if pp.exists():
             pt = pd.read_parquet(pp)
             if len(pt):
-                r["patching"] = patching(pt, units, L)
+                r["patching"] = patching(pt, units, L, beh)
                 lstar = r["patching"]["lstar"]
         r["geometry"] = geometry(run, key, layout, beh, lstar, L, units)
         res["models"][key] = r
+        behs[key] = beh
         print(key, "done", flush=True)
+    res["pooled"] = pooled(behs, units)
+    # the first model was also run with the question closer to the end (64 tokens of wrapper after it)
+    alt = run / f"behavior_{C.MODEL_ORDER[0]}_tb64.parquet"
+    if layout != "tb64" and alt.exists():
+        res["q4_tb64"] = behaviour(pd.read_parquet(alt), units)
     json.dump(res, open(out / "results.json", "w"), indent=1)
+
+
+def pooled(behs, units):
+    """All models together: test items, clusters = model x unit."""
+    rows = []
+    for key, beh in behs.items():
+        known = beh[(beh.condition == "plain") & (beh.known == True) & (beh.split == "test")]
+        pp = np.exp(known.set_index("item_id").lp_g.astype(float))
+        d = beh[beh.item_id.isin(set(known.item_id)) & beh.condition.isin(C.WRAPPED)].copy()
+        d["p_plain"] = d.item_id.map(pp)
+        d["unit"] = key + "|" + d.item_id.map(units)
+        d["model"] = key
+        rows.append(d)
+    if not rows:
+        return {}
+    d = pd.concat(rows, ignore_index=True)
+    d["wrapper"] = d.condition.str.rsplit("_", n=1).str[0]
+    d["bin"] = np.digitize(d.p_plain, CONF_EDGES[1:-1])
+    out = {"n_trials": int(len(d)), "kept": {}, "by_confidence": {}, "lost_types": {}, "lost": {}}
+    for f, g in d.groupby("wrapper"):
+        out["kept"][f] = Boot(g.unit, n=2000).mean(g.retained.astype(float))
+        out["by_confidence"][f] = []
+        for k in range(len(CONF_EDGES) - 1):
+            gk = g[g.bin == k]
+            out["by_confidence"][f].append({"bin": k, **Boot(gk.unit, n=2000).mean(gk.retained.astype(float))})
+        lost = g[~g.retained]
+        types = lost.gen_text.map(lost_type).value_counts()
+        out["lost_types"][f] = {t: int(types.get(t, 0)) for t in ("task", "scope", "wrong")}
+        out["lost"][f] = int(len(lost))
+    out["conf_bin_n"] = [int((d[d.wrapper == "json"].bin == k).sum()) for k in range(len(CONF_EDGES) - 1)]
+    # what happens to each wrapped prompt, by how sure the model is of the answer (all wrappers together)
+    d["type"] = np.where(d.retained, "kept", d.gen_text.map(lost_type))
+    out["type_by_confidence"] = {}
+    units_, bins_ = d.unit.to_numpy(), d.bin.to_numpy()
+    for t in ("kept", "task", "scope", "wrong"):
+        x = (d.type == t).to_numpy(dtype=float)
+        out["type_by_confidence"][t] = [{"bin": k, **Boot(units_[bins_ == k], n=2000).mean(x[bins_ == k])}
+                                        for k in range(len(CONF_EDGES) - 1)]
+    out["type_bin_n"] = [int((d.bin == k).sum()) for k in range(len(CONF_EDGES) - 1)]
+    return out
 
 
 if __name__ == "__main__":
