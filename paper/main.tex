@@ -1,0 +1,74 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[letterpaper,margin=0.72in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{caption}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[colorlinks=true,citecolor=blue,linkcolor=blue,urlcolor=blue]{hyperref}
+\usepackage{balance}
+\usepackage{stfloats}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\graphicspath{{figures/}}
+\input{generated/numbers}
+
+\setlength{\columnsep}{0.24in}
+\setcounter{dbltopnumber}{2}
+\renewcommand{\dbltopfraction}{0.8}
+\setlength{\textfloatsep}{8pt plus 2pt minus 2pt}
+\setlength{\floatsep}{6pt plus 2pt minus 2pt}
+\setlength{\intextsep}{6pt plus 2pt minus 2pt}
+\setlength{\dbltextfloatsep}{8pt plus 2pt minus 2pt}
+\captionsetup{font=small,labelfont=bf}
+\setlist{itemsep=2pt,topsep=3pt,parsep=0pt}
+\raggedbottom
+\makeatletter\@secpenalty=0\makeatother
+\emergencystretch=1em
+
+\title{\vspace{-1.0em}\textbf{When Wrappers Hide What a Language Model Knows:\\The Question Gets Through, the Answer Does Not}}
+\author{Shailesh Rana\\Independent Researcher}
+\date{}
+
+\begin{document}
+
+\twocolumn[
+\begin{@twocolumnfalse}
+\maketitle
+\vspace{-1.4em}
+\begin{center}
+\begin{minipage}{0.82\textwidth}
+\begin{abstract}
+\input{sections/abstract}
+\end{abstract}
+\end{minipage}
+\end{center}
+\vspace{0.7em}
+\end{@twocolumnfalse}
+]
+
+\input{sections/intro}
+\input{sections/setup}
+\input{sections/results}
+\input{sections/related}
+\input{sections/limits}
+\input{sections/conclusion}
+
+\paragraph{Code and data.} Code, prompts, wrappers and all derived results: \url{https://github.com/gut-puncture/interface-formatting-study}.
+
+\small
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\small
+\appendix
+\input{sections/appendix}
+
+\end{document}

@@ -1,0 +1,10 @@
+\section{Limitations}
+\label{sec:limits}
+
+\begin{itemize}
+\item \emph{Synthetic wrappers.} The wrappers imitate real interfaces but are generated from templates, and their content is bland office news. Real tool outputs, pages and logs carry content related to the task, which may pull harder or less hard.
+\item \emph{One layout.} The question is followed by about \TailTokens{} tokens of wrapper and one fixed instruction. We chose this layout because a first one, with about 64 tokens after the question, lost too few answers in Qwen3-4B; with it, logs hid half as many answers (Appendix~\ref{app:tail}). Other instructions, or a question placed at the start, may give different rates.
+\item \emph{Short answers.} The questions have short, single answers that the models know well. Longer answers, reasoning, and models with reasoning turned on are not tested. The largest model has 12 billion parameters.
+\item \emph{Patching measures.} Patching copies states from a prompt with a different context and at different absolute positions. Our main measure looks only at whether the answer's first token is the most likely next token; answers that share a first token, such as some numbers, are not told apart. The log-probability of the full answer gives the same picture (Appendix~\ref{app:repair}). Only Qwen3-4B was patched at every layer, and the log failures per model are few.
+\item \emph{Sorting by rules.} Lost answers are sorted by fixed text rules (Appendix~\ref{app:types}), which misplace some replies.
+\end{itemize}

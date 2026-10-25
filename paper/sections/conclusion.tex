@@ -1,0 +1,4 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+A question placed inside a wrapper often loses an answer the model knows. Logs do this most, by turning the reply into a description of the log; the other wrappers mostly take answers the model holds weakly. Inside the network, the question itself gets through: the model reads whatever question sits in the question's tokens and can answer it from memory. The answer is lost later, at the position where the reply begins, after the question's content has arrived there. This suggests that making models robust to wrappers is less about how they read a question and more about how they decide what to reply. Whether the same holds for longer answers, reasoning models and real tool outputs remains open.
