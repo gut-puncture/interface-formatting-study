@@ -13,7 +13,7 @@ sync_back() {
 }
 verify() {
   # every remote file must exist locally with the same size
-  $SSH "$TARGET" "cd $RDIR && find . -type f -printf '%s %p\n' | sort -k2" > "$LDIR/.remote_list" 2>>"$LOG" || return 1
+  ${=SSH} "$TARGET" "cd $RDIR && find . -type f -printf '%s %p\n' | sort -k2" > "$LDIR/.remote_list" 2>>"$LOG" || return 1
   (cd "$LDIR" && find . -type f ! -name '.remote_list' ! -name 'watchdog.log' -exec stat -f '%z %N' {} \; | sort -k2) > "$LDIR/.local_list"
   python3 - "$LDIR" <<'EOF'
 import sys
@@ -34,7 +34,7 @@ terminate() {
 while true; do
   sync_back
   NOW=$(date +%s)
-  if $SSH "$TARGET" "test -f $RDIR/ALL.done" 2>/dev/null || [ "$NOW" -gt "$LIMIT" ]; then
+  if ${=SSH} "$TARGET" "test -f $RDIR/ALL.done" 2>/dev/null || [ "$NOW" -gt "$LIMIT" ]; then
     echo "$(date) finishing (done or limit)" >> "$LOG"
     for i in 1 2 3; do sync_back; verify >> "$LOG" 2>&1 && break; sleep 20; done
     if verify >> "$LOG" 2>&1 || [ "$NOW" -gt $((LIMIT + 1800)) ]; then

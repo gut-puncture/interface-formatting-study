@@ -108,6 +108,8 @@ def main():
     ap.add_argument("--finish", action="store_true", help="write ALL.done after this invocation")
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    if (out / "hours_override").exists():          # lets the operator extend the budget of a running chain
+        a.hours = float((out / "hours_override").read_text().strip())
     log = Log(out / "run.log")
     items = P.load_items()
     if a.limit:

@@ -104,6 +104,46 @@ def make_trial(tok, item, cond, pool, assign, gen_prefix=""):
                  tuple(ids[len(pt):]), wtext)
 
 
+def make_trials(tok, items, cond, pool, assign, gen_prefix=""):
+    """Batched, faster make_trial for many items of one condition (identical output).
+    Long prompts are encoded in one parallel call; the shared prefix is encoded once per group;
+    the span and the closing part are checked against short encodings."""
+    out, errors = [], []
+    texts = []
+    for it in items:
+        blk, wtext = block_text(it, cond, pool, assign)
+        texts.append((it, blk, wtext, full_text(tok, K.user_content(blk), gen_prefix)))
+    enc_all = tok([t[3] for t in texts], add_special_tokens=False)["input_ids"]
+    pref_cache = {}
+    bos = getattr(tok, "bos_token_id", None)
+    for (it, blk, wtext, full), ids in zip(texts, enc_all):
+        q = it["q"]
+        try:
+            if blk.count(K.ANCHOR + q) != 1:
+                raise AlignError("question not unique")
+            a = full.index(K.ANCHOR + q) + len(K.ANCHOR) - 1
+            b = a + len(K.interior(q))
+            t = full.rindex(K.TAIL)
+            key = full[:a]
+            if key not in pref_cache:
+                pref_cache[key] = encode(tok, key)
+            pa = pref_cache[key]
+            if ids[:len(pa)] != pa:
+                raise AlignError("prefix not token-aligned")
+            span = encode(tok, full[a:b])
+            if ids[len(pa):len(pa) + len(span)] != span:
+                raise AlignError("span not token-aligned")
+            tail = encode(tok, full[t:])
+            if ids[len(ids) - len(tail):] != tail:
+                raise AlignError("closing part not token-aligned")
+            if bos is not None and bos in ids[1:]:
+                raise AlignError("extra BOS")
+            out.append(Trial(it["id"], cond, key, pa, ids[len(pa):], len(span), len(ids), tuple(tail), wtext))
+        except AlignError as e:
+            errors.append((it["id"], cond, str(e)))
+    return out, errors
+
+
 def check_against_plain(trial, plain):
     """The question span and the closing part must be token-identical to the plain prompt."""
     if trial.suffix_ids[:trial.span_len] != plain.suffix_ids[:plain.span_len] or trial.span_len != plain.span_len:

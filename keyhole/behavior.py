@@ -106,12 +106,9 @@ def run(eng, items, layout, out_dir, log=print, conds=None):
     rows, dropped = [], []
     byid = {it["id"]: it for it in items}
 
-    plain = {}
-    for it in items:
-        try:
-            plain[it["id"]] = P.make_trial(tok, it, "plain", pool, assign)
-        except P.AlignError as e:
-            dropped.append((it["id"], "plain", str(e)))
+    trs, errs = P.make_trials(tok, items, "plain", pool, assign)
+    plain = {t.item_id: t for t in trs}
+    dropped += errs
     gens = greedy(eng, list(plain.values()))
     gold = {}
     for iid, tr in plain.items():
@@ -134,14 +131,14 @@ def run(eng, items, layout, out_dir, log=print, conds=None):
     for cond in conds:
         tc = time.time()
         trials = []
-        for iid in sorted(known):
-            it = byid[iid]
+        built, errs = P.make_trials(tok, [byid[i] for i in sorted(known)], cond, pool, assign)
+        dropped += errs
+        for tr in built:
             try:
-                tr = P.make_trial(tok, it, cond, pool, assign)
-                P.check_against_plain(tr, plain[iid])
+                P.check_against_plain(tr, plain[tr.item_id])
                 trials.append(tr)
             except P.AlignError as e:
-                dropped.append((iid, cond, str(e)))
+                dropped.append((tr.item_id, cond, str(e)))
         keep_states = cond in C.NULLS or cond.endswith("_L")
         tf, st = teacher_force(eng, [(t, gold[t.item_id]) for t in trials], grid if keep_states else None)
         need_gen = [t for t in trials if not tf[id(t)]["tf_correct"]]
